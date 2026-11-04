@@ -1,0 +1,55 @@
+enchilada: power up and initialise the QUSB2 PHY before USB device mode
+
+After `fastboot boot` the OnePlus 6 ABL leaves the QUSB2 PHY powered down
+(PWR_CTRL1 0x23), so the DWC3 had no UTMI clock and the first SETEPCONFIG
+timed out even with 0182. Reset the PHY and replay the board DT
+qcom,qusb-phy-init-seq, then report PLL core-ready. sweetusbphy=0 skips it.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -870,7 +870,44 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/*
++	 * OnePlus 6: after `fastboot boot` ABL leaves the QUSB2 PHY powered down
++	 * (PWR_CTRL1 0x23, bit 0), so the DWC3 gets no UTMI clock and endpoint
++	 * commands time out. Reset the PHY (GCC_QUSB2PHY_PRIM_BCR) and replay this
++	 * board's DT qcom,qusb-phy-init-seq <value offset> pairs: power down,
++	 * tuning, then 0x22 clears POWER_DOWN (downstream phy-msm-qusb-v2.c,
++	 * Linux phy-qcom-qusb2.c qusb2_phy_init). Boot-arg sweetusbphy=0 skips it.
++	 */
++	int phyinit = 1;
++	PE_parse_boot_argn("sweetusbphy", &phyinit, sizeof(phyinit));
++	if (phyinit) {
++		static const uint16_t seq[][2] = {
++			{ 0x23, 0x210 }, { 0x03, 0x004 }, { 0x7c, 0x18c }, { 0x80, 0x02c }, { 0x0a, 0x184 },
++			{ 0x19, 0x0b4 }, { 0x40, 0x194 }, { 0x19, 0x198 }, { 0x21, 0x214 }, { 0x07, 0x220 },
++			{ 0x58, 0x224 }, { 0x46, 0x240 }, { 0x2b, 0x244 }, { 0xca, 0x248 }, { 0x04, 0x24c },
++			{ 0x03, 0x250 }, { 0x00, 0x23c }, { 0x22, 0x210 },
++		};
++		vm_offset_t bcr = ml_io_map(GCC_PA + 0x12000, 0x4);
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++		if (bcr != 0 && phy != 0) {
++			*(volatile uint32_t *)bcr = 1;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(150);
++			*(volatile uint32_t *)bcr = 0;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(150);
++			for (unsigned k = 0; k < sizeof(seq) / sizeof(seq[0]); k++) {
++				*(volatile uint32_t *)(phy + seq[k][1]) = seq[k][0];
++				__asm__ volatile ("dsb sy" ::: "memory");
++			}
++			delay(500);
++			uint32_t st = usb_rd(phy, 0x1a0);
++			printf("SWEET USB: QUSB2 init: PWR_CTRL1 0x%08x PLL_STATUS 0x%08x (core ready %s)\n",
++			    usb_rd(phy, 0x210), st, (st & 1) ? "yes" : "NO");
++		}
++	}
++
++	/* Device controller soft reset (global setup stays as ABL left it). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
