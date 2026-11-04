@@ -1,12 +1,13 @@
-enchilada: USB DMA area below 4 GiB, where ABL kept its own
+enchilada: USB DMA area below 4 GiB, on ABL's own event buffer
 
 The 0190 slow-motion boot showed the QUSB2 PHY powering up fine (PLL core
 ready) and the SoC entering crash-dump mode right after the core was pointed
 at our event buffer at 0x10497c000. The USB master goes through apps SMMU SID
 0x740 (s1 bypass), configured by ABL for its buffer at 0x997a6000. Run the DMA
-area from 0x997a4000 instead (unused by XNU, write-combined mapping, so the
-cache maintenance by physical address is skipped). sweetusblowdma=0 restores
-the kernel allocation.
+area from exactly there (unused by XNU, write-combined mapping, so the cache
+maintenance by physical address is skipped). sweetusblowdma=0 restores the
+kernel allocation. sweetusbphy=5 also pauses at two more steps (E: event
+buffer set, F: before RUN).
 
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
@@ -53,13 +54,13 @@ the kernel allocation.
 +	 * qcom,smmu-s1-bypass), set up by ABL for its own buffer at 0x997a6000.
 +	 * Our buffer above 4 GiB sent the SoC into crash-dump mode as soon as the
 +	 * core started writing events to it (0190 boot). sweetusblowdma=1 (default)
-+	 * runs the DMA area from 0x997a4000, plain DDR below 4 GiB that XNU does
++	 * runs the DMA area from 0x997a6000 (ABL's event buffer), DDR that XNU does
 +	 * not use; write-combined, so ordinary loads/stores and memcpy are fine.
 +	 */
 +	int lowdma = 1;
 +	PE_parse_boot_argn("sweetusblowdma", &lowdma, sizeof(lowdma));
 +	if (lowdma) {
-+		ud.dma_pa = 0x997a4000ULL;
++		ud.dma_pa = 0x997a6000ULL;	/* the event buffer lands exactly on ABL's */
 +		ud.dma = ml_io_map_wcomb((vm_offset_t)ud.dma_pa, UD_SIZE);
 +		if (ud.dma == 0) {
 +			printf("SWEET USB: cannot map the low DMA area\n");
@@ -84,3 +85,26 @@ the kernel allocation.
  	ud_if_create();
  
  	/*
+@@ -985,6 +1016,11 @@
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
++	if (phyinit == 5) {
++		printf("SWEET USB DIAG E: event buffer set (GEVNTADR 0x%08x%08x), endpoint 0 setup in 3 s\n",
++		    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO));
++		delay(3000000);
++	}
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+@@ -1014,6 +1050,10 @@
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	if (phyinit == 5) {
++		printf("SWEET USB DIAG F: endpoint 0 ready, VBUS override done, RUN in 3 s\n");
++		delay(3000000);
++	}
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
