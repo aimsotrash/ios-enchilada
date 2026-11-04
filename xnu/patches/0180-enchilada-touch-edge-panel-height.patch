@@ -1,0 +1,27 @@
+enchilada: touch edge and clamp from the panel height, not sweet's 2400 rows
+
+Bottom-edge contacts were never flagged on 2280/2340-row panels (y > 2351 is
+unreachable), so the swipe-up unlock/home gesture could not start.
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -467,7 +467,9 @@
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	/* Last panel row: 2279 on the OnePlus 6, 2339 on the 6T (was sweet's 2399). */
++	int maxY = fLogicalH - 2 * fOffY - 1;
++	y = y < 0 ? 0 : (y > maxY ? maxY : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -481,7 +483,7 @@
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > maxY - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
