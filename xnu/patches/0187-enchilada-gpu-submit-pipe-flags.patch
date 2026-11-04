@@ -1,0 +1,39 @@
+enchilada: GPU: SUBMIT accepts the MSM_PIPE_3D0 pipe bits (K2 c)
+
+freedreno sets flags = MSM_PIPE_3D0 (0x10) on every GEM_SUBMIT, and the user
+client refused every flag except NO_IMPLICIT. Accept a pipe field
+(MSM_PIPE_ID_MASK, low 16 bits) of 0 or 3D0 and ignore it (one ring); other
+pipes, fence-fd and syncobj flags are still refused.
+
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -115,7 +115,7 @@
+ };
+ 
+ struct sweet_msm_gem_submit {
+-	uint32_t flags;         /* in: 0 only (no fence fds, syncobjs, SUDO); NO_IMPLICIT (0x80000000) tolerated */
++	uint32_t flags;         /* in: pipe 0 or MSM_PIPE_3D0 (low 16 bits), NO_IMPLICIT (0x80000000) tolerated; no fence fds, syncobjs, SUDO */
+ 	uint32_t fence;         /* out: sequence number, > 0 */
+ 	uint32_t nr_bos;        /* 1..4096 */
+ 	uint32_t nr_cmds;       /* 1..128 */
+@@ -194,6 +194,7 @@
+ /* ---- msm constants used above (values of msm_drm.h) ---- */
+ 
+ #define SWEET_MSM_PIPE_3D0              0x10
++#define SWEET_MSM_PIPE_ID_MASK          0xffff  /* the pipe field of submit flags */
+ 
+ #define SWEET_MSM_PARAM_GPU_ID          0x01    /* 630 */
+ #define SWEET_MSM_PARAM_GMEM_SIZE       0x02    /* 0x100000 */
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -575,7 +575,9 @@
+ 	if (r->nr_bos == 0 || r->nr_bos > SUBMIT_BOS_MAX || r->nr_cmds == 0 || r->nr_cmds > SUBMIT_CMDS_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if ((r->flags & ~SWEET_MSM_SUBMIT_NO_IMPLICIT) != 0 || r->nr_in_syncobjs != 0 || r->nr_out_syncobjs != 0 ||
++	/* K2(c): freedreno puts its pipe (MSM_PIPE_3D0) in the low bits of flags; one ring, so it is ignored */
++	if (((r->flags & SWEET_MSM_PIPE_ID_MASK) != 0 && (r->flags & SWEET_MSM_PIPE_ID_MASK) != SWEET_MSM_PIPE_3D0) ||
++	    (r->flags & ~(SWEET_MSM_PIPE_ID_MASK | SWEET_MSM_SUBMIT_NO_IMPLICIT)) != 0 || r->nr_in_syncobjs != 0 || r->nr_out_syncobjs != 0 ||
+ 	    r->in_syncobjs != 0 || r->out_syncobjs != 0 || (r->queueid >= QUEUE_IDS) ||
+ 	    (r->queueid != 0 && !(fQueues & (1ull << r->queueid)))) {
+ 		return kIOReturnUnsupported;

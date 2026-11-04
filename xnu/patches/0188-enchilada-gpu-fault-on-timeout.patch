@@ -1,0 +1,68 @@
+enchilada: GPU: log the CB1 fault address on a fence timeout (K2 d)
+
+A fence that never signals said nothing about why. sweet_gpu_report() now
+also prints the CP's SMMU context bank 1 FSR/FAR/FSYNR0 ("cb1 fault at
+0x...") and clears FSR, and a fence wait timeout calls it: the IOKit wait
+(first 16 times, all with sweetgpulog=1) and the chardev WAIT_FENCE.
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -211,6 +211,8 @@
+ #define GPU_SMMU_CB_MAIR0     0x038u
+ #define GPU_SMMU_CB_MAIR1     0x03cu
+ #define GPU_SMMU_CB_FSR       0x058u
++#define GPU_SMMU_CB_FAR       0x060u    /* K2(d): 64-bit, the faulting iova */
++#define GPU_SMMU_CB_FSYNR0    0x068u
+ #define GPU_SMMU_CB_TLBIALL   0x618u
+ #define GPU_SMMU_CB_TLBSYNC   0x7f0u
+ #define GPU_SMMU_CB_TLBSTATUS 0x7f4u
+@@ -1898,6 +1900,20 @@
+ 	printf("SWEET GPU: report%s%s: live %d lost %d ring wptr %u fence %u tables %u\n",
+ 	    why ? " " : "", why ? why : "", gpu_live ? 1 : 0, gpu_lost ? 1 : 0,
+ 	    gpu_cp_wptr, gpu_cp_seq, gpu_pte_used);
++	/* K2(d): the CP's context bank (CB1) names the iova a bad access hit. FSR is write-one-to-clear. */
++	if (gpu_smmu != 0) {
++		vm_offset_t b1 = gpu_smmu + GPU_SMMU_CB(1);
++		uint32_t fsr = gpu_rd_quiet(b1, GPU_SMMU_CB_FSR);
++		uint64_t far = ((uint64_t)gpu_rd_quiet(b1, GPU_SMMU_CB_FAR + 4) << 32) | gpu_rd_quiet(b1, GPU_SMMU_CB_FAR);
++
++		if (fsr != 0) {
++			printf("SWEET GPU: cb1 fault at %#llx fsr %#x fsynr0 %#x\n", (unsigned long long)far, fsr,
++			    gpu_rd_quiet(b1, GPU_SMMU_CB_FSYNR0));
++			gpu_wr_quiet(b1, GPU_SMMU_CB_FSR, fsr);
++		} else {
++			printf("SWEET GPU: cb1 no fault recorded\n");
++		}
++	}
+ }
+ 
+ /* ---- stage 8g: memory for the IOKit client ------------------------------------------ */
+@@ -2193,6 +2209,7 @@
+ 		}
+ 		gpu_wait_ms(1);
+ 	}
++	sweet_gpu_report("wait timeout");       /* K2(d): CB1 FSR/FAR */
+ 	return ETIMEDOUT;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -81,7 +81,7 @@
+  */
+ #define ADRENO_LOG_FIRST        16u
+ static int gAdrenoLogAll = -1;
+-static uint32_t gLogSelector, gLogIb, gLogSubmit, gLogWait, gLogWaitDump;
++static uint32_t gLogSelector, gLogIb, gLogSubmit, gLogWait, gLogWaitDump, gLogFault;
+ 
+ static bool
+ adrenoLog(uint32_t *seen)
+@@ -305,6 +305,9 @@
+ 			if (ns >= NSEC_PER_SEC && waited >= cap) {
+ 				sweet_gpu_mark_lost();
+ 			}
++			if (adrenoLog(&gLogFault)) {
++				sweet_gpu_report("fence timeout");      /* K2(d): CB1 FSR/FAR name a bad iova */
++			}
+ 			return false;
+ 		}
+ 		IOLockUnlock(gAdrenoLock);

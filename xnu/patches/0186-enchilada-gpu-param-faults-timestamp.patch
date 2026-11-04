@@ -1,0 +1,57 @@
+enchilada: GPU: answer FAULTS/SUSPENDS, TIMESTAMP from the always-on counter (K2 b)
+
+GET_PARAM FAULTS (0x09) and SUSPENDS (0x0a) were unknown and failed, as msm
+never does; they now return 0. TIMESTAMP returned the last CP fence instead
+of a clock; it now reads CP_ALWAYS_ON_COUNTER (0x980/0x981, 19.2 MHz), the
+register Linux a6xx_get_timestamp reads, with a hi-lo-hi read against a carry.
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -306,6 +306,8 @@
+ #define A6XX_CP_ROQ_THRESHOLDS_2 0x08c2u
+ #define A6XX_CP_MEM_POOL_SIZE  0x08c3u
+ #define A6XX_CP_AHB_CNTL       0x098du
++#define A6XX_CP_ALWAYS_ON_COUNTER_LO 0x0980u  /* K2(b): 19.2 MHz, what msm's TIMESTAMP reads */
++#define A6XX_CP_ALWAYS_ON_COUNTER_HI 0x0981u
+ #define A6XX_UCHE_ADDR_MODE_CNTL 0x0e00u
+ #define A6XX_UCHE_WRITE_RANGE_MAX 0x0e05u
+ #define A6XX_UCHE_WRITE_THRU_BASE 0x0e07u
+@@ -373,6 +375,8 @@
+ #define GPU_PARAM_GMEM_BASE     6u
+ #define GPU_PARAM_PRIORITIES    7u
+ #define GPU_PARAM_PP_PGTABLE    8u
++#define GPU_PARAM_FAULTS        9u
++#define GPU_PARAM_SUSPENDS      0x0au
+ #define GPU_PARAM_VA_START      0x0eu
+ #define GPU_PARAM_VA_SIZE       0x0fu
+ #define GPU_EXTENT_MAX          8u
+@@ -1592,9 +1596,16 @@
+ 	case GPU_PARAM_MAX_FREQ:
+ 		*value = 710000000u;
+ 		break;
+-	case GPU_PARAM_TIMESTAMP:
+-		*value = *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE);
++	case GPU_PARAM_TIMESTAMP: {
++		/* K2(b): the CP always-on counter (19.2 MHz ticks, as Mesa expects), not the fence; hi-lo-hi against a carry */
++		uint32_t hi, lo;
++		do {
++			hi = gpu_cp_rd(gpu_core, A6XX_CP_ALWAYS_ON_COUNTER_HI);
++			lo = gpu_cp_rd(gpu_core, A6XX_CP_ALWAYS_ON_COUNTER_LO);
++		} while (hi != gpu_cp_rd(gpu_core, A6XX_CP_ALWAYS_ON_COUNTER_HI));
++		*value = ((uint64_t)hi << 32) | lo;
+ 		break;
++	}
+ 	case GPU_PARAM_GMEM_BASE:
+ 		*value = 0x100000u;
+ 		break;
+@@ -1604,6 +1615,10 @@
+ 	case GPU_PARAM_PP_PGTABLE:
+ 		*value = 0;             /* one address space for everybody */
+ 		break;
++	case GPU_PARAM_FAULTS:          /* K2(b): answered, as msm does; no fault counting yet */
++	case GPU_PARAM_SUSPENDS:
++		*value = 0;
++		break;
+ 	case GPU_PARAM_VA_START:
+ 		*value = GPU_VA_BASE;
+ 		break;

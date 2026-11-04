@@ -1,0 +1,56 @@
+enchilada: GPU: enter every 4 KiB GPU page of a BO (K2 a)
+
+mapGem() and the SET_IOVA move loop stepped by PAGE_SIZE, which is 16 KiB in
+this kernel, while sweet_gpu_vm_map() writes one 4 KiB SMMU PTE. Only the
+first GPU page of every 16 KiB was mapped, so anything past +0x1000 in a BO
+faulted. Step by GPU_PAGE (0x1000) instead, and check the physical address
+against 4 KiB alignment (arena offsets are only 4 KiB aligned).
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -69,6 +69,7 @@
+ #define WAIT_PATIENCE_MS        5000    /* a wait that asks for more than this is cut here and the GPU declared lost */
+ #define CLOSE_PATIENCE_MS       2000
+ #define IOVA_UNSET              0
++#define GPU_PAGE                0x1000ull       /* K2(a): one GPU PTE; XNU's PAGE_SIZE is 16 KiB */
+ 
+ static IOLock *gAdrenoLock;
+ static uint32_t gAdrenoClients;
+@@ -381,7 +382,7 @@
+ 	}
+ 	bool ok = true;
+ 	uint64_t mapped = 0;
+-	for (; mapped < size && ok; mapped += PAGE_SIZE) {
++	for (; mapped < size && ok; mapped += GPU_PAGE) {     /* K2(a): every 4 KiB PTE, not every 16 KiB */
+ 		uint64_t pa;
+ 		if (slot->pa != 0) {
+ 			/* GEM_NEW: the arena address is already known, no descriptor walk needed. */
+@@ -390,16 +391,16 @@
+ 			IOByteCount length = 0;
+ 			pa = (uint64_t)slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 		}
+-		ok = pa != 0 && (pa & (PAGE_SIZE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
++		ok = pa != 0 && (pa & (GPU_PAGE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
+ 		if (!ok) {
+ 			panic("SWEET DIAG: mapGem page %llu of %llu: iova %#llx pa %#llx arena %#llx",
+-			    mapped / PAGE_SIZE, size / PAGE_SIZE, iova, pa, slot->pa);
++			    mapped / GPU_PAGE, size / GPU_PAGE, iova, pa, slot->pa);
+ 		}
+ 	}
+ 	if (!ok) {
+ 		sweet_gpu_vm_unmap(iova, mapped);
+ 		sweet_gpu_iova_free(iova, taken);
+-		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space (page %llu)\n", size, mapped / PAGE_SIZE);
++		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space (page %llu)\n", size, mapped / GPU_PAGE);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	slot->iova = iova;
+@@ -507,7 +508,7 @@
+ 				uint64_t old = g->iova, oldLen = g->vaLen, newIova = r->value;
+ 				bool ok = true;
+ 				uint64_t mapped = 0;
+-				for (; mapped < g->size && ok; mapped += PAGE_SIZE) {
++				for (; mapped < g->size && ok; mapped += GPU_PAGE) {     /* K2(a): every 4 KiB PTE */
+ 					IOByteCount length = 0;
+ 					addr64_t pa = g->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 					ok = pa != 0 && sweet_gpu_vm_map(newIova + mapped, pa, (g->flags & SWEET_MSM_BO_GPU_READONLY) != 0);

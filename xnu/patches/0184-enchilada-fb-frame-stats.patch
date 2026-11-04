@@ -1,0 +1,52 @@
+enchilada: frame statistics every 10 s (swaps vs. panel copies, copy time)
+
+Makes "laggy" measurable: every 10 s while frames arrive, log how many frames
+backboardd swapped, how many the vsync timer copied to the panel and how long
+a copy took (average and maximum).
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,6 +69,8 @@
+ #define SWEET_FIT_MAX                   2048
+ static uint16_t sweet_fit_col[SWEET_FIT_MAX];  /* sweetfb_fit: panel column -> plane column */
+ static uint32_t sweet_fit_row[SWEET_FIT_MAX];  /* one scaled row, then one write to the panel */
++/* Frame statistics, logged every 10 s while frames arrive ("SWEET FB: last 10 s ..."). */
++static uint64_t sweet_fb_stat_swaps, sweet_fb_stat_copies, sweet_fb_stat_copy_abs, sweet_fb_stat_copy_max;
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -337,9 +339,26 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		sweet_fb_stat_copies++;
++		sweet_fb_stat_copy_abs += dt;
++		sweet_fb_stat_copy_max = dt > sweet_fb_stat_copy_max ? dt : sweet_fb_stat_copy_max;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	/* Every 600 vsync ticks (10 s): frames iOS submitted vs. frames copied to the panel. */
++	if ((count % 600) == 0 && (sweet_fb_stat_swaps != 0 || sweet_fb_stat_copies != 0)) {
++		uint64_t avg_ns = 0, max_ns = 0;
++		if (sweet_fb_stat_copies != 0) {
++			absolutetime_to_nanoseconds(sweet_fb_stat_copy_abs / sweet_fb_stat_copies, &avg_ns);
++		}
++		absolutetime_to_nanoseconds(sweet_fb_stat_copy_max, &max_ns);
++		IOLog("SWEET FB: last 10 s: %llu swaps (%llu.%llu/s), %llu panel copies, copy avg %llu us max %llu us\n",
++		    sweet_fb_stat_swaps, sweet_fb_stat_swaps / 10, sweet_fb_stat_swaps % 10, sweet_fb_stat_copies,
++		    avg_ns / 1000, max_ns / 1000);
++		sweet_fb_stat_swaps = sweet_fb_stat_copies = sweet_fb_stat_copy_abs = sweet_fb_stat_copy_max = 0;
++	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -387,6 +406,7 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	sweet_fb_stat_swaps++;
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
