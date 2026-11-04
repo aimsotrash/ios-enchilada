@@ -1,0 +1,86 @@
+enchilada: USB DMA area below 4 GiB, where ABL kept its own
+
+The 0190 slow-motion boot showed the QUSB2 PHY powering up fine (PLL core
+ready) and the SoC entering crash-dump mode right after the core was pointed
+at our event buffer at 0x10497c000. The USB master goes through apps SMMU SID
+0x740 (s1 bypass), configured by ABL for its buffer at 0x997a6000. Run the DMA
+area from 0x997a4000 instead (unused by XNU, write-combined mapping, so the
+cache maintenance by physical address is skipped). sweetusblowdma=0 restores
+the kernel allocation.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -38,6 +38,7 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -255,9 +256,17 @@
+ 	return usb_rd(ud.dwc, off);
+ }
+ 
++/* Set when the DMA area is the uncached low window (sweetusblowdma): no cache to maintain. */
++static int ud_lowdma;
++
+ static void
+ ud_sync(uint32_t off, uint32_t len)
+ {
++	if (ud_lowdma) {
++		/* flush_dcache64(phys) would look up a PA XNU does not manage */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -858,16 +867,38 @@
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
+-		return;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
+-		return;
++	/*
++	 * OnePlus 6: the USB master reaches DDR through apps SMMU SID 0x740 (DT
++	 * qcom,smmu-s1-bypass), set up by ABL for its own buffer at 0x997a6000.
++	 * Our buffer above 4 GiB sent the SoC into crash-dump mode as soon as the
++	 * core started writing events to it (0190 boot). sweetusblowdma=1 (default)
++	 * runs the DMA area from 0x997a4000, plain DDR below 4 GiB that XNU does
++	 * not use; write-combined, so ordinary loads/stores and memcpy are fine.
++	 */
++	int lowdma = 1;
++	PE_parse_boot_argn("sweetusblowdma", &lowdma, sizeof(lowdma));
++	if (lowdma) {
++		ud.dma_pa = 0x997a4000ULL;
++		ud.dma = ml_io_map_wcomb((vm_offset_t)ud.dma_pa, UD_SIZE);
++		if (ud.dma == 0) {
++			printf("SWEET USB: cannot map the low DMA area\n");
++			return;
++		}
++		bzero((void *)ud.dma, UD_SIZE);
++		ud_lowdma = 1;
++	} else {
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: no DMA memory\n");
++			return;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
++		ud.dma_pa = ptoa_64(pn);
+ 	}
+-	ud.dma_pa = ptoa_64(pn);
++	printf("SWEET USB: DMA area at 0x%llx (%s)\n", ud.dma_pa, lowdma ? "below 4 GiB, as ABL" : "kernel memory");
+ 	ud_if_create();
+ 
+ 	/*
