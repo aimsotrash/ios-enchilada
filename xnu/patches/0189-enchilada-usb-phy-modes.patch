@@ -1,0 +1,91 @@
+enchilada: QUSB2 power-up selectable per boot, off by default
+
+0183 reset the PHY through GCC_QUSB2PHY_PRIM_BCR while the DWC3 was live and
+the SoC went into Qualcomm crash-dump mode (900E) about 18 s into the boot.
+sweetusbphy= now picks the method: 4 clears POWER_DOWN only, 2 replays the
+board init sequence without a reset, 3 holds the core and USB2 PHY in soft
+reset around the BCR reset and the sequence (older Linux dwc3 order). 0 (the
+default) leaves the PHY as ABL left it.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -873,38 +873,60 @@
+ 	/*
+ 	 * OnePlus 6: after `fastboot boot` ABL leaves the QUSB2 PHY powered down
+ 	 * (PWR_CTRL1 0x23, bit 0), so the DWC3 gets no UTMI clock and endpoint
+-	 * commands time out. Reset the PHY (GCC_QUSB2PHY_PRIM_BCR) and replay this
+-	 * board's DT qcom,qusb-phy-init-seq <value offset> pairs: power down,
+-	 * tuning, then 0x22 clears POWER_DOWN (downstream phy-msm-qusb-v2.c,
+-	 * Linux phy-qcom-qusb2.c qusb2_phy_init). Boot-arg sweetusbphy=0 skips it.
++	 * commands time out. Resetting the PHY through GCC_QUSB2PHY_PRIM_BCR while
++	 * the core was live put the SoC into Qualcomm crash-dump mode (0183), so
++	 * the power-up is now chosen per boot with sweetusbphy= (default 0, off):
++	 *   4  only clear POWER_DOWN in PWR_CTRL1 (one write)
++	 *   2  replay the board DT qcom,qusb-phy-init-seq, no reset
++	 *   3  older Linux dwc3_core_soft_reset order: core and USB2 PHY held in
++	 *      soft reset (GCTL CORESOFTRESET, GUSB2PHYCFG PHYSOFTRST), PHY BCR
++	 *      reset and the init sequence, then release and restore GCTL/PHYCFG
+ 	 */
+-	int phyinit = 1;
++	int phyinit = 0;
+ 	PE_parse_boot_argn("sweetusbphy", &phyinit, sizeof(phyinit));
+-	if (phyinit) {
++	vm_offset_t phy = phyinit ? ml_io_map(QUSB2_PA, QUSB2_SIZE) : 0;
++	if (phy != 0) {
+ 		static const uint16_t seq[][2] = {
+ 			{ 0x23, 0x210 }, { 0x03, 0x004 }, { 0x7c, 0x18c }, { 0x80, 0x02c }, { 0x0a, 0x184 },
+ 			{ 0x19, 0x0b4 }, { 0x40, 0x194 }, { 0x19, 0x198 }, { 0x21, 0x214 }, { 0x07, 0x220 },
+ 			{ 0x58, 0x224 }, { 0x46, 0x240 }, { 0x2b, 0x244 }, { 0xca, 0x248 }, { 0x04, 0x24c },
+ 			{ 0x03, 0x250 }, { 0x00, 0x23c }, { 0x22, 0x210 },
+ 		};
+-		vm_offset_t bcr = ml_io_map(GCC_PA + 0x12000, 0x4);
+-		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-		if (bcr != 0 && phy != 0) {
+-			*(volatile uint32_t *)bcr = 1;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			delay(150);
+-			*(volatile uint32_t *)bcr = 0;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			delay(150);
++		uint32_t gctl = dwc_rd(GCTL), phycfg = dwc_rd(0xc200);
++		printf("SWEET USB: QUSB2 mode %d: before PWR_CTRL1 0x%08x PLL_STATUS 0x%08x\n",
++		    phyinit, usb_rd(phy, 0x210), usb_rd(phy, 0x1a0));
++		if (phyinit == 3) {
++			dwc_wr(GCTL, gctl | (1u << 11));             /* CORESOFTRESET */
++			dwc_wr(0xc200, phycfg | (1u << 31));         /* GUSB2PHYCFG PHYSOFTRST */
++			vm_offset_t bcr = ml_io_map(GCC_PA + 0x12000, 0x4);
++			if (bcr != 0) {
++				*(volatile uint32_t *)bcr = 1;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(150);
++				*(volatile uint32_t *)bcr = 0;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(150);
++			}
++		}
++		if (phyinit == 2 || phyinit == 3) {
+ 			for (unsigned k = 0; k < sizeof(seq) / sizeof(seq[0]); k++) {
+ 				*(volatile uint32_t *)(phy + seq[k][1]) = seq[k][0];
+ 				__asm__ volatile ("dsb sy" ::: "memory");
+ 			}
+-			delay(500);
+-			uint32_t st = usb_rd(phy, 0x1a0);
+-			printf("SWEET USB: QUSB2 init: PWR_CTRL1 0x%08x PLL_STATUS 0x%08x (core ready %s)\n",
+-			    usb_rd(phy, 0x210), st, (st & 1) ? "yes" : "NO");
++		} else if (phyinit == 4) {
++			*(volatile uint32_t *)(phy + 0x210) = usb_rd(phy, 0x210) & ~1u;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		delay(500);
++		if (phyinit == 3) {
++			dwc_wr(0xc200, phycfg);
++			delay(1000);
++			dwc_wr(GCTL, gctl);
++			delay(1000);
+ 		}
++		uint32_t st = usb_rd(phy, 0x1a0);
++		printf("SWEET USB: QUSB2 mode %d: after PWR_CTRL1 0x%08x PLL_STATUS 0x%08x (core ready %s) GCTL 0x%08x PHYCFG 0x%08x\n",
++		    phyinit, usb_rd(phy, 0x210), st, (st & 1) ? "yes" : "NO", dwc_rd(GCTL), dwc_rd(0xc200));
+ 	}
+ 
+ 	/* Device controller soft reset (global setup stays as ABL left it). */
