@@ -1,0 +1,51 @@
+enchilada: sweetusbphy=5, the QUSB2 power-up in slow motion
+
+Mode 4 (clear POWER_DOWN only) also sent the SoC into crash-dump mode. Mode 5
+does the same write with each step printed on the panel and 3 s pauses before
+and after it, so a photo shows whether the write itself or something after it
+(the PHY waking the core) faults.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -881,6 +881,8 @@
+ 	 *   3  older Linux dwc3_core_soft_reset order: core and USB2 PHY held in
+ 	 *      soft reset (GCTL CORESOFTRESET, GUSB2PHYCFG PHYSOFTRST), PHY BCR
+ 	 *      reset and the init sequence, then release and restore GCTL/PHYCFG
++	 *   5  mode 4 in slow motion: every step printed on the panel with 3 s
++	 *      pauses, so a photo of the last line names the step that faults
+ 	 */
+ 	int phyinit = 0;
+ 	PE_parse_boot_argn("sweetusbphy", &phyinit, sizeof(phyinit));
+@@ -913,9 +915,20 @@
+ 				*(volatile uint32_t *)(phy + seq[k][1]) = seq[k][0];
+ 				__asm__ volatile ("dsb sy" ::: "memory");
+ 			}
+-		} else if (phyinit == 4) {
++		} else if (phyinit == 4 || phyinit == 5) {
++			if (phyinit == 5) {
++				printf("SWEET USB DIAG A: GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x GEVNTADR 0x%08x%08x - clearing POWER_DOWN in 3 s\n",
++				    dwc_rd(GCTL), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO));
++				delay(3000000);
++			}
+ 			*(volatile uint32_t *)(phy + 0x210) = usb_rd(phy, 0x210) & ~1u;
+ 			__asm__ volatile ("dsb sy" ::: "memory");
++			if (phyinit == 5) {
++				printf("SWEET USB DIAG B: write done, PWR_CTRL1 0x%08x - waiting 3 s with the PHY on\n", usb_rd(phy, 0x210));
++				delay(3000000);
++				printf("SWEET USB DIAG C: survived 3 s, PLL_STATUS 0x%08x DSTS 0x%08x GEVNTCOUNT 0x%08x\n",
++				    usb_rd(phy, 0x1a0), dwc_rd(DSTS), dwc_rd(GEVNTCOUNT));
++			}
+ 		}
+ 		delay(500);
+ 		if (phyinit == 3) {
+@@ -962,6 +975,10 @@
+ 		printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clock as pipe clock)\n", before, *gcfg);
+ 	}
+ 
++	if (phyinit == 5) {
++		printf("SWEET USB DIAG D: soft reset done, events to our buffer at 0x%llx in 3 s\n", ud.dma_pa + UD_EVT);
++		delay(3000000);
++	}
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
