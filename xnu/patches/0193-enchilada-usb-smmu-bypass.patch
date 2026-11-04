@@ -1,0 +1,93 @@
+enchilada: route the USB stream through an SMMU bypass context (sweetusbsmmu=2)
+
+Boot 14 (0192 dump): apps SMMU enabled, sCR0.USFCFG=1 (unidentified streams
+fault), 6 of 76 SMRs valid and none for USB SID 0x740 once ABL has exited, so
+every USB DMA faulted the SoC into crash-dump mode. Do what Linux
+arm-smmu-qcom does on SDM845 (bypass_quirk, no S2CR bypass type under this
+hypervisor): the last context bank becomes S1-translate/S2-bypass with
+SCTLR.M=0 and a free SMR/S2CR pair maps 0x740 to it. Refuses if that bank is
+in use or no SMR is free; reads everything back.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -84,10 +84,59 @@
+  */
+ #define APPS_SMMU_PA            0x15000000
+ #define USB_SID                 0x740
++/*
++ * boot-arg sweetusbsmmu=2: give the USB stream a way through. Boot 14 showed
++ * the apps SMMU enabled with USFCFG=1 (unidentified streams fault) and no SMR
++ * for SID 0x740 once ABL is gone, so every USB DMA faulted the SoC into
++ * crash-dump mode. This SoC's hypervisor does not take S2CR type bypass, so
++ * do what Linux arm-smmu-qcom does for it (bypass_quirk): the last context
++ * bank becomes S1-translate/S2-bypass with SCTLR.M=0 (no translation, i.e.
++ * physical addresses pass through) and a free SMR/S2CR pair sends 0x740 there.
++ */
++static void
++sweet_usb_smmu_bypass(vm_offset_t g, unsigned nsmr, unsigned ncb, uint32_t idr1)
++{
++	unsigned numpage = 1u << (((idr1 >> 28) & 7) + 1);
++	unsigned cb = ncb - 1;
++	vm_offset_t cbb = g + (vm_offset_t)(numpage + cb) * 0x1000;
++	int free = -1;
++	if (ncb == 0 || (vm_offset_t)(numpage + cb + 1) * 0x1000 > 0x80000) {
++		printf("SWEET SMMU: bypass: CB space outside the mapping, skipped\n");
++		return;
++	}
++	for (unsigned n = 0; n < nsmr && n < 256; n++) {
++		uint32_t smr = usb_rd(g, 0x800 + 4 * n), s2cr = usb_rd(g, 0xc00 + 4 * n);
++		if (!(smr & (1u << 31))) {
++			if (free < 0) {
++				free = (int)n;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == cb) {
++			printf("SWEET SMMU: bypass: CB%u already used by SMR%u, skipped\n", cb, n);
++			return;
++		}
++	}
++	if (free < 0) {
++		printf("SWEET SMMU: bypass: no free SMR, skipped\n");
++		return;
++	}
++	printf("SWEET SMMU: bypass: CB%u CBAR 0x%08x SCTLR 0x%08x -> S1 trans/S2 bypass, M=0; SMR%d <- SID 0x%x\n",
++	    cb, usb_rd(g, 0x1000 + 4 * cb), usb_rd(cbb, 0x0), free, USB_SID);
++	*(volatile uint32_t *)(g + 0x1000 + 4 * cb) = 1u << 16;        /* CBAR TYPE S1_TRANS_S2_BYPASS */
++	*(volatile uint32_t *)(cbb + 0x0) = 0;                         /* SCTLR: translation off */
++	*(volatile uint32_t *)(g + 0xc00 + 4 * free) = cb;             /* S2CR: translate via that bank */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(g + 0x800 + 4 * free) = (1u << 31) | USB_SID;  /* SMR valid, mask 0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET SMMU: bypass: read back SMR%d 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x\n", free,
++	    usb_rd(g, 0x800 + 4 * free), usb_rd(g, 0xc00 + 4 * free), usb_rd(g, 0x1000 + 4 * cb), usb_rd(cbb, 0x0));
++}
++
+ static void
+-sweet_usb_smmu_dump(void)
++sweet_usb_smmu_dump(int mode)
+ {
+-	vm_offset_t g = ml_io_map(APPS_SMMU_PA, 0x2000);
++	vm_offset_t g = ml_io_map(APPS_SMMU_PA, 0x80000);
+ 	if (g == 0) {
+ 		return;
+ 	}
+@@ -116,6 +165,9 @@
+ 	}
+ 	printf("SWEET SMMU: %u valid SMRs, %u match USB SID 0x%x%s\n", valid, hits, USB_SID,
+ 	    hits ? "" : " - unmatched streams follow sCR0.USFCFG");
++	if (mode == 2 && hits == 0 && !page64k) {
++		sweet_usb_smmu_bypass(g, nsmr, ncb, idr1);
++	}
+ }
+ 
+ void
+@@ -129,7 +181,7 @@
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	int smmudump = 0;
+ 	if (PE_parse_boot_argn("sweetusbsmmu", &smmudump, sizeof(smmudump)) && smmudump) {
+-		sweet_usb_smmu_dump();
++		sweet_usb_smmu_dump(smmudump);
+ 	}
+ 	if (!enabled) {
+ 		return;
