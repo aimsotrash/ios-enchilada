@@ -1,0 +1,1180 @@
+enchilada: MSS stage 9 (mss=9): WCN3990 copy engines, HTC, WMI, HTT and a passive scan (Wi-Fi round 5)
+
+mss=9 = mss=8 plus the host side of the WLAN data path, after Linux v6.12 ath10k snoc.c, ce.c,
+htc.c, htt_tx.c and wmi-tlv.c, ported from topaz 0123/0125. Stage 2 gives the WLAN stream (SID
+0x40 mask 0x1, enchilada2.dtb icnss iommus) a free apps-SMMU SMR whose S2CR points at the bypass
+bank CB(n-1) that 0193 sets up for USB, the way arm-smmu-qcom shares one bypass bank; it refuses
+if that bank is not configured or the SID is already routed elsewhere. Once stage 8 reaches
+mission mode: the twelve copy engines at membase 0x18800000 (+0x240000, RRI at +0x24c004,
+shadow source write indices at +0x32000) with host_ce_config_wlan, 64-bit descriptors and the
+read indices in DDR, polled; rings and buffers in 8 MiB of low DDR at 0xa1100000 that XNU does
+not manage, mapped write-combined only. HTC READY, connect HTT_DATA and WMI_CONTROL (one credit,
+use_fw_tx_credits = false; credit reports are 4-byte records, as htc.c parses them), then
+SETUP_COMPLETE_EX; WMI-TLV SERVICE_READY -> INIT (ath10k_wmi_tlv_op_gen_init's resource config
+and host memory chunks) -> READY; HTT VERSION_REQ, FRAG_DESC_BANK_CFG, RX_RING_CFG (htt_rx_desc_v2
+offsets) and AGGR_CFG; a channel list with every channel passive, one station vdev and passive
+scans every 15 s, logging each BSS once (SSID, BSSID, channel, RSSI). Nothing is transmitted.
+Also fixes 0266: ath10k_hw_power_on comes before wlan_enable, so stage 8 now votes the WCN3990
+supplies (mainline sdm845-oneplus-common &wifi: ldoa5 800, ldoa7 1800, ldoa17 1304, ldoa25 and
+ldoa23 3300 mV, HPM) and RF_CLK2 through RPMh before wlan_cfg (new sweet_rpmh_wlan_power; votes
+are never dropped). Any failure or timeout stops the WLAN path with a log line; wlan_mode off
+and the 0262 stop path follow as before. mss<=7 behave as before.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -42,6 +42,8 @@
+  *   7  + pd-mapper, TFTP (modem_a, read-only) and rmtfs (EFS from a RAM copy, writes dropped)
+  * 0266:
+  *   8  + the WLFW QMI client (ath10k qmi.c) up to WLAN mission mode, MSA regions via SCM
++ * 0267:
++ *   9  + apps-SMMU route for the WLAN, copy engines, HTC, WMI, HTT and passive scans (no TX)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -1321,6 +1323,7 @@
+ }
+ 
+ static bool mss_efs_load(void);
++static void wn_smmu(void);
+ 
+ static bool
+ mss_stage2(void)
+@@ -1345,6 +1348,9 @@
+ 	if (!why && mss_mode >= 7 && !mss_efs_load()) {
+ 		why = "efs copy for rmtfs";     /* 0265 */
+ 	}
++	if (!why && mss_mode >= 9) {
++		wn_smmu();                      /* 0267: before the modem boots; a refusal only stops stage 9 */
++	}
+ 	if (!why && !smp2p_create_out()) {
+ 		why = "smp2p item 428";
+ 	}
+@@ -3198,6 +3204,27 @@
+ 	}
+ }
+ 
++/*
++ * 0267: ath10k_hw_power_on before wlan_enable: the five WCN3990 supplies and RF_CLK2 (sweet_rpmh.c).
++ * 0266 sent wlan_cfg/mission without them. Votes only raise; they are not dropped again.
++ */
++extern int sweet_rpmh_wlan_power(void);
++
++static bool
++wlfw_power(void)
++{
++	int err = EBUSY;
++
++	for (unsigned i = 0; i < 50 && err == EBUSY; i++) {
++		if ((err = sweet_rpmh_wlan_power()) == EBUSY) {
++			delay(20000);           /* the touch thread holds the apps RSC */
++		}
++	}
++	printf("SWEET WLFW: WCN3990 power (ldoa5 800, ldoa7 1800, ldoa17 1304, ldoa25/23 3300 mV, rfclka2) -> %s (%d)\n",
++	    err ? "FAILED" : "on", err);
++	return err == 0;
++}
++
+ /* timeouts and the cap retry; true at the end of the watch while wlan_mode off is in flight */
+ static bool
+ wlfw_poll(unsigned t, bool end)
+@@ -3221,8 +3248,12 @@
+ 		}
+ 	}
+ 	if (wl.on && !wl.pending && wl.fw_ready && !wl.cfg_sent) {
+-		wl.cfg_sent = true;             /* ath10k_snoc_wlan_enable */
+-		wlfw_cfg_req();
++		wl.cfg_sent = true;             /* ath10k_snoc_hif_power_up: hw power on, then wlan_enable */
++		if (wlfw_power()) {
++			wlfw_cfg_req();
++		} else {
++			wlfw_fail("wcn3990 power", 0xffff, 0xffff);
++		}
+ 	}
+ 	if (!end || !wl.mission) {
+ 		return false;
+@@ -3244,6 +3275,991 @@
+ 	}
+ }
+ 
++/* ======================================================================================== */
++/*
++ * 0267: stage 9 (mss=9): the host side of the WCN3990 data path once stage 8 reached mission
++ * mode, after Linux v6.12 ath10k snoc.c, ce.c, htc.c, htt_tx.c, wmi-tlv.c, ported from topaz
++ * 0123/0125 and adapted to SDM845:
++ *   apps SMMU: SID 0x40 mask 0x1 (enchilada2.dtb icnss iommus) gets a free SMR whose S2CR points
++ *     at the bypass bank CB(n-1) that 0193 sets up for USB (S1 translate / S2 bypass, SCTLR.M=0),
++ *     as arm-smmu-qcom shares its one bypass bank; done in stage 2, before the modem boots. It
++ *     refuses when that bank is not set up or the SID is already routed elsewhere.
++ *   copy engines: membase 0x18800000 (+0x240000 CEs, +0x24c000 wrapper/RRI, +0x32000 shadow
++ *     source write indices), touched only after mission mode; 64-bit descriptors,
++ *     host_ce_config_wlan, read indices in DDR, polled (no interrupts enabled).
++ *   DMA memory: 8 MiB of low DDR at 0xa1100000 that XNU does not manage (next to the SCM
++ *     scratch), mapped write-combined only, identity through the bypass bank.
++ *   HTC: READY, connect HTT_DATA then WMI_CONTROL (1 credit, use_fw_tx_credits = false),
++ *     SETUP_COMPLETE_EX; WMI-TLV SERVICE_READY -> INIT (resource config and host memory as
++ *     ath10k_wmi_tlv_op_gen_init) -> READY; HTT VERSION_REQ, FRAG_DESC_BANK_CFG, RX_RING_CFG,
++ *     AGGR_CFG (topaz 0125: no beacon reaches the host without the HTT rx ring); then a
++ *     channel list (every channel passive), one station vdev and passive scans. Nothing is
++ *     transmitted; no association.
++ * Any failure or timeout stops this path (logged); stage 8's wlan_mode off and the stop path
++ * follow as before.
++ */
++#define WN_SID                  0x40u
++#define WN_SID_MASK             0x1u
++#define WN_SMMU_PA              0x15000000ull
++#define WN_CE_PA                0x18a40000ull   /* membase 0x18800000 + 0x240000 */
++#define WN_SHADOW_PA            0x18830000ull   /* 16 KiB page holding membase + 0x32000 */
++#define WN_DMA_PA               0xa1100000ull
++#define WN_DMA_SIZE             0x800000u
++#define WN_RXN                  32u     /* rx buffers kept posted per ring */
++#define WN_TXN                  32u
++#define WN_HTT_RING             256u
++#define WN_HTT_BUF              2048u
++#define WN_MSDU_DESC            (1024u + 32u)   /* TARGET_TLV_NUM_MSDU_DESC */
++#define WN_EXT_DESC             72u     /* sizeof(struct htt_msdu_ext_desc_64) */
++#define WN_STEP_MS              5000u   /* each handshake step */
++#define WN_SCAN_EVERY_MS        15000u
++
++/* host_ce_config_wlan (snoc.c): source entries, source max bytes, destination entries */
++static const struct { uint16_t src_n, src_max, dst_n; } wn_cfg[12] = {
++	{ 16, 2048, 0 }, { 0, 2048, 512 }, { 0, 2048, 64 }, { 32, 2048, 0 }, { 2048, 256, 0 }, { 0, 512, 512 },
++	{ 0, 0, 0 }, { 2, 2048, 2 }, { 0, 2048, 128 }, { 0, 2048, 512 }, { 0, 2048, 512 }, { 0, 2048, 512 },
++};
++
++static struct {
++	bool smmu, up, dead;
++	const char *step;
++	unsigned deadline, started_ms;
++	vm_offset_t ce, sh, dma;
++	uint64_t used;                          /* DMA bytes carved */
++	volatile uint32_t *rri;
++	struct {
++		uint8_t *src, *dst, *buf, *txb;
++		uint64_t src_pa, dst_pa, buf_pa, txb_pa;
++		uint32_t sn, dn, swr, dwr, dsw, nbuf, bufsz, ntx, rx, tx;
++	} c[12];
++	/* HTC */
++	bool ready, setup;
++	uint16_t credit_size;
++	struct { uint16_t svc; uint8_t ul, seq; bool up, flow; int credits; unsigned rx; } ep[8];
++	uint8_t wmi_eid, htt_eid;
++	/* WMI */
++	uint32_t svc_map[32], nreq;
++	struct { uint32_t id, unit, info, units; uint64_t pa; uint32_t len; } req[8];
++	bool svc_ready, init_sent, wmi_ready;
++	uint8_t mac[6];
++	/* HTT */
++	unsigned htt_state;                     /* 0 none, 1 version asked, 2 configured */
++	volatile uint64_t *hring;
++	volatile uint32_t *hidx;
++	uint8_t *hbuf;
++	uint64_t hring_pa, hidx_pa, hbank_pa, hbuf_pa;
++	uint32_t halloc, hmsdus;
++	/* scan */
++	bool scanning;
++	unsigned scans, frames, next_scan, nbss, lines;
++	struct { uint8_t bssid[6]; uint8_t chan; int8_t rssi; } bss[64];
++	/* WMI messages waiting for a credit */
++	uint8_t q[8][1536];
++	uint16_t qlen[8];
++	unsigned qh, qt, qdrop;
++} wn;
++
++static void
++wn_fail(const char *why)
++{
++	if (!wn.dead) {
++		printf("SWEET WLAN: %s: FAILED (%s); the WLAN path stops here\n", wn.step ? wn.step : "start", why);
++	}
++	wn.dead = true;
++}
++
++static void
++wn_next(const char *step, unsigned t)
++{
++	wn.step = step;
++	wn.deadline = t + WN_STEP_MS;
++}
++
++/* --- apps SMMU, stage 2 --- */
++static void
++wn_smmu(void)
++{
++	vm_offset_t g = io_map(WN_SMMU_PA, 0x80000, MSS_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++	int slot = -1;
++
++#define SR(o) (*(volatile uint32_t *)(g + (o)))
++	if (!g) {
++		printf("SWEET WLAN: smmu: no mapping\n");
++		return;
++	}
++	uint32_t idr0 = SR(0x20), idr1 = SR(0x24), nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	uint32_t numpage = 1u << (((idr1 >> 28) & 7) + 1), cb = ncb - 1;
++	if ((idr1 >> 31) || ncb == 0 || (numpage + ncb) * 0x1000u > 0x80000u) {
++		printf("SWEET WLAN: smmu: IDR1 %#x not the 4K layout 0193 knows\n", idr1);
++		goto out;
++	}
++	uint32_t cbar = SR(0x1000 + 4 * cb), sctlr = SR((numpage + cb) * 0x1000);
++	if (cbar != (1u << 16) || (sctlr & 1)) {
++		printf("SWEET WLAN: smmu: CB%u CBAR %#x SCTLR %#x is not the bypass bank (sweetusbsmmu=2 sets it up)\n",
++		    cb, cbar, sctlr);
++		goto out;
++	}
++	for (uint32_t n = 0; n < nsmr && n < 128; n++) {
++		uint32_t smr = SR(0x800 + 4 * n), s2cr = SR(0xc00 + 4 * n);
++		uint32_t m = (smr >> 16) & 0x7fff;
++		if (!(smr >> 31)) {
++			slot = slot < 0 ? (int)n : slot;
++			continue;
++		}
++		if ((((smr & 0x7fff) ^ WN_SID) & ~(m | WN_SID_MASK) & 0x7fff) == 0) {
++			wn.smmu = ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == cb;
++			printf("SWEET WLAN: smmu: SMR%u %#x S2CR %#x already matches SID %#x: %s\n", n, smr, s2cr, WN_SID,
++			    wn.smmu ? "the bypass bank, kept" : "routed elsewhere, refused");
++			goto out;
++		}
++	}
++	if (slot < 0) {
++		printf("SWEET WLAN: smmu: no free SMR\n");
++		goto out;
++	}
++	SR(0xc00 + 4 * (uint32_t)slot) = cb;                                    /* S2CR: translate via CB */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	SR(0x800 + 4 * (uint32_t)slot) = (1u << 31) | (WN_SID_MASK << 16) | WN_SID;     /* SMR valid last */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wn.smmu = SR(0x800 + 4 * (uint32_t)slot) == ((1u << 31) | (WN_SID_MASK << 16) | WN_SID) &&
++	    SR(0xc00 + 4 * (uint32_t)slot) == cb;
++	printf("SWEET WLAN: smmu: SID %#x mask %#x -> CB%u (bypass, shared with USB) via SMR%d: SMR %#x S2CR %#x %s\n",
++	    WN_SID, WN_SID_MASK, cb, slot, SR(0x800 + 4 * (uint32_t)slot), SR(0xc00 + 4 * (uint32_t)slot),
++	    wn.smmu ? "ok" : "NOT as written");
++out:
++#undef SR
++	ml_io_unmap(g, 0x80000);
++}
++
++/* --- registers --- */
++static uint32_t
++wn_rd(uint32_t ce, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(wn.ce + ce * 0x1000u + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wn_wr(uint32_t ce, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");      /* descriptors and buffers before the index */
++	*(volatile uint32_t *)(wn.ce + ce * 0x1000u + off) = v;
++}
++
++static uint8_t *
++wn_carve(uint32_t bytes, uint64_t *pa)
++{
++	uint64_t at = (wn.used + 0xfff) & ~0xfffull;
++
++	if (at + bytes > WN_DMA_SIZE) {
++		return NULL;
++	}
++	wn.used = at + bytes;
++	*pa = WN_DMA_PA + at;
++	return (uint8_t *)(wn.dma + (vm_offset_t)at);
++}
++
++/* --- copy engines: ath10k_ce_alloc_rri, ath10k_ce_init_pipe, ath10k_snoc_rx_post --- */
++static bool
++wn_ce_start(void)
++{
++	wn.ce = io_map(WN_CE_PA, 0x10000, MSS_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++	wn.sh = io_map(WN_SHADOW_PA, 0x4000, MSS_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++	wn.dma = io_map(WN_DMA_PA, WN_DMA_SIZE, 0x6u /* VM_WIMG_WCOMB */, VM_PROT_READ | VM_PROT_WRITE, true);
++	if (!wn.ce || !wn.sh || !wn.dma) {
++		return false;
++	}
++	bzero((void *)wn.dma, WN_DMA_SIZE);
++	uint64_t rri_pa = 0;
++	wn.rri = (volatile uint32_t *)wn_carve(12 * 4, &rri_pa);
++	for (uint32_t i = 0; i < 12; i++) {
++		__typeof__(&wn.c[0]) c = &wn.c[i];
++		c->sn = wn_cfg[i].src_n;
++		c->dn = wn_cfg[i].dst_n;
++		if ((c->sn && !(c->src = wn_carve(c->sn * 16, &c->src_pa))) ||
++		    (c->dn && !(c->dst = wn_carve(c->dn * 16, &c->dst_pa)))) {
++			return false;
++		}
++		if (c->dn && i != 7) {                 /* CE7 is the diag window */
++			c->nbuf = MIN(WN_RXN, c->dn / 2);
++			c->bufsz = wn_cfg[i].src_max;
++			if (!(c->buf = wn_carve(c->nbuf * c->bufsz, &c->buf_pa))) {
++				return false;
++			}
++		}
++		if (i == 0 || i == 3 || i == 4) {       /* host -> target: HTC ctrl, WMI, HTT */
++			c->ntx = MIN(WN_TXN, c->sn);
++			if (!(c->txb = wn_carve(c->ntx * wn_cfg[i].src_max, &c->txb_pa))) {
++				return false;
++			}
++		}
++	}
++	wn_wr(0, 0xc004, (uint32_t)rri_pa);                                     /* ce_rri_low/high */
++	wn_wr(0, 0xc008, (uint32_t)(rri_pa >> 32) & 0x1f);
++	for (uint32_t i = 0; i < 12; i++) {
++		wn_wr(i, 0x18, wn_rd(i, 0x18) | (1u << 19));                    /* CTRL1: RRI update */
++	}
++	for (uint32_t i = 0; i < 12; i++) {
++		__typeof__(&wn.c[0]) c = &wn.c[i];
++		if (c->sn) {                            /* ath10k_ce_init_src_ring */
++			c->swr = wn_rd(i, 0x3c) & (c->sn - 1);
++			wn_wr(i, 0x00, (uint32_t)c->src_pa);
++			wn_wr(i, 0x04, (uint32_t)(c->src_pa >> 32) & 0x1f);
++			wn_wr(i, 0x08, c->sn);
++			wn_wr(i, 0x18, (wn_rd(i, 0x18) & ~0xffffu & ~(1u << 17)) | wn_cfg[i].src_max);
++			wn_wr(i, 0x4c, c->sn);          /* low mark 0, high mark n */
++		}
++		if (c->dn) {                            /* ath10k_ce_init_dest_ring */
++			c->dsw = wn_rd(i, 0x48) & (c->dn - 1);
++			c->dwr = wn_rd(i, 0x40) & (c->dn - 1);
++			wn_wr(i, 0x0c, (uint32_t)c->dst_pa);
++			wn_wr(i, 0x10, (wn_rd(i, 0x10) & ~0x1fu) | ((uint32_t)(c->dst_pa >> 32) & 0x1f));
++			wn_wr(i, 0x14, c->dn);
++			wn_wr(i, 0x18, wn_rd(i, 0x18) & ~(1u << 18));
++			wn_wr(i, 0x50, c->dn);
++		}
++	}
++	unsigned posted = 0;
++	for (uint32_t i = 0; i < 12; i++) {
++		__typeof__(&wn.c[0]) c = &wn.c[i];
++		if (!c->nbuf) {
++			continue;
++		}
++		c->dsw = c->dwr;                        /* nothing of ours is pending yet */
++		for (uint32_t k = 0; k < c->nbuf; k++) {
++			uint32_t s = (c->dwr + k) & (c->dn - 1);
++			uint64_t pa = c->buf_pa + (uint64_t)(s % c->nbuf) * c->bufsz;
++			memcpy(c->dst + 16 * s, &pa, 8);
++			posted++;
++		}
++		c->dwr = (c->dwr + c->nbuf) & (c->dn - 1);
++		wn_wr(i, 0x40, c->dwr);
++	}
++	printf("SWEET WLAN: ce: 12 engines programmed, %u rx buffers posted, rings and buffers %#llx+%#llx\n",
++	    posted, WN_DMA_PA, wn.used);
++	return true;
++}
++
++static bool
++wn_ce_send(uint32_t i, const void *d, uint32_t len, uint8_t eid)
++{
++	__typeof__(&wn.c[0]) c = &wn.c[i];
++	uint32_t mask = c->sn - 1;
++	uint32_t hw = (i == 4 ? wn.rri[i] : wn_rd(i, 0x44)) & mask;        /* DIS_INTR CE4: DDR RRI */
++
++	if (!c->ntx || len > wn_cfg[i].src_max || ((c->swr + 1) & mask) == hw || ((c->swr - hw) & mask) >= c->ntx - 1) {
++		return false;
++	}
++	uint32_t s = c->swr;
++	uint64_t pa = c->txb_pa + (uint64_t)(s % c->ntx) * wn_cfg[i].src_max;
++	uint16_t n = (uint16_t)len, fl = (uint16_t)((uint32_t)eid << 4);       /* meta data: the HTC eid */
++	memcpy(c->txb + (s % c->ntx) * wn_cfg[i].src_max, d, len);
++	memcpy(c->src + 16 * s, &pa, 8);
++	memcpy(c->src + 16 * s + 8, &n, 2);
++	memcpy(c->src + 16 * s + 10, &fl, 2);
++	c->swr = (s + 1) & mask;
++	c->tx++;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(wn.sh + 0x2000 + 4 * i) = c->swr;               /* shadow src write index */
++	return true;
++}
++
++/* --- HTC --- */
++static bool
++wn_htc_send(uint8_t eid, const void *p, uint32_t len)
++{
++	static uint8_t b[2048];         /* one thread: kept off the stack */
++	__typeof__(&wn.ep[0]) e;
++
++	if (eid >= 8) {
++		return false;
++	}
++	e = &wn.ep[eid];
++
++	if (!e->up || len + 8 > sizeof(b)) {
++		return false;
++	}
++	int need = e->flow ? (int)((len + 8 + wn.credit_size - 1) / MAX(wn.credit_size, 1)) : 0;
++	if (e->flow && e->credits < need) {
++		return false;
++	}
++	bzero(b, 8);
++	b[0] = eid;
++	b[1] = e->flow ? 0x01 : 0;              /* NEED_CREDIT_UPDATE */
++	b[2] = (uint8_t)len;
++	b[3] = (uint8_t)(len >> 8);
++	b[5] = e->seq++;
++	memcpy(b + 8, p, len);
++	if (!wn_ce_send(e->ul, b, len + 8, eid)) {
++		return false;
++	}
++	e->credits -= need;
++	return true;
++}
++
++static void
++wn_wmi_pump(void)
++{
++	while (wn.qh != wn.qt && wn_htc_send(wn.wmi_eid, wn.q[wn.qh % 8], wn.qlen[wn.qh % 8])) {
++		wn.qh++;
++	}
++}
++
++static void
++wn_wmi_send(uint32_t id, const void *tlvs, uint32_t len)
++{
++	uint8_t *m;
++
++	if (wn.qt - wn.qh >= 8 || len + 4 > sizeof(wn.q[0])) {
++		wn.qdrop++;
++		printf("SWEET WLAN: wmi %#x (%u bytes) dropped\n", id, len);
++		return;
++	}
++	m = wn.q[wn.qt % 8];
++	memcpy(m, &id, 4);
++	memcpy(m + 4, tlvs, len);
++	wn.qlen[wn.qt % 8] = (uint16_t)(len + 4);
++	wn.qt++;
++	wn_wmi_pump();
++}
++
++static void
++wn_htc_connect(uint16_t svc, uint16_t flags)
++{
++	uint8_t m[8] = { 2, 0, (uint8_t)svc, (uint8_t)(svc >> 8), (uint8_t)flags, (uint8_t)(flags >> 8), 0, 0 };
++
++	if (!wn_htc_send(0, m, sizeof(m))) {
++		wn_fail("htc connect not sent");
++	}
++}
++
++static uint8_t *
++wn_tlv(uint8_t *p, uint16_t tag, uint16_t len)
++{
++	memcpy(p, &len, 2);
++	memcpy(p + 2, &tag, 2);
++	return p + 4;
++}
++
++static uint8_t *
++wn_put32(uint8_t *p, uint32_t v)
++{
++	memcpy(p, &v, 4);
++	return p + 4;
++}
++
++/* WMI_SERVICE_IS_ENABLED: 4 bits per word, as ath10k reads the TLV map */
++static bool
++wn_svc(uint32_t bit)
++{
++	return bit < 128 && (wn.svc_map[bit / 4] & (1u << (bit % 4)));
++}
++
++/* ath10k_wmi_tlv_op_gen_init */
++static void
++wn_wmi_init(unsigned t)
++{
++	uint8_t m[4 + 28 + 4 + 176 + 4 + 8 * 20], *p = m;
++	uint32_t rc[44], total = 0, n = 0;
++
++	bzero(m, sizeof(m));
++	for (uint32_t i = 0; i < wn.nreq; i++) {
++		uint32_t units = wn.req[i].units;
++		if (wn.req[i].info & 6) {
++			units = 33 + 1;                 /* NUM_UNITS_IS_NUM_(ACTIVE_)PEERS */
++		} else if (wn.req[i].info & 1) {
++			units = 4 + 1;                  /* NUM_UNITS_IS_NUM_VDEVS */
++		}
++		wn.req[i].len = units * ((wn.req[i].unit + 3) & ~3u);
++		uint8_t *va = wn.req[i].len <= 0x400000 ? wn_carve(wn.req[i].len, &wn.req[i].pa) : NULL;
++		if (va == NULL) {
++			printf("SWEET WLAN: wmi: host memory request %u (%u bytes) does not fit\n", wn.req[i].id, wn.req[i].len);
++			wn_fail("host memory");
++			return;
++		}
++		total += wn.req[i].len;
++		n++;
++	}
++	p = wn_tlv(p, 0x4a, 28);                /* INIT_CMD: abi, num_host_mem_chunks */
++	p = wn_put32(p, 0x01000000);
++	p = wn_put32(p, 53);
++	p = wn_put32(p, 0x5f414351);            /* "QCA_" */
++	p = wn_put32(p, 0x00004c4d);            /* "ML" */
++	p = wn_put32(p, 0);
++	p = wn_put32(p, 0);
++	p = wn_put32(p, n);
++	bzero(rc, sizeof(rc));
++	rc[0] = 4;                              /* TARGET_TLV_NUM_VDEVS */
++	rc[1] = 33;                             /* TARGET_HL_TLV_NUM_PEERS (hw_params.num_peers) */
++	if (wn_svc(65)) {                       /* WMI_TLV_SERVICE_RX_FULL_REORDER */
++		rc[2] = rc[3] = 4;
++	}
++	rc[4] = 2;
++	rc[5] = 66;
++	rc[6] = 16;                             /* ast_skid_limit */
++	rc[7] = rc[8] = 0x7;
++	rc[9] = rc[10] = rc[11] = 0x64;
++	rc[12] = 0x28;
++	rc[13] = 1;                             /* rx_decap_mode: native wifi */
++	rc[14] = 4;
++	rc[15] = rc[16] = 4;
++	rc[17] = 8;
++	rc[21] = 0x400;
++	rc[22] = 2;                             /* num_wds_entries */
++	rc[27] = 2;
++	rc[28] = WN_MSDU_DESC;
++	rc[29] = 2;
++	rc[30] = 1;
++	rc[31] = 0x20;
++	rc[32] = 2;
++	rc[33] = 5;
++	rc[34] = 22;                            /* TARGET_TLV_NUM_WOW_PATTERNS */
++	rc[35] = 6;
++	rc[37] = rc[38] = 1;
++	rc[43] = 1u << 9;                       /* WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL */
++	p = wn_tlv(p, 0x4b, sizeof(rc));
++	memcpy(p, rc, sizeof(rc));
++	p += sizeof(rc);
++	p = wn_tlv(p, 0x12, (uint16_t)(n * 20));
++	for (uint32_t i = 0; i < n; i++) {
++		uint8_t *c = wn_tlv(p, 0x4c, 16);
++		c = wn_put32(c, wn.req[i].id);
++		c = wn_put32(c, (uint32_t)wn.req[i].pa);
++		c = wn_put32(c, wn.req[i].len);
++		(void)wn_put32(c, 0);           /* ptr_high: below 4 GiB */
++		p += 20;
++	}
++	wn_wmi_send(0x1, m, (uint32_t)(p - m));
++	wn.init_sent = true;
++	printf("SWEET WLAN: wmi INIT sent (%u host memory chunks, %u bytes)\n", n, total);
++	wn_next("wmi READY", t);
++}
++
++static void
++wn_svc_ready(const uint8_t *p, uint32_t len)
++{
++	bool bmap = false, reqs = false;
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, p + o, 2);
++		memcpy(&tag, p + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		const uint8_t *v = p + o + 4;
++		if (tag == 0x20 && l >= 8) {
++			uint32_t fw, abi;
++			memcpy(&fw, v, 4);
++			memcpy(&abi, v + 4, 4);
++			printf("SWEET WLAN: wmi SERVICE_READY: fw %#x abi %#x\n", fw, abi);
++		} else if (tag == 0x10 && !bmap) {
++			bmap = true;
++			memcpy(wn.svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wn.svc_map)));
++		} else if (tag == 0x12 && !reqs) {
++			reqs = true;
++			for (uint32_t q = 0; q + 4 <= l;) {
++				uint16_t ql, qt;
++				memcpy(&ql, v + q, 2);
++				memcpy(&qt, v + q + 2, 2);
++				if (q + 4 + ql > l) {
++					break;
++				}
++				if (qt == 0x22 && ql >= 16 && wn.nreq < 8) {
++					memcpy(&wn.req[wn.nreq].id, v + q + 4, 4);
++					memcpy(&wn.req[wn.nreq].unit, v + q + 8, 4);
++					memcpy(&wn.req[wn.nreq].info, v + q + 12, 4);
++					memcpy(&wn.req[wn.nreq].units, v + q + 16, 4);
++					printf("SWEET WLAN: wmi host memory request: id %u unit %u info %#x units %u\n",
++					    wn.req[wn.nreq].id, wn.req[wn.nreq].unit, wn.req[wn.nreq].info, wn.req[wn.nreq].units);
++					wn.nreq++;
++				}
++				q += 4u + ql;
++			}
++		}
++		o += 4u + l;
++	}
++	printf("SWEET WLAN: wmi services: rx_full_reorder %u, %u host memory requests\n", wn_svc(65), wn.nreq);
++}
++
++/* --- HTT (ath10k_htt_setup, 64-bit ops) --- */
++static bool
++wn_htt_send(const void *p, uint32_t len)
++{
++	return wn.htt_eid < 8 && wn_htc_send(wn.htt_eid, p, len);
++}
++
++static void
++wn_htt_post(uint64_t pa)
++{
++	*(volatile uint32_t *)(wn.hbuf + (pa - wn.hbuf_pa) + 4) = 0;   /* rx_attention word */
++	wn.hring[wn.halloc] = pa;
++	wn.halloc = (wn.halloc + 1) & (WN_HTT_RING - 1);
++}
++
++static void
++wn_htt_version(unsigned t)
++{
++	uint8_t m[4] = { 0, 0, 0, 0 };          /* VERSION_REQ */
++	uint8_t *r = wn_carve(WN_HTT_RING * 8 + 64, &wn.hring_pa);
++	uint8_t *b = r ? wn_carve(WN_MSDU_DESC * WN_EXT_DESC, &wn.hbank_pa) : NULL;
++
++	wn.hbuf = b ? wn_carve(WN_HTT_RING * WN_HTT_BUF, &wn.hbuf_pa) : NULL;
++	if (!wn.hbuf) {
++		wn_fail("htt memory");
++		return;
++	}
++	wn.hring = (volatile uint64_t *)r;
++	wn.hidx = (volatile uint32_t *)(r + WN_HTT_RING * 8);
++	wn.hidx_pa = wn.hring_pa + WN_HTT_RING * 8;
++	wn.htt_state = 1;
++	if (!wn_htt_send(m, sizeof(m))) {
++		wn_fail("htt VERSION_REQ not sent");
++		return;
++	}
++	printf("SWEET WLAN: htt VERSION_REQ sent\n");
++	wn_next("htt VERSION_CONF", t);
++}
++
++static void wn_scan_start(unsigned t);
++
++static void
++wn_htt_configure(unsigned t)
++{
++	uint8_t f[64], r[48], *p = f;
++	uint8_t g[4] = { 5, 64, 3, 0 };         /* AGGR_CFG v2: ampdu 64, amsdu 3 (firmware defaults) */
++	uint16_t v;
++
++	bzero(f, sizeof(f));
++	f[0] = 6;                               /* FRAG_DESC_BANK_CFG, info 0 (no peer flow control) */
++	f[2] = 1;                               /* num_banks */
++	f[3] = WN_EXT_DESC;
++	memcpy(f + 4, &wn.hbank_pa, 8);
++	v = WN_MSDU_DESC - 1;
++	memcpy(f + 4 + 32 + 2, &v, 2);          /* bank_id[0] = { 0, max_num_pending_tx - 1 } */
++	f[4 + 32 + 16 + 8] = 1;                 /* q_state.record_size; paddr, peers, tids 0 */
++	bool a = wn_htt_send(f, sizeof(f));
++	for (uint32_t i = 0; i < WN_HTT_RING - 1; i++) {
++		wn_htt_post(wn.hbuf_pa + (uint64_t)i * WN_HTT_BUF);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*wn.hidx = wn.halloc;
++	bzero(r, sizeof(r));
++	p = r;
++	*p++ = 2;                               /* RX_RING_CFG */
++	*p++ = 1;                               /* num_rings */
++	p += 2;
++	memcpy(p, &wn.hidx_pa, 8);
++	p += 8;
++	memcpy(p, &wn.hring_pa, 8);
++	p += 8;
++	static const uint16_t rest[14] = { WN_HTT_RING, WN_HTT_BUF, 0xffff /* every frame type */, 0,
++		/* htt_rx_desc_v2 offsets in words: hdr status, payload, ppdu start/end, mpdu start/end,
++		 * msdu start/end, attention, frag info (computed from ath10k rx_desc.h) */
++		74, 90, 27, 37, 4, 26, 7, 12, 1, 2 };
++	memcpy(p, rest, sizeof(rest));
++	bool b = wn_htt_send(r, sizeof(r));
++	bool c = wn_htt_send(g, sizeof(g));
++	wn.htt_state = 2;
++	printf("SWEET WLAN: htt: frag desc bank %s, rx ring cfg %s (%u buffers), aggr cfg %s\n", a ? "sent" : "FAILED",
++	    b ? "sent" : "FAILED", WN_HTT_RING - 1, c ? "sent" : "FAILED");
++	if (!a || !b || !c) {
++		wn_fail("htt setup");
++		return;
++	}
++	wn_scan_start(t);
++}
++
++static void
++wn_htt_rx(const uint8_t *p, uint32_t len, unsigned t)
++{
++	if (len >= 3 && p[0] == 0x00) {         /* VERSION_CONF: minor, major */
++		printf("SWEET WLAN: htt VERSION_CONF %u.%u\n", p[2], p[1]);
++		if (wn.htt_state == 1) {
++			wn_htt_configure(t);
++		}
++	} else if (len >= 8 && p[0] == 0x12 && wn.htt_state == 2) {   /* RX_IN_ORD_PADDR_IND */
++		uint16_t n;
++		memcpy(&n, p + 6, 2);
++		for (uint32_t i = 0; i < n && 8 + 12 * (i + 1) <= len; i++) {
++			uint64_t pa;
++			memcpy(&pa, p + 8 + 12 * i, 8);
++			if (pa >= wn.hbuf_pa && pa < wn.hbuf_pa + (uint64_t)WN_HTT_RING * WN_HTT_BUF &&
++			    (pa - wn.hbuf_pa) % WN_HTT_BUF == 0) {
++				wn.hmsdus++;
++				wn_htt_post(pa);        /* recycled: data frames are for later */
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*wn.hidx = wn.halloc;
++	}
++}
++
++/* --- scan --- */
++static const uint16_t wn_freq[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620,
++	5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825,
++};
++#define WN_NFREQ ((uint32_t)(sizeof(wn_freq) / sizeof(wn_freq[0])))
++
++static void
++wn_scan_req(unsigned t)
++{
++	uint8_t m[4 + 100 + 4 + 4 * WN_NFREQ + 4 + 4 + 8 + 4], *c;
++
++	bzero(m, sizeof(m));
++	c = wn_tlv(m, 0x4d, 100);               /* START_SCAN_CMD */
++	c = wn_put32(c, 0xa000 + wn.scans + 1); /* scan_id */
++	c = wn_put32(c, 0xa001);                /* scan_req_id */
++	c = wn_put32(c, 0);                     /* vdev 0 */
++	c = wn_put32(c, 1);                     /* priority low */
++	c = wn_put32(c, 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x100);  /* started, completed, channels, dequeued */
++	c = wn_put32(c, 50);                    /* dwell active */
++	c = wn_put32(c, 150);                   /* dwell passive */
++	c = wn_put32(c, 50);                    /* min rest */
++	c = wn_put32(c, 500);                   /* max rest */
++	c += 12;                                /* repeat probe, probe spacing, idle */
++	c = wn_put32(c, 30000);                 /* max scan time */
++	c = wn_put32(c, 5);                     /* probe delay */
++	c = wn_put32(c, (0x1 | 0x10) ^ 0x20);   /* passive, chan stat; the TLV inverts FILTER_PROBE_REQ */
++	c += 4;                                 /* burst duration */
++	c = wn_put32(c, WN_NFREQ);
++	c = wn_put32(c, 1);                     /* num_bssids */
++	c += 4;                                 /* num_ssids */
++	c += 4;                                 /* ie_len */
++	c = wn_put32(c, 3);                     /* num_probes (unused: passive) */
++	c += 16;                                /* mac addr, mask */
++	c = wn_tlv(c, 0x10, (uint16_t)(4 * WN_NFREQ));
++	for (uint32_t i = 0; i < WN_NFREQ; i++) {
++		c = wn_put32(c, wn_freq[i]);
++	}
++	c = wn_tlv(c, 0x13, 0);                 /* ssids */
++	c = wn_tlv(c, 0x13, 8);                 /* bssids: broadcast */
++	memset(c, 0xff, 6);
++	c = wn_tlv(c + 8, 0x11, 0);             /* ie */
++	wn_wmi_send(0x3001, m, (uint32_t)(c - m));
++	wn.scanning = true;
++	printf("SWEET WLAN: scan %u: passive scan of %u channels requested\n", wn.scans + 1, WN_NFREQ);
++	wn_next("scan", t + 30000);
++}
++
++static void
++wn_scan_start(unsigned t)
++{
++	static uint8_t m[8 + 4 + WN_NFREQ * 28];
++	uint8_t v[24], *p = m, *c;
++	uint8_t mac[6] = { 0x02, 0x00, 0x00, 0x53, 0x57, 0x54 };
++
++	p = wn_put32(wn_tlv(p, 0x4f, 4), WN_NFREQ);     /* SCAN_CHAN_LIST_CMD */
++	p = wn_tlv(p, 0x12, (uint16_t)(WN_NFREQ * 28));
++	for (uint32_t i = 0; i < WN_NFREQ; i++) {
++		uint32_t f = wn_freq[i], dfs = f >= 5260 && f <= 5720;
++		uint32_t flags = (f < 4000 ? 1u : 0u) | (1u << 7) | (1u << 11) | (f < 4000 ? 0 : (1u << 12)) | (dfs << 10);
++		c = wn_tlv(p, 0x50, 24);        /* CHANNEL: mhz, center1, center2, mode|flags, reginfo0/1 */
++		c = wn_put32(c, f);
++		c = wn_put32(c, f);
++		c = wn_put32(c, 0);
++		c = wn_put32(c, flags);         /* mode 11G / 11A, PASSIVE, ALLOW_HT (+VHT, DFS) */
++		c = wn_put32(c, (40u << 8) | (40u << 16));
++		p = wn_put32(c, 40u << 8);
++	}
++	wn_wmi_send(0x3003, m, (uint32_t)(p - m));
++	if (wn.mac[0] | wn.mac[1] | wn.mac[2] | wn.mac[3] | wn.mac[4] | wn.mac[5]) {
++		memcpy(mac, wn.mac, 6);
++	}
++	bzero(v, sizeof(v));
++	c = wn_tlv(v, 0x56, 20);                /* VDEV_CREATE_CMD: vdev 0, station */
++	c = wn_put32(c, 0);
++	c = wn_put32(c, 2);
++	c = wn_put32(c, 0);
++	memcpy(c, mac, 6);
++	wn_wmi_send(0x5001, v, sizeof(v));
++	printf("SWEET WLAN: scan: channel list (%u, all passive), station vdev 0 %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    WN_NFREQ, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++	wn_scan_req(t);
++}
++
++static void
++wn_mgmt_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t h[6] = { 0, 0, 0, 0, 0, 0 }, flen = 0;
++	const uint8_t *f = NULL;
++	bool hdr = false;
++	char ssid[33];
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, p + o, 2);
++		memcpy(&tag, p + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == 0x2c && l >= 24 && !hdr) {  /* MGMT_RX_HDR: channel, snr, rate, phy, buf_len */
++			memcpy(h, p + o + 4, 24);
++			hdr = true;
++		} else if (tag == 0x11 && !f) {
++			f = p + o + 4;
++			flen = l;
++		}
++		o += 4u + l;
++	}
++	if (!hdr || !f || (flen = MIN(h[4], flen)) < 36 || (f[0] & 0x0c) || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
++		return;                         /* beacons and probe responses only */
++	}
++	wn.frames++;
++	int rssi = (int)h[1] - 95;              /* snr + ATH10K_DEFAULT_NOISE_FLOOR */
++	uint32_t chan = h[0];
++	strlcpy(ssid, "<hidden>", sizeof(ssid));
++	for (uint32_t o = 36; o + 2 <= flen && o + 2 + f[o + 1] <= flen; o += 2u + f[o + 1]) {
++		if (f[o] == 0 && f[o + 1] && f[o + 2]) {
++			uint32_t n = MIN((uint32_t)f[o + 1], 32u);
++			for (uint32_t i = 0; i < n; i++) {
++				ssid[i] = (f[o + 2 + i] >= 0x20 && f[o + 2 + i] < 0x7f) ? (char)f[o + 2 + i] : '?';
++			}
++			ssid[n] = '\0';
++		} else if (f[o] == 3 && f[o + 1] == 1) {
++			chan = f[o + 2];        /* DS parameter set */
++		}
++	}
++	for (unsigned i = 0; i < wn.nbss; i++) {
++		if (memcmp(wn.bss[i].bssid, f + 16, 6) == 0) {
++			wn.bss[i].rssi = (int8_t)MAX((int)wn.bss[i].rssi, rssi);
++			return;
++		}
++	}
++	if (wn.nbss < sizeof(wn.bss) / sizeof(wn.bss[0])) {
++		memcpy(wn.bss[wn.nbss].bssid, f + 16, 6);
++		wn.bss[wn.nbss].chan = (uint8_t)chan;
++		wn.bss[wn.nbss].rssi = (int8_t)rssi;
++		wn.nbss++;
++	}
++	if (wn.lines++ < 200) {
++		printf("SWEET WLAN: bss %u: '%s' %02x:%02x:%02x:%02x:%02x:%02x ch %u %d dBm\n", wn.nbss, ssid, f[16], f[17],
++		    f[18], f[19], f[20], f[21], chan, rssi);
++	}
++}
++
++static void
++wn_wmi_rx(const uint8_t *d, uint32_t len, unsigned t)
++{
++	uint32_t id;
++
++	if (len < 4) {
++		return;
++	}
++	memcpy(&id, d, 4);
++	id &= 0xffffff;
++	if (id == 0x1 && !wn.svc_ready) {       /* SERVICE_READY */
++		wn.svc_ready = true;
++		wn_svc_ready(d + 4, len - 4);
++		wn_wmi_init(t);
++	} else if (id == 0x2 && !wn.wmi_ready) {        /* READY: abi (24), mac (8), status */
++		uint32_t st = 0;
++		if (len >= 4 + 4 + 36) {
++			memcpy(wn.mac, d + 8 + 24, 6);
++			memcpy(&st, d + 8 + 32, 4);
++		}
++		wn.wmi_ready = true;
++		printf("SWEET WLAN: wmi READY: mac %02x:%02x:%02x:%02x:%02x:%02x status %u\n", wn.mac[0], wn.mac[1],
++		    wn.mac[2], wn.mac[3], wn.mac[4], wn.mac[5], st);
++		wn_htt_version(t);
++	} else if (id == 0x3001 && len >= 8 + 24) {    /* SCAN_EVENT */
++		uint32_t e[2];
++		memcpy(e, d + 8, 8);
++		if (e[0] & (0x2 | 0x20 | 0x40)) {      /* completed, preempted, start failed */
++			wn.scanning = false;
++			wn.scans++;
++			printf("SWEET WLAN: scan %u done (event %#x reason %u): %u networks so far, %u beacons/probe responses, "
++			    "%u htt msdus\n", wn.scans, e[0], e[1], wn.nbss, wn.frames, wn.hmsdus);
++			if (wn.scans == 1 && mss_reached == 8) {
++				mss_reached = 9;
++				printf("SWEET MSS: stage 9: ok: first passive scan done after %u ms, %u networks\n",
++				    t - wn.started_ms, wn.nbss);
++			}
++			wn.next_scan = t + WN_SCAN_EVERY_MS;
++			wn_next("idle", t + 3600000);
++		} else if (e[0] & 0x1) {
++			printf("SWEET WLAN: scan %u started\n", wn.scans + 1);
++		}
++	} else if (id == 0x7001) {              /* MGMT_RX */
++		wn_mgmt_rx(d + 4, len - 4);
++	}
++}
++
++static void
++wn_htc_ctrl(const uint8_t *p, uint32_t len, unsigned t)
++{
++	uint16_t msg = 0;
++
++	if (len >= 2) {
++		memcpy(&msg, p, 2);
++	}
++	if (msg == 1 && len >= 8 && !wn.ready) {        /* READY: credit_count, credit_size, max_endpoints */
++		uint16_t cc, cs;
++		memcpy(&cc, p + 2, 2);
++		memcpy(&cs, p + 4, 2);
++		printf("SWEET WLAN: htc READY: credits %u x %u bytes, %u endpoints\n", cc, cs, p[6]);
++		if (cs == 0) {
++			wn_fail("credit size 0");
++			return;
++		}
++		wn.ready = true;
++		wn.credit_size = cs;
++		wn_htc_connect(0x300, 1u << 3);         /* HTT_DATA_MSG, no credit flow */
++		wn_next("htc connect HTT", t);
++	} else if (msg == 3 && len >= 8) {      /* CONNECT_SERVICE_RESP: service, status, eid, max */
++		uint16_t svc, max;
++		memcpy(&svc, p + 2, 2);
++		memcpy(&max, p + 6, 2);
++		uint8_t st = p[4], eid = p[5];
++		printf("SWEET WLAN: htc connect svc %#x -> status %u eid %u max_msg %u\n", svc, st, eid, max);
++		if (st != 0 || eid == 0 || eid >= 8 || (svc != 0x300 && svc != 0x100)) {
++			wn_fail("htc connect");
++			return;
++		}
++		wn.ep[eid].svc = svc;
++		wn.ep[eid].up = true;
++		wn.ep[eid].ul = svc == 0x100 ? 3 : 4;
++		wn.ep[eid].flow = svc == 0x100;
++		wn.ep[eid].credits = svc == 0x100 ? 1 : 0;      /* tx_alloc = total_transmit_credits = 1 */
++		if (svc == 0x300) {
++			wn.htt_eid = eid;
++			wn_htc_connect(0x100, 1u << 8);         /* WMI_CONTROL, recv_alloc 1 */
++			wn_next("htc connect WMI", t);
++		} else {
++			uint8_t m[12] = { 5 };                  /* SETUP_COMPLETE_EX */
++			wn.wmi_eid = eid;
++			wn.setup = wn_htc_send(0, m, sizeof(m));
++			printf("SWEET WLAN: htc SETUP_COMPLETE_EX %s\n", wn.setup ? "sent" : "FAILED");
++			if (!wn.setup) {
++				wn_fail("setup complete");
++			}
++			wn_next("wmi SERVICE_READY", t);
++		}
++	}
++}
++
++/* ath10k_htc_rx_completion_handler: header, trailer (credit reports), then the endpoint */
++static void
++wn_htc_rx(uint32_t ce, const uint8_t *d, uint32_t len, unsigned t)
++{
++	if (len < 8 || d[0] >= 8) {
++		return;
++	}
++	uint8_t eid = d[0];
++	uint32_t pl = (uint32_t)d[2] | (uint32_t)d[3] << 8, tl = 0;
++	if (pl + 8 > len) {
++		return;
++	}
++	if (d[1] & 0x02) {                      /* trailer present */
++		tl = d[4];
++		if (tl < 4 || tl > pl) {
++			return;
++		}
++		for (uint32_t o = pl + 8 - tl; o + 4 <= pl + 8;) {
++			uint32_t rl = d[o + 1];
++			if (o + 4 + rl > pl + 8) {
++				break;
++			}
++			for (uint32_t k = 0; d[o] == 1 && k + 4 <= rl; k += 4) {  /* credit reports */
++				if (d[o + 4 + k] < 8) {
++					wn.ep[d[o + 4 + k]].credits += d[o + 5 + k];
++				}
++			}
++			o += 4 + rl;
++		}
++		wn_wmi_pump();
++	}
++	wn.ep[eid].rx++;
++	if (pl <= tl) {
++		return;
++	}
++	if (ce == 5 || (eid == wn.htt_eid && wn.htt_eid)) {
++		wn_htt_rx(d + 8, pl - tl, t);
++	} else if (eid == 0) {
++		wn_htc_ctrl(d + 8, pl - tl, t);
++	} else if (eid == wn.wmi_eid && wn.wmi_eid) {
++		wn_wmi_rx(d + 8, pl - tl, t);
++	}
++}
++
++static void
++wn_ce_poll(unsigned t)
++{
++	for (uint32_t i = 0; i < 12 && !wn.dead; i++) {
++		__typeof__(&wn.c[0]) c = &wn.c[i];
++		for (unsigned k = 0; c->nbuf && k < 16; k++) {
++			uint32_t s = c->dsw;
++			uint16_t n;
++			memcpy(&n, c->dst + 16 * s + 8, 2);
++			if (n == 0) {
++				break;
++			}
++			__asm__ volatile ("dmb oshld" ::: "memory");   /* the payload after its descriptor */
++			bzero(c->dst + 16 * s + 8, 2);
++			c->dsw = (s + 1) & (c->dn - 1);
++			c->rx++;
++			if (n <= c->bufsz) {
++				wn_htc_rx(i, c->buf + (s % c->nbuf) * c->bufsz, n, t);
++			}
++			uint64_t pa = c->buf_pa + (uint64_t)(s % c->nbuf) * c->bufsz;  /* the same buffer again */
++			memcpy(c->dst + 16 * c->dwr, &pa, 8);
++			c->dwr = (c->dwr + 1) & (c->dn - 1);
++			wn_wr(i, 0x40, c->dwr);
++		}
++	}
++}
++
++/* from the stage-6 loop, every millisecond */
++static void
++wn_poll(unsigned t)
++{
++	if (mss_mode < 9 || wn.dead || !wl.mission || wl.off_sent) {
++		return;
++	}
++	if (!wn.up) {
++		wn.up = true;
++		wn.started_ms = t;
++		wn.htt_eid = wn.wmi_eid = 0;
++		wn.ep[0].up = true;             /* HTC control: CE0 out */
++		wn.ep[0].ul = 0;
++		wn_next("htc READY", t);
++		if (!wn.smmu) {
++			wn_fail("no SMMU route for SID 0x40");
++		} else if (!wn_ce_start()) {
++			wn_fail("ce setup: mapping or DMA memory");
++		}
++		return;
++	}
++	wn_ce_poll(t);
++	wn_wmi_pump();
++	if (wn.htt_state == 1 && t > wn.deadline) {
++		printf("SWEET WLAN: htt: no VERSION_CONF in %u ms, configuring anyway (topaz 0125)\n", WN_STEP_MS);
++		wn_htt_configure(t);
++	} else if (!wn.scanning && wn.next_scan && t >= wn.next_scan) {
++		wn.next_scan = 0;
++		wn_scan_req(t);
++	} else if (t > wn.deadline) {
++		wn_fail("timeout");
++	}
++}
++
++static void
++wn_summary(void)
++{
++	printf("SWEET WLAN: summary: step %s%s, %u scans, %u networks, %u frames, %u htt msdus, wmi queue drops %u, "
++	    "ce rx %u/%u/%u tx %u/%u/%u\n", wn.step ? wn.step : "not started", wn.dead ? " (stopped)" : "", wn.scans,
++	    wn.nbss, wn.frames, wn.hmsdus, wn.qdrop, wn.c[1].rx, wn.c[2].rx, wn.c[9].rx, wn.c[0].tx, wn.c[3].tx,
++	    wn.c[4].tx);
++	for (unsigned i = 0; i < wn.nbss; i++) {
++		printf("SWEET WLAN:   %02x:%02x:%02x:%02x:%02x:%02x ch %u %d dBm\n", wn.bss[i].bssid[0], wn.bss[i].bssid[1],
++		    wn.bss[i].bssid[2], wn.bss[i].bssid[3], wn.bss[i].bssid[4], wn.bss[i].bssid[5], wn.bss[i].chan,
++		    wn.bss[i].rssi);
++	}
++}
++
+ static void
+ qrtr_data(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
+ {
+@@ -3643,6 +4659,7 @@
+ 		}
+ 		glink_poll(t);
+ 		(void)wlfw_poll(t, false);
++		wn_poll(t);                     /* 0267 */
+ 		if (wl.mission && mss_reached == 7) {
+ 			mss_reached = 8;
+ 			printf("SWEET MSS: stage 8: ok: WLAN firmware in mission mode after %u ms\n", wl.ready_ms);
+@@ -3669,6 +4686,9 @@
+ 	if (mss_mode >= 8) {
+ 		wlfw_summary();
+ 	}
++	if (mss_mode >= 9) {
++		wn_summary();
++	}
+ 	if (!up) {
+ 		printf("SWEET MSS: stage 6: FAILED: %s\n", why ? why : "?");
+ 	} else if (why) {
+@@ -3835,7 +4855,7 @@
+ 		mss_win_va = 0;
+ 	}
+ 	printf("SWEET MSS: done: mss=%d, last good stage %d%s\n", mode, reached,
+-	    reached == (mode > 8 ? 8 : mode) ? "" : " (stopped early)");
++	    reached == (mode > 9 ? 9 : mode) ? "" : " (stopped early)");
+ 	mss_efs_free();
+ 	(void)thread_terminate(current_thread());
+ }
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -15,6 +15,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_ddr_vote(void);
+ int sweet_rpmh_arc_vote(const char *res, int corner, unsigned *sent);
++int sweet_rpmh_wlan_power(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u     /* sweet (SM7150) default */
+@@ -600,5 +601,56 @@
+ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++/*
++ * 0267: the WCN3990 supplies of mainline sdm845-oneplus-common.dtsi &wifi (v6.12) at their fixed
++ * DT voltages, HPM, enabled, then RPMH_RF_CLK2 ("rfclka2", VRM enable at +4), as ath10k_hw_power_on
++ * does before wlan_enable. ACTIVE votes only; never turned off again: the apps DRV's earlier vote
++ * on a shared rail is unknown (as the cx/mx votes of 0261/0262). SDM845 and these names only.
++ */
++int
++sweet_rpmh_wlan_power(void)
++{
++	static const struct { const char *res; uint32_t mv; } rails[] = {
++		{ "ldoa5", 800 }, { "ldoa7", 1800 }, { "ldoa17", 1304 }, { "ldoa25", 3300 }, { "ldoa23", 3300 },
++	};
++	int error = 0;
++
++	rh_bases();
++	if (rh_rsc_pa != 0x179e0000u || rh_tcs_pa != 0x179e0d00u) {
++		printf("SWEET RPMH: WLAN power is SDM845-only; not sent\n");
++		return ENODEV;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		error = EIO;
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); i++) {
++		uint32_t address = 0;
++		if ((error = rh_lookup(rails[i].res, RH_VRM, &address, NULL, NULL)) == 0) {
++			const uint32_t addr[3] = {address, address + 8, address + 4};
++			const uint32_t values[3] = {rails[i].mv, 7, 1};
++			const uint32_t msgid[3] = {RH_WRITE_ACK, RH_WRITE_ACK, RH_WRITE_ACK};
++			char what[40];
++			snprintf(what, sizeof(what), "%s %u mV mode=7 enable=1", rails[i].res, rails[i].mv);
++			error = rh_send(3, addr, values, msgid, 7, what);
++		}
++	}
++	if (!error) {
++		uint32_t address = 0;
++		if ((error = rh_lookup("rfclka2", RH_VRM, &address, NULL, NULL)) == 0) {
++			const uint32_t addr = address + 4, value = 1, msgid = RH_WRITE_ACK;
++			error = rh_send(1, &addr, &value, &msgid, 1, "rfclka2 enable=1");
++		}
++	}
++	printf("SWEET RPMH: WLAN power votes %s (errno %d)\n", error ? "FAILED" : "complete", error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
