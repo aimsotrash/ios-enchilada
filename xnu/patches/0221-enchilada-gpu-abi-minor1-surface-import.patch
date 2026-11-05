@@ -1,0 +1,187 @@
+enchilada: GPU: SweetAdreno ABI minor 1, so the GL library imports display surfaces in place
+
+0220 maps cacheable single-plane IOSurfaces for the GPU, but SURFACE_BO was never called
+(gl-run-22: "copied, not shared: (the library refused)", every frame still ~72 ms copied out and
+~20 ms refilled). The library (Mesa with Bergamota's OSMesa/freedreno patch, reached through
+sweetca_gl.c's OSMesaSweetWrapTexture) gives up before asking the kernel: its sampling import
+(sweet_hw_wrapped_resource) returns nothing unless INFO.abi_minor >= 1, and this kernel left that
+word (our `reserved`) 0. INFO now reports abi_minor 1, and SURFACE_BO dispatches on the input
+length: 48 bytes is the minor-0 struct and is answered exactly as before; 112 bytes is the minor-1
+struct, which adds flags (in: only IN_SYNC, anything else unsupported; out: CPU_CACHEABLE for a
+cacheable surface), tiling and ubwc (always 0: linear, uncompressed) and three plane descriptions
+(plane[0] is the whole surface when it has no planes). What is mapped is unchanged from 0220: only
+cacheable single-plane IOBufferMemoryDescriptor surfaces in place, client memory and planar ones
+still refused (so the read-only and client-memory out bits are never set, and no writable alias:
+minor 2 is not offered), and SUBMIT still cleans such a surface, which is what IN_SYNC asks for.
+SURFACE_BO is not idempotent here (each call is a new handle; the library does not look for the
+"existing" bit). Mesa keeps an imported BO until OSMesaSweetForgetSurface, which this port's
+glue never calls, and CoreAnimation makes a new display surface every frame, so one client may
+hold at most 256 MB of surfaces in place; past that it is refused once with a log line and the
+client copies, as before. glzc0=1 makes INFO report minor 0 again (and SURFACE_BO keeps refusing
+cacheable surfaces), so the library is back on the copy path exactly as with 0198.
+
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -24,6 +24,7 @@
+ /* IOServiceMatching() name of the service; IOServiceOpen(type 0) gives the connection. */
+ #define SWEET_GPU_SERVICE_NAME          "SweetAdreno630"
+ #define SWEET_GPU_ABI_VERSION           1
++#define SWEET_GPU_ABI_MINOR             1       /* 0221: INFO.abi_minor (0 with glzc0=1) */
+ 
+ /* Selectors of IOConnectCallStructMethod. */
+ enum sweet_gpu_selector {
+@@ -165,12 +166,18 @@
+ 	uint64_t va_start;      /* GPU address range the kernel places BOs in */
+ 	uint64_t va_size;
+ 	uint32_t last_fence;    /* last submitted sequence number */
+-	uint32_t reserved;
++	uint32_t abi_minor;     /* 0221: 1 = SURFACE_BO takes the longer struct below (flags, tiling, planes) */
+ };
+ 
+ /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
+  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
+ #define SWEET_GPU_DESCRIBE_ONLY         0xffffffffu
++struct sweet_gpu_surface_plane {        /* 0221 */
++	uint32_t offset;        /* in the BO */
++	uint32_t stride;        /* bytes a row */
++	uint32_t width;
++	uint32_t height;
++};
+ struct sweet_gpu_surface_bo {
+ 	uint32_t surface_id;    /* in: IOSurfaceGetID() */
+ 	uint32_t handle;        /* in: DESCRIBE_ONLY or 0; out: BO handle (0 when describing) */
+@@ -182,7 +189,21 @@
+ 	uint32_t height;
+ 	uint32_t pixel_format;
+ 	uint32_t planes;
++	/*
++	 * 0221, minor 1. A caller that sends SWEET_GPU_SURFACE_BO_SIZE_MINOR1 bytes gets them all back; one
++	 * that sends SWEET_GPU_SURFACE_BO_SIZE_MINOR0 (the fields above) is answered as before. Client-memory
++	 * surfaces are still refused here, so the read-only (0x1) and client-memory (0x4) out bits never appear.
++	 */
++	uint32_t flags;         /* in: SWEET_GPU_SBO_IN_SYNC only (others: unsupported); out: SWEET_GPU_SBO_CPU_CACHEABLE */
++	uint32_t tiling;        /* out: 0, linear */
++	uint32_t ubwc;          /* out: 0, not compressed */
++	uint32_t reserved;
++	struct sweet_gpu_surface_plane plane[3];        /* out: the first three; planes == 0: plane[0] is the whole surface */
+ };
++#define SWEET_GPU_SURFACE_BO_SIZE_MINOR0 48
++#define SWEET_GPU_SURFACE_BO_SIZE_MINOR1 112
++#define SWEET_GPU_SBO_IN_SYNC           0x1     /* in: CPU writes cleaned before the GPU reads (here: at every SUBMIT anyway) */
++#define SWEET_GPU_SBO_CPU_CACHEABLE     0x2     /* out: CPU mappings are cacheable, BO_SYNC around CPU access */
+ 
+ struct sweet_gpu_bo_sync {
+ 	uint32_t handle;
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -123,6 +123,14 @@
+  * IOSurface lock and the panel copy (sweet_surface_gpu_settle). glzc0=1: refused as with 0198.
+  */
+ #define SETTLE_PATIENCE_MS      100u
++/*
++ * 0221: bytes of surfaces one client may hold in place. The GPU mapping pins a surface until GEM_CLOSE,
++ * and a client that never closes (Mesa keeps a wrapped texture's BO until OSMesaSweetForgetSurface)
++ * would pin every surface CoreAnimation makes. ponytail: fixed cap (~18 full-screen BGRA surfaces);
++ * past it the client copies, as before 0220. Raise it once the client releases what it imports.
++ */
++#define SURF_ZC_BYTES_MAX       (256ull << 20)
++static_assert(sizeof(struct sweet_gpu_surface_bo) == SWEET_GPU_SURFACE_BO_SIZE_MINOR1, "SURFACE_BO minor 1 is 112 bytes");
+ static int gSurfZc = -1;
+ 
+ static bool
+@@ -235,7 +243,7 @@
+ 	IOReturn cpuPrep(struct sweet_msm_gem_cpu_prep *r);
+ 	IOReturn submit(struct sweet_msm_gem_submit *r);
+ 	IOReturn waitFenceCall(struct sweet_msm_wait_fence *r);
+-	IOReturn surfaceBo(struct sweet_gpu_surface_bo *r);
++	IOReturn surfaceBo(struct sweet_gpu_surface_bo *r, bool minor1);
+ 	IOReturn boSync(struct sweet_gpu_bo_sync *r);
+ 
+ public:
+@@ -935,8 +943,12 @@
+ }
+ 
+ IOReturn
+-SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
++SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r, bool minor1)
+ {
++	/* 0221: of the minor-1 input flags only IN_SYNC, which SUBMIT does for these surfaces anyway */
++	if (minor1 && (r->flags & ~SWEET_GPU_SBO_IN_SYNC) != 0) {
++		return kIOReturnUnsupported;
++	}
+ 	SweetSurface *s = sweet_surface_copy(r->surface_id);
+ 	IOReturn ret;
+ 
+@@ -956,6 +968,22 @@
+ 	r->pixel_format = s->pixelFormat;
+ 	r->planes = s->planeCount;
+ 	r->iova = 0;
++	if (minor1) {
++		/* 0221: always linear and uncompressed; plane[0] is the whole surface when it has no planes */
++		uint32_t n = s->planeCount == 0 ? 1u : s->planeCount < 3u ? s->planeCount : 3u;
++		r->flags = s->mapCache != kIOMapWriteCombineCache ? SWEET_GPU_SBO_CPU_CACHEABLE : 0;
++		r->tiling = 0;
++		r->ubwc = 0;
++		r->reserved = 0;
++		bzero(r->plane, sizeof(r->plane));
++		for (uint32_t i = 0; i < n; i++) {
++			const struct sweet_surface_plane *pl = s->planeCount != 0 ? &s->planes[i] : NULL;
++			r->plane[i].offset = pl != NULL ? pl->offset : s->offset;
++			r->plane[i].stride = pl != NULL ? pl->bytesPerRow : s->bytesPerRow;
++			r->plane[i].width = pl != NULL ? pl->width : s->width;
++			r->plane[i].height = pl != NULL ? pl->height : s->height;
++		}
++	}
+ 	if (r->handle == SWEET_GPU_DESCRIBE_ONLY) {
+ 		r->handle = 0;
+ 		s->release();
+@@ -995,8 +1023,19 @@
+ 	}
+ 	IOLockLock(gAdrenoLock);
+ 	ret = kIOReturnNoResources;
++	uint64_t inPlace = 0;
++	for (uint32_t i = 0; zc && i < GEM_MAX; i++) {
++		inPlace += (fGems[i].md != NULL && fGems[i].zc) ? fGems[i].size : 0;
++	}
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
++	} else if (zc && inPlace + size > SURF_ZC_BYTES_MAX) {
++		static bool toldFull;
++		if (!toldFull) {
++			toldFull = true;
++			IOLog("SWEET GPU: surface %u: this client already holds %llu MB of surfaces in place, the client copies\n",
++			    s->id, (unsigned long long)(inPlace >> 20));
++		}
+ 	} else {
+ 		for (uint32_t n = 0; n < GEM_MAX; n++) {
+ 			uint32_t i = (fNextGem + n) % GEM_MAX;
+@@ -1250,6 +1289,7 @@
+ 		break;
+ 	case SWEET_GPU_SEL_INFO: {
+ 		uint64_t v = 0;
++		uint32_t minor = surfZc() ? SWEET_GPU_ABI_MINOR : 0;    /* 0221: glzc0=1 keeps clients on the minor-0 copy path */
+ 		IOLockLock(gAdrenoLock);
+ 		r.info.abi_version = SWEET_GPU_ABI_VERSION;
+ 		r.info.flags = sweet_gpu_ready() ? 1u : 2u;
+@@ -1258,14 +1298,18 @@
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+ 		r.info.va_size = sweet_gpu_param(SWEET_MSM_PARAM_VA_SIZE, &v) ? v : 0;
+ 		r.info.last_fence = sweet_gpu_ready() ? sweet_gpu_fence_last() : 0;
++		r.info.abi_minor = minor;
+ 		IOLockUnlock(gAdrenoLock);
+ 		outLen = sizeof(r.info);
+ 		break;
+ 	}
+ 	case SWEET_GPU_SEL_SURFACE_BO:
+-		NEED(struct sweet_gpu_surface_bo);
+-		ret = surfaceBo(&r.surface);
+-		outLen = sizeof(r.surface);
++		/* 0221: the minor-0 struct or the minor-1 one, answered at the length it came in */
++		if (in < SWEET_GPU_SURFACE_BO_SIZE_MINOR0) {
++			return kIOReturnBadArgument;
++		}
++		ret = surfaceBo(&r.surface, in >= SWEET_GPU_SURFACE_BO_SIZE_MINOR1);
++		outLen = in >= SWEET_GPU_SURFACE_BO_SIZE_MINOR1 ? SWEET_GPU_SURFACE_BO_SIZE_MINOR1 : SWEET_GPU_SURFACE_BO_SIZE_MINOR0;
+ 		break;
+ 	case SWEET_GPU_SEL_BO_SYNC:
+ 		NEED(struct sweet_gpu_bo_sync);

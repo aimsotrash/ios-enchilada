@@ -113,6 +113,7 @@ hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 {
 	static int (*active)(void);
 	static int (*wrap)(unsigned name, uint32_t surface, int kind, unsigned w, unsigned h);
+	static void (*forget)(uint32_t surface);
 	static int asked, usable;
 	IOSurfaceRef ref;
 	int kind = 0, name = 0, done;
@@ -122,6 +123,7 @@ hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 		asked = 1;
 		active = (int (*)(void))dlsym(RTLD_DEFAULT, "OSMesaSweetActive");
 		wrap = (int (*)(unsigned, uint32_t, int, unsigned, unsigned))dlsym(RTLD_DEFAULT, "OSMesaSweetWrapTexture");
+		forget = (void (*)(uint32_t))dlsym(RTLD_DEFAULT, "OSMesaSweetForgetSurface");
 		usable = active != NULL && wrap != NULL && active() && zero_copy_allowed();
 	}
 	if (!usable || (ref = IOSurfaceLookup(surface)) == NULL) {
@@ -135,6 +137,14 @@ hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &name);
 	done = kind != 0 && name != 0 &&
 	    wrap((unsigned)name, surface, kind, (unsigned)IOSurfaceGetWidth(ref), (unsigned)IOSurfaceGetHeight(ref));
+	/*
+	 * eagl.c never says when CoreAnimation lets a surface go, and CA makes a new display surface
+	 * every frame: drop the library's own reference now, the texture keeps one (released with it).
+	 * ponytail: a surface wrapped again is imported again; cache the last few if that shows.
+	 */
+	if (done && forget != NULL) {
+		forget(surface);
+	}
 	CFRelease(ref);
 	return done;
 }
