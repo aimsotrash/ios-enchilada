@@ -1,0 +1,404 @@
+enchilada: battery: real SOC/charging/voltage/current/temperature from PMI8998 over SPMI, read only
+
+SweetBattery reported a static 100 % on the OnePlus 6 (sweetbattery=1 polls sweet's PM6150, wrong
+PMIC here). With no boot-arg it now probes PMI8998 on SID 2 (REVID 0x104 = 0x51, 0x105 = 0x15,
+REV4 0x103 >= 2; qcom-spmi-pmic.c) and, only on a match, samples the SMB2 charger (0x1006/0x1007
+status, 0x1310 USBIN plugin, 0x160b power path; qcom_pmi8998_charger.c) and the FG ADC registers
+that need no SRAM handshake (0x41a0 VBATT 122.07 uV, 0x41a2 IBATT 488.281 uA, 0x4150 BATT_TEMP,
+0x4009/0x400a MONOTONIC_SOC; RFC pmi8998_fg.c, downstream fg-gen3). The percentage is a smoothed
+OCV estimate (VBATT - IBATT x 120 mOhm) on a 4.4 V-class curve, held monotonic per charge
+direction; FG MSOC is published only as SweetBatteryFGMonotonicSOC because OnePlus runs fg-gen3
+with oem,use_external_fg and Android showed bq27541 31 % vs bms 51 % (PLAN-ENCHILADA.md 12). Design
+and max capacity 3300 mAh (mainline enchilada DT, OP_3300mah); temperature published when 0-45 C,
+else 25 C. USBIN is read every 2 s, a full sample on a cable change or every 30 s. SPMI glitches
+keep the last sample; 10 failed samples fall back to the static source. sweetbattery=0 forces the
+static source, sweetbattery=1 keeps the PM6150 path. sweet_spmi_read() only gains READ access to
+SID 2 peripherals 0x01, 0x10, 0x13, 0x16, 0x40, 0x41; no write path is added or used.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -89,10 +89,15 @@
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	/* 0275, enchilada PMI8998 (SID 2), reads only: REVID 0x01, SMB2 CHGR 0x10,
++	 * USBIN 0x13, MISC 0x16, FG_BATT_SOC 0x40, FG_BATT_INFO 0x41. */
++	bool pmi = sid == 2 && (peripheral == 0x01 || peripheral == 0x10 ||
++	    peripheral == 0x13 || peripheral == 0x16 || peripheral == 0x40 ||
++	    peripheral == 0x41);
++	if (!sp_ready || !out || addr > 0xffffu || (!pmi && (sid != 0 ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 &&
+-	    peripheral != 0x60 /* RTC_RW: read only, SweetPlatformExpert */)) {
++	    peripheral != 0x60 /* RTC_RW: read only, SweetPlatformExpert */)))) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,10 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
++ * Built-in iOS battery bring-up service. Fallback: 100%, AC, not charging.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ * 0275: no boot-arg = auto-detect PMI8998 on SID 2 (OnePlus 6), read only;
++ * sweetbattery=0 forces the fallback. See pollPmi().
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -28,15 +30,24 @@
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	/* 0275 PMI8998 state */
++	bool fPmi, fTempMeasured;
++	unsigned fDesign, fTemp, fPct, fOcv, fFailures, fTicks, fPollTick, fLogTick, fQuiet;
++	int fLastUsb, fLastState;
++	uint8_t fRevMajor, fRevMinor;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	bool detectPmi(void);
++	void pollPmi(void);
++	void tick(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
++	static bool readWord(unsigned sid, unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
++	static unsigned estimatePercentHv(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -51,7 +62,13 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fPmi = fTempMeasured = false;
++	fDesign = 5020;
++	fTemp = 2500;
++	fPct = fOcv = fFailures = fTicks = fPollTick = fQuiet = 0;
++	fLogTick = 0u - 5u; /* the first change after boot is logged */
++	fLastUsb = fLastState = -1;
++	fRevMajor = fRevMinor = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +118,13 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (sweet DT nominal=5020, enchilada 3300).
++	 * powerd computes C*100/M. */
++	const unsigned design = fDesign;
++	const unsigned capacity = (design * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(design);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +138,15 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", design);
++	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; 25 C unless measured (0275). */
++	putNumber("Temperature", fTemp);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +156,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, design, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -152,25 +171,25 @@
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+ 	int mode = measured ? 1 : 0;
+-	if (mode != fLastMode) {
++	if (mode != fLastMode && !(fPmi && measured)) { /* pollPmi() logs its own */
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+ 		    measured ? "PM6150 / estimated SOC" : "static fallback",
+ 		    percent, mv, external, charging);
+-		fLastMode = mode;
+ 	}
++	fLastMode = mode;
+ }
+ 
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::readWord(unsigned sid, unsigned address, uint16_t *value)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(sid, address, &lo) ||
++		    sweet_spmi_read(sid, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -208,10 +227,14 @@
+ {
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
++	if (fPmi) {
++		pollPmi();
++		return;
++	}
+ 	bool valid = fReal &&
+ 	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+ 	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    readWord(0, 0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+ 	    !sweet_spmi_read(0, 0x1310, &usb) &&
+ 	    !sweet_spmi_read(0, 0x110b, &path) &&
+ 	    !sweet_spmi_read(0, 0x1006, &charger) &&
+@@ -235,7 +258,7 @@
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+ 	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	    (subtype == 3 || subtype == 4) && readWord(0, 0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+@@ -246,11 +269,178 @@
+ 	    charging, full, true, currentValid);
+ }
+ 
++/*
++ * 0275: OnePlus 6 (enchilada) PMI8998, SID 2, every access a read.
++ * Linux: drivers/mfd/qcom-spmi-pmic.c + include/soc/qcom/qcom-spmi-pmic.h
++ * (REVID 0x104 type 0x51, 0x105 subtype PMI8998 = 0x15, 0x103 REV4 >= 2: v1
++ * swaps the FG ADC bytes, downstream fg-gen3 PMI8998_V1_REV_WA).
++ */
++bool
++SweetBattery::detectPmi(void)
++{
++	uint8_t type = 0, subtype = 0, major = 0, minor = 0;
++	if (sweet_spmi_read(2, 0x104, &type) || sweet_spmi_read(2, 0x105, &subtype) ||
++	    sweet_spmi_read(2, 0x103, &major) || sweet_spmi_read(2, 0x102, &minor) ||
++	    type != 0x51 || subtype != 0x15 || major < 2) {
++		IOLog("SWEET BATT: no PMI8998 v2+ on SID 2 (type %#x subtype %#x rev %u.%u)\n",
++		    type, subtype, major, minor);
++		return false;
++	}
++	fRevMajor = major;
++	fRevMinor = minor;
++	fDesign = 3300; /* mainline sdm845-oneplus-enchilada.dts, DT OP_3300mah */
++	return true;
++}
++
++unsigned
++SweetBattery::estimatePercentHv(unsigned mv)
++{
++	/* Generic 4.4 V-class LiCoO2 OCV curve (float 4.365 V on this phone), NOT
++	 * this cell's profile. ponytail: fixed table; the bq27541 gauge on SE10 is
++	 * the real SOC source (PLAN-ENCHILADA.md section 12 step 2). */
++	static const unsigned volts[] = {3400, 3620, 3690, 3750, 3790, 3830, 3880,
++	    3960, 4050, 4140, 4240, 4340};
++	static const unsigned soc[] = {1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
++	if (mv <= volts[0]) {
++		return soc[0];
++	}
++	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++		if (mv < volts[i]) {
++			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
++			       (volts[i] - volts[i - 1]);
++		}
++	}
++	return 100;
++}
++
++/*
++ * Linux mainline drivers/power/supply/qcom_pmi8998_charger.c (SMB2, base
++ * 0x1000): 0x1006 BATTERY_CHARGER_STATUS_1 bits 2:0 (0 trickle .. 4 taper,
++ * 5 terminate, 6 inhibit, 7 disable), 0x1007 STATUS_2 bit 5 BAT_OV, 0x1310
++ * USBIN INT_RT_STS bit 4 plugin, 0x160b POWER_PATH_STATUS bit 4 USE_USBIN +
++ * bit 0 VALID (usb_online). FG (RFC pmi8998_fg.c, downstream fg-gen3 regs):
++ * 0x4009/0x400a MONOTONIC_SOC(+CP), 0x4150 BATT_TEMP (0.25 K, 11 bits),
++ * 0x41a0 VBATT (122.07 uV), 0x41a2 IBATT (488.281 uA, s16, +discharging).
++ * The FG SOC algorithm is NOT trusted: OnePlus runs fg-gen3 with
++ * oem,use_external_fg and Android once showed bq27541 31% vs PMI8998 bms 51%
++ * (PLAN-ENCHILADA.md section 12). Its MSOC is published for comparison only;
++ * the percentage comes from VBATT corrected by IBATT through a fixed
++ * resistance. No SRAM (MEM_IF) access: that needs writes.
++ */
++void
++SweetBattery::pollPmi(void)
++{
++	/* ponytail: fixed cell + path resistance; calibrate against the bq27541 /
++	 * a meter, or read the FG ESR from SRAM once a read handshake is agreed. */
++	const int kMilliOhm = 120;
++	uint8_t usb, path, st1, st2, soc, socCp;
++	uint16_t rawV, rawI, rawT;
++	fPollTick = fTicks;
++	bool ok = !sweet_spmi_read(2, 0x1310, &usb) &&
++	    !sweet_spmi_read(2, 0x160b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &st1) &&
++	    !sweet_spmi_read(2, 0x1007, &st2) &&
++	    !sweet_spmi_read(2, 0x4009, &soc) &&
++	    !sweet_spmi_read(2, 0x400a, &socCp) &&
++	    readWord(2, 0x41a0, &rawV) && readWord(2, 0x41a2, &rawI) &&
++	    readWord(2, 0x4150, &rawT);
++	int mv = ok ? (int)(((uint64_t)rawV * 122070u) / 1000000u) : 0;
++	if (!ok || mv < 2800 || mv > 4600) {
++		/* Keep the last good sample through short glitches; ~10 failed
++		 * samples (or none ever) fall back to the static source. */
++		if (fPct == 0 || ++fFailures >= 10) {
++			fPct = 0;
++			fTempMeasured = false;
++			fTemp = 2500;
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
++	fFailures = 0;
++	/* iOS: positive = into the battery; the PMIC counts discharge positive. */
++	int ma = -(int)(((int64_t)(int16_t)rawI * 488281) / 1000000);
++	bool currentValid = ma > -8000 && ma < 8000;
++	if (!currentValid) {
++		ma = 0;
++	}
++	int deciC = (int)(((unsigned)(rawT & 0x7ffu) * 10u + 2u) / 4u) - 2730;
++	/* An out-of-range thermistor reading must not drive iOS thermal policy. */
++	fTempMeasured = deciC >= 0 && deciC <= 450;
++	fTemp = fTempMeasured ? (unsigned)deciC * 10u : 2500u;
++	bool external = (usb & 0x10u) != 0;
++	bool online = (path & 0x10u) && (path & 0x01u);
++	unsigned state = st1 & 7u;
++	bool charging = online && state <= 4 && !(st2 & 0x20u);
++	/* smb2_get_prop_status(): terminate and inhibit are both FULL. */
++	bool full = online && (state == 5 || state == 6);
++	/* Open-circuit estimate, smoothed (1/4 per sample, 30 s or on USB change). */
++	int ocv = mv - ma * kMilliOhm / 1000;
++	ocv = ocv < 3000 ? 3000 : ocv > 4500 ? 4500 : ocv;
++	fOcv = fPct ? (3u * fOcv + (unsigned)ocv + 2u) / 4u : (unsigned)ocv;
++	unsigned pct = full ? 100 : estimatePercentHv(fOcv);
++	/* No rising on battery, no falling while charging, unless the cable moved. */
++	if (fPct && (int)external == fLastUsb && !full) {
++		if (!charging && pct > fPct) {
++			pct = fPct;
++		} else if (charging && pct < fPct) {
++			pct = fPct;
++		}
++	}
++	unsigned raw = soc < socCp ? soc : socCp;
++	unsigned msoc = raw == 0 ? 0 : raw == 0xff ? 100 : ((raw - 1) * 98 + 126) / 253 + 1;
++	putNumber("SweetBatteryFGMonotonicSOC", msoc);
++	putNumber("SweetBatteryRawSMB2", (UInt32)st1 | (UInt32)st2 << 8 |
++	    (UInt32)usb << 16 | (UInt32)path << 24);
++	putNumber("SweetBatteryOCV", fOcv);
++	bool first = fPct == 0;
++	fPct = pct;
++	fLastUsb = external;
++	publish(pct, (unsigned)mv, ma, external, online, charging, full, true, currentValid);
++
++	int st = !external ? 0 : charging ? 2 : full ? 3 : 1;
++	static const char *const names[] = {"discharging", "USB, not charging",
++	    "charging", "full"};
++	if (first && fLastState < 0) {
++		IOLog("SWEET BATT: PMI8998 v%u.%u FG: SOC %u%% (V-estimate; FG MSOC %u%%) "
++		    "%d mV %d mA %s, USB %s, batt %d dC%s, chg %#x/%#x path %#x\n",
++		    fRevMajor, fRevMinor, pct, msoc, mv, ma, names[st],
++		    external ? "present" : "absent", deciC,
++		    fTempMeasured ? "" : " (ignored)", st1, st2, path);
++	} else if (st != fLastState) {
++		/* At most one line per 10 s; bounces are counted, not printed. */
++		if (fLastState < 0 || fTicks - fLogTick >= 5) {
++			IOLog("SWEET BATT: %s, SOC %u%% %d mV %d mA, USB %s (%u changes not logged)\n",
++			    names[st], pct, mv, ma, external ? "present" : "absent", fQuiet);
++			fLogTick = fTicks;
++			fQuiet = 0;
++		} else {
++			++fQuiet;
++		}
++	}
++	fLastState = st;
++}
++
++/* Every 2 s: one USBIN read; a full sample on a cable change or every 30 s. */
++void
++SweetBattery::tick(void)
++{
++	uint8_t usb;
++	++fTicks;
++	bool changed = !sweet_spmi_read(2, 0x1310, &usb) &&
++	    (int)((usb >> 4) & 1u) != fLastUsb;
++	if (changed || fTicks - fPollTick >= 15) {
++		poll();
++	}
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+-	if (self && self->fRunning) {
++	if (self && self->fRunning && self->fPmi) {
++		self->tick();
++		sender->setTimeoutMS(2000);
++	} else if (self && self->fRunning) {
+ 		self->poll();
+ 		sender->setTimeoutMS(30000);
+ 	}
+@@ -262,20 +452,24 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = -1; /* 0275: unset = PMI8998 auto-detect, 0 = fallback, 1 = PM6150 */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	fPmi = real != 0 && real != 1 && sweet_spmi_init() == 0 && detectPmi();
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || fPmi) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fPmi ? 2000 : 30000);
+ 		} else {
+-			fReal = false;
++			fReal = fPmi = false;
++			fDesign = 5020;
++			fTemp = 2500;
++			fTempMeasured = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
