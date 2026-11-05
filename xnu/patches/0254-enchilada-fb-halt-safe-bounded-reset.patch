@@ -1,0 +1,496 @@
+enchilada: display + reboot: no frame waits at shutdown, halt hook restores ABL's scanout, bounded reset
+
+Boots 26/27 (sweetzc=1): `launchctl reboot` ended in "Halt/Restart Timed Out" 30 s into
+PEHaltRestart, and after boot 27 the panic reset did not come either; boot 28 (no sweetzc) read PON
+subtype 0 once at 13.1 s and had reboot-to-fastboot off for the whole boot.
+Display: shutdown, restart and panic restart now reach SweetFramebuffer through
+SweetPlatformExpert's PE_halt_restart (sweet_fb_halt, before sweet_reboot_fastboot) and, earlier,
+through a priority sleep/wake interest (kIOMessageSystemWillRestart/PowerOff). That path takes no
+lock and waits for no frame: flips stop for good, the pool closes, ABL's registers are written back
+if a flip moved the pipe (idempotent stores, as the panic hook), and the console draws again so the
+restart's own lines are on the panel. System sleep pauses flips until wake. Display off (vsync
+tick, try-lock) only issues the restore; the held surface is let go once a later tick sees the
+flush taken. The 50 ms wait remains only in SwapEnd, and gives up as soon as shutdown or sleep
+starts.
+Reboot (0200): PON subtype/spare are read up to 5 times 10 ms apart (keys thread held each time,
+failed tries logged with the transfer status), and once more at the first restart if all failed.
+A panic after a restart that already marked the spare goes straight to the reset, no SPMI round
+trip. The reset is PSCI SYSTEM_RESET, entered at most once (a CPU that never came back may hold the
+secure side, so a later panic does not issue another SMC), then PS_HOLD = 0 if, and only if, the
+PMIC's PS_HOLD reset is enabled as a warm reset (read at boot: SOFT_RB_SPARE and IMEM survive that,
+a hard reset could boot Android). Every wait is bounded; nothing waits on another CPU's flag.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <IOKit/pwr_mgt/RootDomain.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c, 0251 */
+@@ -78,6 +79,14 @@
+ static uint64_t sweet_fb_stat_zc, sweet_fb_stat_zc_abs, sweet_fb_stat_zc_max;  /* 0251: frames scanned in place, latch wait */
+ static uint64_t sweet_fb_stat_zcno;             /* 0253: swaps zcFlip did not scan in place */
+ static const char *sweet_fb_stat_zcwhy;         /* 0253: and the last reason */
++/*
++ * 0253: true from the first register write of a flip until a restore has been taken by a frame:
++ * only then is there anything to put back. Read by the panic hook too.
++ */
++static volatile bool sweet_mdp_away;
++/* 0254: 1 = shutdown/restart under way (for good), 2 = system sleep: no flips, no waiting for frames. */
++static volatile uint32_t sweet_fb_paused;
++static IOReturn sweet_fb_power_note(void *, void *, UInt32, IOService *, void *, vm_size_t);
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -151,7 +160,8 @@
+ 	bool          zcProgram(void);
+ 	bool          zcLatch(void);
+ 	bool          zcFlip(const uint8_t *rec);
+-	void          zcStop(const char *why, bool forever);
++	void          zcStop(const char *why, bool forever, bool wait);
++	bool          zcTaken(void);
+ 	void          zcSay(const char *what, uint32_t id);
+ 	void          pauseConsole(void);
+ 
+@@ -591,9 +601,8 @@
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (fb->fMdpLock != NULL) {
+-			IOLockLock(fb->fMdpLock);
+-			fb->zcStop("display off", false);       /* 0251: the black frame is drawn into ABL's framebuffer */
++		if (fb->fMdpLock != NULL && IOLockTryLock(fb->fMdpLock)) {     /* 0254: busy: next tick */
++			fb->zcStop("display off", false, false);        /* 0254: restore, never wait for a frame here */
+ 			IOLockUnlock(fb->fMdpLock);
+ 		}
+ 		if (step <= 6) {
+@@ -607,6 +616,11 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
++	/* 0254: a restore issued without waiting (display off, sleep): release the surface once taken */
++	if (fb->fMdpLock != NULL && sweet_mdp_away && !fb->fZcOn && IOLockTryLock(fb->fMdpLock)) {
++		fb->zcStop("", false, false);
++		IOLockUnlock(fb->fMdpLock);
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -959,12 +973,6 @@
+ }
+ 
+ /*
+- * 0253: true from the first register write of a flip until a restore has been taken by a frame:
+- * only then is there anything to put back. Read by the panic hook too.
+- */
+-static volatile bool sweet_mdp_away;
+-
+-/*
+  * Show ABL's framebuffer 1:1 again (latched at the next frame). Idempotent (writes the saved
+  * values, nothing read-modify-write), no locks, no sleeping, no logging: also the panic hook.
+  */
+@@ -1064,6 +1072,10 @@
+ 	fZcFsr[1] = sweet_mdp.smmuCb[0] ? sweet_rd(sweet_mdp.smmuCb[0], 0x58) : 0;
+ 	fZcFsr[2] = sweet_mdp.smmuCb[1] ? sweet_rd(sweet_mdp.smmuCb[1], 0x58) : 0;
+ 	sweet_fb_panic_hook = sweet_mdp_boot_restore;
++	if (IOService::getPMRootDomain() != NULL &&
++	    registerPrioritySleepWakeInterest(&sweet_fb_power_note, this, NULL) == NULL) {
++		IOLog("SWEET FB: no root domain notices; restart relies on the halt hook alone\n");
++	}
+ 	fZc = mode;
+ 	sweet_scanout_pa[0] = fPhys + start;
+ 	sweet_scanout_pa[1] = fPhys + start + slot;
+@@ -1156,6 +1168,9 @@
+ 		if ((v & fZcFlush) == 0) {
+ 			return true;
+ 		}
++		if (sweet_fb_paused) {
++			return false;   /* 0254: shutdown or sleep began: the MDP may stop, do not wait for it */
++		}
+ 		IOSleep(1);
+ 	}
+ 	IOLog("SWEET FB: CTL%d flush still 0x%08x after %u ms (waiting for 0x%08x to clear)\n",
+@@ -1179,19 +1194,34 @@
+ 	}
+ }
+ 
+-/* Back to ABL's framebuffer; forever: the copy path from now on. fMdpLock held. */
++/* 0254: one look, no waiting: has a frame taken the last flush? */
++bool
++AppleCLCD::zcTaken(void)
++{
++	return (sweet_rd(sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl), SWEET_CTL_FLUSH) & fZcFlush) == 0;
++}
++
++/*
++ * Back to ABL's framebuffer; forever: the copy path from now on. fMdpLock held.
++ * wait: up to 50 ms for a frame to take the restore (SwapEnd only). 0254: without wait (display
++ * off, sleep, the vsync tick) the restore is only issued; fZcHeld is let go once a later call
++ * sees it taken, and until then a restore stays due (sweet_mdp_away), which the halt and panic
++ * paths simply write again.
++ */
+ void
+-AppleCLCD::zcStop(const char *why, bool forever)
++AppleCLCD::zcStop(const char *why, bool forever, bool wait)
+ {
+ 	if (sweet_mdp_away) {
+-		sweet_mdp_boot_restore();
+-		if (zcLatch()) {
++		if (fZcOn || forever) {
++			sweet_mdp_boot_restore();
++			fZcOn = false;
++		}
++		if (wait ? zcLatch() : zcTaken()) {
+ 			sweet_mdp_away = false;
+ 			OSSafeReleaseNULL(fZcHeld);
+-		} else {
++		} else if (wait) {
+ 			forever = true;         /* fZcHeld may still be scanned: it stays held */
+ 		}
+-		fZcOn = false;
+ 	}
+ 	if (forever && fZc) {
+ 		fZc = 0;
+@@ -1218,6 +1248,10 @@
+ 			id = get32(rec, 0x54 + 4 * l);
+ 		}
+ 	}
++	if (sweet_fb_paused) {
++		fZcPath = "shutdown or sleep under way: not scanned";
++		return false;
++	}
+ 	if (n == 0 || fPowerOff) {
+ 		/* 0253: boot 26 had only id-0 layers (unpublished pool surfaces) and said nothing */
+ 		fZcPath = fPowerOff ? "display off: not shown" : "no enabled layer names a surface: nothing to show";
+@@ -1256,7 +1290,7 @@
+ 		sweet_fb_stat_zcwhy = fZcPath;
+ 		if (fZcOn) {
+ 			present(rec);   /* into ABL's framebuffer while the pipe still scans the surface */
+-			zcStop(why != NULL ? why : "off", false);
++			zcStop(why != NULL ? why : "off", false, true);
+ 			shown = true;
+ 		}
+ 		IOLockUnlock(fMdpLock);
+@@ -1286,6 +1320,9 @@
+ 		}
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
++	if (fail == NULL && sweet_fb_paused) {
++		fail = "shutdown or sleep began during the flip";       /* 0254 */
++	}
+ 	if (fail == NULL) {
+ 		sweet_wr(sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl), SWEET_CTL_FLUSH, fZcFlush);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -1303,7 +1340,7 @@
+ 		if (!first) {
+ 			present(rec);
+ 		}
+-		zcStop(fail, true);
++		zcStop(fail, true, true);
+ 		fZcPath = fail;
+ 		sweet_fb_stat_zcno++;
+ 		sweet_fb_stat_zcwhy = fail;
+@@ -1331,6 +1368,44 @@
+ 	return true;
+ }
+ 
++/*
++ * 0254: shutdown, restart and panic restart (SweetPlatformExpert's PE_halt_restart, before
++ * sweet_reboot_fastboot) and the root domain's restart/power-off notice. No lock is taken (a
++ * stuck SwapEnd may hold fMdpLock) and nothing waits for a frame (the MDP may be stopping):
++ * flips stop for good, the pool closes, ABL's registers are written again if a flip moved the
++ * pipe (the same plain stores as the panic hook, harmless when repeated), and the console is
++ * drawn again so the restart's own lines show on the panel. panic: no logging.
++ */
++extern "C" void
++sweet_fb_halt(int panic)
++{
++	bool away = sweet_mdp_away;
++	sweet_fb_paused |= 1;
++	sweet_scanout_size = 0;
++	sweet_mdp_boot_restore();
++	sweet_console_muted = 0;
++	if (!panic) {
++		IOLog("SWEET FB: halt: in-place scanout stopped, %s\n",
++		    away ? "ABL's registers written back (not waited for)" : "ABL's framebuffer was on the panel already");
++	}
++}
++
++/* Priority sleep/wake interest: restart/power-off as sweet_fb_halt; sleep pauses flips until wake. */
++static IOReturn
++sweet_fb_power_note(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
++{
++	if (type == kIOMessageSystemWillRestart || type == kIOMessageSystemWillPowerOff) {
++		sweet_fb_halt(0);
++	} else if (type == kIOMessageSystemWillSleep) {
++		sweet_fb_paused |= 2;
++		sweet_mdp_boot_restore();
++		IOLog("SWEET FB: system sleep: in-place scanout paused, ABL's registers written back\n");
++	} else if (type == kIOMessageSystemHasPoweredOn) {
++		sweet_fb_paused &= ~2u;
++	}
++	return kIOReturnSuccess;        /* returnValue left 0: acknowledged, no time wanted */
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -17,6 +17,7 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_reboot_init(void);
+ extern "C" int sweet_reboot_fastboot(int panic);
++extern "C" void sweet_fb_halt(int panic);       /* SweetFramebuffer.cpp, 0254 */
+ 
+ /*
+  * Kernel restarts (reboot, launchctl reboot, PEHaltRestart) and panic restarts go to fastboot
+@@ -25,6 +26,9 @@
+ static int
+ sweet_halt_restart(unsigned int type)
+ {
++	if (type == kPERestartCPU || type == kPEPanicRestartCPU || type == kPEHaltCPU) {
++		sweet_fb_halt(type == kPEPanicRestartCPU);      /* 0254: ABL's scanout back, no waiting */
++	}
+ 	if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
+ 		return sweet_reboot_fastboot(type == kPEPanicRestartCPU);
+ 	}
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -161,6 +161,27 @@
+ static vm_offset_t rb_chan, rb_obs, rb_imem;
+ static uint32_t rb_on = 1, rb_panic_s = 60;
+ static int rb_panicking;
++/*
++ * 0254: rb_marked: the spare register read back as bootloader (restart or panic path), so a
++ * later panic needs no SPMI round trip. rb_reset_entered: a CPU went into PSCI SYSTEM_RESET; if
++ * it never came back that CPU may hold the secure side, and another SMC could block for good, so
++ * the panic path then drops PS_HOLD instead. rb_restarting: one restart at a time, never waited on.
++ */
++static volatile int rb_marked, rb_reset_entered, rb_restarting;
++static vm_offset_t rb_pshold;
++#define RB_PSHOLD_PA    0x0c264000u     /* MPM PS_HOLD (shim/shim.c): 0 = the PMIC resets as configured */
++/*
++ * PON PS_HOLD_RESET_CTL (type, low nibble: 1 warm reset, 4 shutdown, 7 hard reset) and _CTL2
++ * (bit 7 enable), gen2 offsets 0x5a/0x5b (Linux qpnp-power-on). PS_HOLD is only dropped when it
++ * means a warm reset: SOFT_RB_SPARE and IMEM survive that one; a hard reset or shutdown could
++ * lose the bootloader mark and boot Android (0200).
++ */
++#define RB_PS_HOLD_CTL  0x5au
++#define RB_PS_HOLD_CTL2 0x5bu
++static uint8_t rb_ps_type, rb_ps_ctl2;
++static unsigned rb_apid = SP_NO_APID, rb_owner = 7;
++static uint32_t rb_status;              /* 0254: last failed transfer: status word, ~0 = no completion */
++static int rb_lazy_tried;
+ 
+ /* One command on one channel, spinning (also used in panic context: no lock, no block). */
+ static int
+@@ -176,6 +197,7 @@
+ 		uint32_t status = sp_rd(chan, 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				rb_status = status;
+ 				return -1;
+ 			}
+ 			if (cmd >> 27) {
+@@ -185,6 +207,7 @@
+ 		}
+ 		delay(1);
+ 	}
++	rb_status = ~0u;
+ 	return -1;
+ }
+ 
+@@ -194,13 +217,54 @@
+ 	return rb_xfer(rb_obs, (1u << 27) | (reg << 4), out);          /* EXT_READL */
+ }
+ 
++/*
++ * 0254: PON subtype and spare through the observer channel, up to 5 tries 10 ms apart, the keys
++ * thread held off each time (boot 28 read subtype 0 once, at 13.1 s, and lost reboot-to-fastboot
++ * for the whole boot). A try counts only if both reads complete and the subtype is GEN2_PRIMARY.
++ * Then, read only, the PS_HOLD reset configuration. Thread context. Returns the tries it took,
++ * 0 = none worked.
++ */
++static unsigned
++rb_probe(uint8_t *subtype, uint8_t *spare)
++{
++	for (unsigned t = 1; t <= 5; t++) {
++		*subtype = *spare = 0;
++		sweet_keys_hold = 1;
++		delay((t == 1 ? 50 : 10) * 1000);
++		bool ok = rb_read(RB_PON_SUBTYPE, subtype) == 0 && rb_read(RB_SPARE, spare) == 0 && *subtype == 0x04;
++		if (ok && (rb_read(RB_PS_HOLD_CTL, &rb_ps_type) != 0 || rb_read(RB_PS_HOLD_CTL2, &rb_ps_ctl2) != 0)) {
++			rb_ps_type = rb_ps_ctl2 = 0;    /* unknown: PS_HOLD stays unused */
++		}
++		sweet_keys_hold = 0;
++		if (ok) {
++			return t;
++		}
++		printf("SWEET RB: pon read try %u: subtype %#x spare %#x, last transfer status %#x\n", t, *subtype, *spare,
++		    rb_status);
++		delay(10 * 1000);
++	}
++	return 0;
++}
++
++/* The RW channel (and PS_HOLD when it is a warm reset) once rb_probe() worked; owner 0 = ours. */
++static void
++rb_setup(uint8_t subtype)
++{
++	if (rb_owner == 0 && subtype == 0x04 && rb_chan == 0) {
++		rb_chan = ml_io_map(SP_CHNLS_PA + 0x10000u * rb_apid, 0x1000);
++		if ((rb_ps_ctl2 & 0x80u) && (rb_ps_type & 0x0fu) == 1) {
++			rb_pshold = ml_io_map(RB_PSHOLD_PA, 0x1000);
++		}
++	}
++}
++
+ /* Thread context, after sweet_spmi_init(). */
+ void
+ sweet_reboot_init(void)
+ {
+ 	uint8_t subtype = 0, spare = 0;
+ 	uint32_t imem = 0;
+-	unsigned apid = SP_NO_APID, owner = 7;
++	unsigned tries = 0;
+ 
+ 	(void)PE_parse_boot_argn("rbfb", &rb_on, sizeof(rb_on));
+ 	(void)PE_parse_boot_argn("pfb", &rb_panic_s, sizeof(rb_panic_s));
+@@ -209,24 +273,49 @@
+ 		imem = *(volatile uint32_t *)(rb_imem + RB_IMEM_REASON);
+ 	}
+ 	if (sp_ready) {
+-		apid = sp_find_apid(RB_PON_PPID);
++		rb_apid = sp_find_apid(RB_PON_PPID);
+ 	}
+-	if (apid != SP_NO_APID) {
+-		owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
+-		rb_obs = sp_obs + 0x80u * apid;
+-		sweet_keys_hold = 1;
+-		delay(50 * 1000);
+-		if (rb_read(RB_PON_SUBTYPE, &subtype) != 0 || rb_read(RB_SPARE, &spare) != 0) {
+-			subtype = 0;
+-		}
+-		sweet_keys_hold = 0;
+-		if (owner == 0 && subtype == 0x04) {
+-			rb_chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (rb_apid != SP_NO_APID) {
++		rb_owner = sp_rd(sp_cfg, 0x700u + 4u * rb_apid) & 7u;
++		rb_obs = sp_obs + 0x80u * rb_apid;
++		tries = rb_probe(&subtype, &spare);
++		if (tries != 0) {
++			rb_setup(subtype);
+ 		}
+ 	}
+ 	printf("SWEET RB: boot with pon spare %#x (reason %u, 2 = fastboot), imem %#x; pon apid %u owner %u "
+-	    "subtype %#x; reboot -> %s, panic -> %s after %u s\n", spare, (unsigned)(spare >> 1), imem, apid, owner, subtype,
++	    "subtype %#x (%s); PS_HOLD reset type %#x ctl2 %#x -> %s; reboot -> %s, panic -> %s after %u s\n",
++	    spare, (unsigned)(spare >> 1), imem, rb_apid, rb_owner, subtype,
++	    tries ? (tries == 1 ? "first try" : "after retries") : "reads FAILED, retried at the first reboot",
++	    rb_ps_type, rb_ps_ctl2, rb_pshold ? "fallback after PSCI" : "not used",
+ 	    rb_chan && rb_on ? "fastboot" : "nothing", rb_chan && rb_panic_s ? "fastboot" : "nothing", rb_panic_s);
++	if (tries > 1) {
++		printf("SWEET RB: pon reads took %u tries\n", tries);
++	}
++}
++
++/*
++ * 0254: the reset itself, once the spare register is marked. PSCI SYSTEM_RESET first, unless a
++ * CPU already went in and did not come back; if it returns (or is skipped), drop PS_HOLD, as the
++ * shim does. Bounded: returns after one second if neither reset the SoC.
++ */
++static void
++rb_reset(int panic)
++{
++	if (!__atomic_exchange_n(&rb_reset_entered, 1, __ATOMIC_SEQ_CST)) {
++		register uint64_t x0 __asm__("x0") = 0x84000009ULL;       /* PSCI SYSTEM_RESET */
++		__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++		    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		printf("SWEET RB: PSCI SYSTEM_RESET returned %d, dropping PS_HOLD\n", (int)x0);
++	} else if (panic) {
++		printf("SWEET RB: an earlier SYSTEM_RESET never returned: PS_HOLD instead of another SMC\n");
++	}
++	if (rb_pshold != 0) {
++		*(volatile uint32_t *)rb_pshold = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay(1000 * 1000);
++	}
++	printf("SWEET RB: still running after PS_HOLD = 0 (%s), no reset\n", rb_pshold ? "written" : "not mapped");
+ }
+ 
+ /* Returns only when no reset was made (the caller keeps its old behaviour). */
+@@ -241,25 +330,49 @@
+ 			return -1;
+ 		}
+ 		(void)ml_set_interrupts_enabled(FALSE);        /* delay() then spins, never blocks */
+-		printf("SWEET RB: panic -> fastboot in %u s (boot-arg pfb=0 keeps this screen)\n", rb_panic_s);
++		printf("SWEET RB: panic -> fastboot in %u s (boot-arg pfb=0 keeps this screen)%s\n", rb_panic_s,
++		    rb_marked ? "; spare already marked by the restart" : "");
+ 		for (uint32_t s = 0; s < rb_panic_s; s++) {
+ 			delay(1000 * 1000);
+ 		}
+-	} else if (rb_panicking || rb_chan == 0 || rb_on == 0) {
+-		return -1;
++		if (rb_marked) {
++			rb_reset(1);            /* 0254: no second SPMI round trip */
++			return -1;
++		}
++	} else {
++		if (rb_panicking || rb_on == 0 || __atomic_exchange_n(&rb_restarting, 1, __ATOMIC_SEQ_CST)) {
++			return -1;
++		}
++		if (rb_chan == 0 && rb_obs != 0 && rb_owner == 0 && !rb_lazy_tried) {
++			uint8_t subtype = 0, sp = 0;
++			unsigned tries;
++			rb_lazy_tried = 1;      /* 0254: the boot-time reads failed: one more round, thread context */
++			tries = rb_probe(&subtype, &sp);
++			if (tries != 0) {
++				rb_setup(subtype);
++			}
++			printf("SWEET RB: restart: pon reads %s (subtype %#x)%s\n", tries ? "worked now" : "failed again",
++			    subtype, rb_chan ? "" : ", no reset");
++		}
++		if (rb_chan == 0) {
++			rb_restarting = 0;
++			return -1;
++		}
+ 	}
+ 	sweet_keys_hold = 1;
+ 	delay(50 * 1000);
+ 	if (rb_read(RB_SPARE, &spare) != 0) {
+-		printf("SWEET RB: cannot read pon spare, no reset\n");
++		printf("SWEET RB: cannot read pon spare (status %#x), no reset\n", rb_status);
+ 		sweet_keys_hold = 0;
++		rb_restarting = 0;
+ 		return -1;
+ 	}
+ 	uint8_t want = (uint8_t)((spare & 1u) | RB_BOOTLOADER);
+ 	if (rb_xfer(rb_chan, RB_SPARE << 4, &want) != 0 || rb_read(RB_SPARE, &back) != 0 ||
+ 	    (back & 0xfeu) != RB_BOOTLOADER) {
+-		printf("SWEET RB: pon spare %#x -> %#x failed (reads %#x), no reset\n", spare, want, back);
++		printf("SWEET RB: pon spare %#x -> %#x failed (reads %#x, status %#x), no reset\n", spare, want, back, rb_status);
+ 		sweet_keys_hold = 0;
++		rb_restarting = 0;
+ 		return -1;
+ 	}
+ 	if (rb_imem) {
+@@ -267,13 +380,10 @@
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		imem = *(volatile uint32_t *)(rb_imem + RB_IMEM_REASON);
+ 	}
++	rb_marked = 1;
+ 	printf("SWEET RB: restart -> fastboot (pon spare %#x, imem %#x)\n", back, imem);
+ 	delay(100 * 1000);
+-
+-	register uint64_t x0 __asm__("x0") = 0x84000009ULL;       /* PSCI SYSTEM_RESET */
+-	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+-	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+-	printf("SWEET RB: PSCI SYSTEM_RESET returned %d\n", (int)x0);
++	rb_reset(panic);
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
