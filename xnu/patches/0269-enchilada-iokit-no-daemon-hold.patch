@@ -1,0 +1,60 @@
+enchilada: no IOKit-daemon busy hold at mss>=9, so IOKit quiesces for configd and wifid (after topaz 0128)
+
+StartIOKitMatching() takes a busy count on the registry root until the IOKit daemon
+(kernelmanagerd) says it has launched. It never runs on this port (no kexts; no exec in any boot
+log), so the root stays busy for ever: IOKit never quiesces, configd's InterfaceNamer never names
+network interfaces (no "Wi-Fi" network service) and wifid waits for it at boot (topaz 0128 saw
+SpringBoard held up behind wifid). With boot-arg mss>=9 (the 0268 Wi-Fi integration) the hold is
+not taken, and iokitDaemonLaunched() does not drop one it did not take. Other boots unchanged.
+
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,6 +1200,10 @@
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	extern bool gSweetNoIOKitDaemonHold;    /* IOStartIOKit.cpp, 0269: no hold was taken */
++	if (!gSweetNoIOKitDaemonHold)
++#endif
+ 	getServiceRoot()->adjustBusy(-1);
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -177,6 +177,11 @@
+ 	gRootNub->configureDefaults();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++bool gSweetNoIOKitDaemonHold;           /* 0269: read by IOService::iokitDaemonLaunched */
++#endif
++
+ void
+ StartIOKitMatching(void)
+ {
+@@ -194,7 +199,23 @@
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0269 (after topaz 0128): no IOKit daemon ever says it has launched here (kernelmanagerd is
++	 * never run: there are no kexts), so this hold kept the registry root busy for ever: IOKit
++	 * never quiesced, and configd's InterfaceNamer (which names network interfaces and so makes
++	 * the Wi-Fi service) and wifid wait for that. Only at mss>=9, where wifid runs (0268).
++	 */
++	int sweet_mss = 0;
++	(void)PE_parse_boot_argn("mss", &sweet_mss, sizeof(sweet_mss));
++	gSweetNoIOKitDaemonHold = sweet_mss >= 9;
++	if (gSweetNoIOKitDaemonHold) {
++		printf("SWEET: mss>=9: no registry busy hold for the IOKit daemon (0269)\n");
++	}
++	if (OSKext::iokitDaemonAvailable() && !gSweetNoIOKitDaemonHold) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been

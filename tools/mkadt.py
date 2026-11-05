@@ -50,6 +50,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 # HCI Read_BD_ADDR sends it reversed (bsd/dev/sweet_bt.c).
 _bt = hashlib.sha256(b'sweet bt fake controller').digest()
 BT_ADDR = bytes([_bt[0] & 0xfc | 0x02]) + _bt[1:6]     # 66:df:f8:7d:d2:41
+# Wi-Fi address for /arm-io/wlan (ADT_WLAN=1): fixed, locally administered, unicast, the same
+# for every phone; the kernel (0268) gives en0 and the station vdev this address.
+WLAN_ADDR = bytes([0x02, 0x00, 0x00, 0x53, 0x57, 0x54])
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -296,7 +299,15 @@ def build(seed=None, qemu=False, highmem=False, mem_size=None):
             ('local-mac-address', BT_ADDR),
             ('transport-encoding', u32(1)),
             ('transport-speed', u32(3000000)),
-        ])] if os.environ.get('ADT_BT') == '1' else []))
+        ])] if os.environ.get('ADT_BT') == '1' else []) + ([
+        # ADT_WLAN=1 (PLAN-ENCHILADA.md §9 step 7, kernel 0268, boot with mss=9). launchd starts
+        # wifid only if a "wlan" node exists (_LimitLoadToDeviceTree in com.apple.wifid.plist);
+        # SpringBoard looks for the IOService named "wlan"; MobileGestalt reads the Wi-Fi address
+        # as its local-mac-address. The kernel hangs IO80211Controller under this nub.
+        node('wlan', [
+            ph(),
+            ('local-mac-address', WLAN_ADDR),
+        ])] if os.environ.get('ADT_WLAN') == '1' else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
