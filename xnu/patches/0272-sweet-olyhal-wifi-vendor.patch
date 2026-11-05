@@ -1,0 +1,104 @@
+sweet: AppleOLYHAL nub with vendor-id "Murata" so BlueTool -R finds its D22 boot script (btfake only)
+
+After 0271 bluetoothd stays up and asks BlueTool -R for RunBuiltinScript "boot"/"init", but the port is
+never opened (/private/var/tmp/BlueTool.log: only "Device not open yet", no "SWEET BT: uN connected").
+BlueTool runCommandForCurrentConfig (0x100015fa4):
+ - override scripts /etc/bluetool/<HWModel|platform>.<seq>.script are only looked at when MobileGestalt
+   ReleaseType is "Vendor" or "Internal" (0x100016278); user build: skipped.
+ - builtin firmwareList match getFirmwarePosForPlatform (0x100014f10): platform = MG ProductHash
+   (= /product product-id fd079b29...; listed: BCM4357B1 with vendors MUR and USI), chip = getChipset,
+   which for a UART transport sends HCI Read_Local_Version (0x100018be0) before any `device` and so
+   prints "Device not open yet" and yields NULL (chip is then not compared), vendor = getManufacturer
+   (0x1000401a8) from MG WifiVendor ("Murata" or "V=m" -> MUR).
+ - MG WifiVendor is missing on the phone (mgask: "Cannot find key WifiVendor"), so manufacturer = -1:
+   BlueTool loops "No WiFi - Iteration %d" 9 x 0.5 s and returns 0xd; the boot script for
+   fd079b29/MUR (0x10002af00: device -D; wake on; power off/on; hci reset; bcm -b 1500000; bcm -W; ...)
+   never runs.
+libMobileGestalt (dyld cache .09, 0x19c574fb4) answers WifiVendor with the raw "vendor-id" property of
+the AppleOLYHAL service (IORegistryEntrySearchCFProperty, IOService plane, recursive|parents;
+"failed to fetch wifi vendor (no AppleOLYHAL node)" otherwise). This adds that service on IOResources,
+only when btfake != 0, carrying nothing but vendor-id = "Murata".
+
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-05 11:35:15.537507295 -0800
++++ b/iokit/conf/files.arm64	2026-11-05 11:35:32.513017737 -0800
+@@ -12,6 +12,7 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetOLYHAL.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+diff -ruN a/iokit/Kernel/arm/SweetOLYHAL.cpp b/iokit/Kernel/arm/SweetOLYHAL.cpp
+--- a/iokit/Kernel/arm/SweetOLYHAL.cpp	1969-12-31 16:00:00.000000000 -0800
++++ b/iokit/Kernel/arm/SweetOLYHAL.cpp	2026-11-05 11:35:24.935377641 -0800
+@@ -0,0 +1,53 @@
++/*
++ * AppleOLYHAL stand-in for SWEET (boot-arg btfake != 0 only).
++ *
++ * MobileGestalt answers WifiVendor from the "vendor-id" property of the
++ * AppleOLYHAL service (IORegistryEntrySearchCFProperty, IOService plane;
++ * otherwise "failed to fetch wifi vendor (no AppleOLYHAL node)"). BlueTool
++ * -R maps that string to a module vendor (getManufacturer: "Murata" -> MUR)
++ * and only then finds its firmwareList entry for ProductHash fd079b29...
++ * (D22 /product product-id) + MUR, whose boot script starts with
++ * "device -D". Without a vendor it loops "No WiFi" and returns 0xd without
++ * ever opening the port. There is no Wi-Fi HAL here: this nub only carries
++ * the property.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class AppleOLYHAL : public IOService {
++	OSDeclareDefaultStructors(AppleOLYHAL);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleOLYHAL, IOService);
++
++IOService *
++AppleOLYHAL::probe(IOService *provider, SInt32 *score)
++{
++	uint32_t bt_mode = 0;
++
++	if (!PE_parse_boot_argn("btfake", &bt_mode, sizeof(bt_mode)) || bt_mode == 0) {
++		return NULL;
++	}
++	return IOService::probe(provider, score);
++}
++
++bool
++AppleOLYHAL::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("vendor-id", "Murata");
++	registerService();
++	IOLog("SWEET OLYHAL: AppleOLYHAL vendor-id \"Murata\" (MobileGestalt WifiVendor)\n");
++	return true;
++}
++#endif /* SWEET */
+diff -ruN a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp	2026-11-05 11:35:15.538790705 -0800
++++ b/iokit/KernelConfigTables.cpp	2026-11-05 11:35:32.513072900 -0800
+@@ -56,6 +56,11 @@
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleOLYHAL;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleOLYHAL;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
