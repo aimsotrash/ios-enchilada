@@ -1,0 +1,889 @@
+enchilada: battery: SOC, capacities, cycles, V/I/T from the bq27541 fuel gauge on SE10, read only
+
+0275 showed a voltage-derived estimate (about +-10 points). The OnePlus 6 gauge is a TI bq27541 at
+0x55 on QUPv3 SE10 (dtbo board 17819 fragment@71 "ti,bq27541-battery" on qupv3_se10_i2c =
+i2c@a88000, 100 kHz; fg-gen3 has oem,use_external_fg; mainline sdm845-oneplus-common.dtsi lists
+it as "ti,bq27411" on i2c10). sweet_touch.c's GENI FIFO I2C core now takes a per-SE state (touch
+keeps its globals through touch_msg()/touch_read() wrappers; fajita_clocks() takes the SE's vote
+mask, CBCR and RCG; the 0x5200c vote RMW is under one mutex) and gains sweet_bq_read(): SE10 =
+wrapper 1 SE2, gcc_qupv3_wrap1_s2_clk vote bit 24 + m/s AHB bits 20/21, CBCR 0x18274, RCG
+0x18278 to XO/1 (gcc-sdm845.c, the same sequence SE12 touch uses); gpio55/56 NORTH function qup10,
+switched only if not already qup10 (Linux applies qupv3_se10_i2c_active: qup10, 2 mA, no bias);
+pin and clock state logged. Every gauge transfer is a 1-byte register-pointer write plus a
+repeated-START 2-byte read of a standard command; no Control() subcommand, no data flash, no other
+address. SweetBattery (PMI8998 path only, from the work loop, first access at the first full poll)
+picks the register map by plausibility (bq27541 06/08/2c vs bq27411 02/04/1c: V 3000-4500 mV,
+T -40..100 C, SOC <= 100, exactly one must match; raw words logged once), then every 30 s reads
+Temperature, Voltage, Flags, AverageCurrent, StateOfCharge, FullChargeCapacity,
+RemainingCapacity, CycleCount and once DesignCapacity (0x3c). iOS gets SOC (clamped 1-100) via
+CurrentCapacity/MaxCapacity = FCC, AppleRawCurrentCapacity = RM, AppleRawMaxCapacity = FCC,
+DesignCapacity = DCAP (1000-10000, else 3300), CycleCount, gauge V/I, temperature clamped 0-45 C;
+IsCharging/ExternalConnected/FullyCharged stay PMI8998 SMB2. Errors back off 1, 2, 4 .. 32 polls,
+the last good sample is held 5 minutes, then the 0275 estimate (still published as
+SweetBatteryVEstimate) is used; SE10 setup failure disables the gauge for the boot. Logs:
+"SWEET BATT SE10:" pin/clock/SE lines, "SWEET BATT: bq27541 at SE10 0x55: SOC .. FCC .. RM ..
+cycles .. V .. I .. T .." once, failures rate-limited. No boot-arg; sweetbattery=0 still forces the
+static source.
+
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -21,6 +22,7 @@
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
++int sweet_bq_read(uint8_t reg, uint16_t *out);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -94,14 +96,20 @@
+ #define SE_PACK0        0x0007f8feu
+ #define SE_PACK1        0x000ffefeu
+ 
+-static struct {
++/* One per serial engine: touch (st) and, 0277, the enchilada fuel gauge (bq). */
++struct touch_state {
++	const char *name;	/* log tag: SWEET <name>: */
+ 	vm_offset_t se, gcc, gpio, gpio_s, gpio_e;   /* north, south, east */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+-} st;
++};
++static struct touch_state st = { .name = "TOUCH" };
++/* GCC vote 0x5200c is read-modify-written by both engines' threads. */
++static LCK_GRP_DECLARE(sweet_geni_grp, "sweet_geni");
++static LCK_MTX_DECLARE(sweet_gcc_lock, &sweet_geni_grp);
+ static int touch_sleep_chan;
+ 
+ static uint32_t
+@@ -163,12 +171,19 @@
+ 	touch_gpio_at(st.gpio, pin, mux, pull, drive, out, high);
+ }
+ 
++static void
++gcc_vote(vm_offset_t gcc, uint32_t mask)
++{
++	lck_mtx_lock(&sweet_gcc_lock);
++	touch_wr(gcc, TOUCH_GCC_VOTE, touch_rd(gcc, TOUCH_GCC_VOTE) | mask);
++	lck_mtx_unlock(&sweet_gcc_lock);
++}
++
+ static bool
+ touch_clocks(void)
+ {
+ 	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
++	gcc_vote(st.gcc, (0x0fu << 18) | (1u << 23));
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+@@ -203,78 +218,78 @@
+ 
+ /* Called only for a transfer started by this driver, including a stretched TX. */
+ static void
+-touch_abort(void)
++touch_abort(struct touch_state *b)
+ {
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++	touch_wr(b->se, SE_CTRL, 2); /* abort M command, release held bus */
+ 	bool done = false;
+ 	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
++		if (touch_rd(b->se, SE_IRQ) & (1u << 5)) {
+ 			done = true;
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
+-	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+-		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++	if (!done || !touch_wait_clear(b->se, SE_STATUS, 1u)) {
++		b->dead = true;
++		printf("SWEET %s: abort failed status=%#x irq=%#x; stopping\n", b->name,
++		    touch_rd(b->se, SE_STATUS), touch_rd(b->se, SE_IRQ));
+ 	}
+ 	/* Bound drain even if the hardware reports an impossible FIFO count. */
+-	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+-		(void)touch_rd(st.se, SE_RX);
++	for (unsigned i = 0; i < 64 && (touch_rd(b->se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)touch_rd(b->se, SE_RX);
+ 	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
++	touch_wr(b->se, SE_IRQ_CLR, 0xffffffffu);
++	if (touch_rd(b->se, SE_TX_COUNT) & 0xfffffffu) {
++		b->dead = true;
++		printf("SWEET %s: TX FIFO not empty after abort; stopping\n", b->name);
+ 	}
+ }
+ 
+ /* Keep all observed bits for diagnostics, even if a watermark was cleared. */
+ static uint32_t
+-touch_irq(void)
++touch_irq(struct touch_state *b)
+ {
+-	st.irq_last = touch_rd(st.se, SE_IRQ);
+-	st.irq_status |= st.irq_last;
+-	return st.irq_last;
++	b->irq_last = touch_rd(b->se, SE_IRQ);
++	b->irq_status |= b->irq_last;
++	return b->irq_last;
+ }
+ 
+ /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+ static int
+-touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++touch_msg_run(struct touch_state *b, uint8_t addr, const uint8_t *tx,
++    unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (b->dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+-	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
++	if (!touch_wait_clear(b->se, SE_STATUS, 1u)) {
++		b->dead = true; /* no other owner of this SE is supported */
+ 		return EBUSY;
+ 	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
++	touch_wr(b->se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(b->se, SE_TX_WM, nt ? 1u : 0u);
+ 	/* Both lengths are programmed for every command (mainline geni_se does the
+ 	 * same); a write+repeated-start read needs TX_LEN even though it is a read. */
+-	touch_wr(st.se, SE_TX_LEN, nt);
+-	touch_wr(st.se, SE_RX_LEN, nr);
+-	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	touch_wr(b->se, SE_TX_LEN, nt);
++	touch_wr(b->se, SE_RX_LEN, nr);
++	touch_wr(b->se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	{
+ 		static unsigned dbg;
+ 		if (dbg < 6) {
+ 			dbg++;
+-			printf("SWEET TS: se cmd=%#x addr=%#x txlen=%#x rxlen=%#x status=%#x "
+-			    "irq=%#x irqen=%#x out=%#x cgc=%#x dma=%#x\n",
+-			    touch_rd(st.se, SE_CMD), addr, touch_rd(st.se, SE_TX_LEN),
+-			    touch_rd(st.se, SE_RX_LEN), touch_rd(st.se, SE_STATUS),
+-			    touch_rd(st.se, SE_IRQ), touch_rd(st.se, SE_IRQ_EN),
+-			    touch_rd(st.se, 0x24), touch_rd(st.se, 0x28),
+-			    touch_rd(st.se, SE_DMA));
++			printf("SWEET %s: se cmd=%#x addr=%#x txlen=%#x rxlen=%#x status=%#x "
++			    "irq=%#x irqen=%#x out=%#x cgc=%#x dma=%#x\n", b->name,
++			    touch_rd(b->se, SE_CMD), addr, touch_rd(b->se, SE_TX_LEN),
++			    touch_rd(b->se, SE_RX_LEN), touch_rd(b->se, SE_STATUS),
++			    touch_rd(b->se, SE_IRQ), touch_rd(b->se, SE_IRQ_EN),
++			    touch_rd(b->se, 0x24), touch_rd(b->se, 0x28),
++			    touch_rd(b->se, SE_DMA));
+ 		}
+ 	}
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+-		uint32_t irq = touch_irq();
++		uint32_t irq = touch_irq(b);
+ 		if (irq & SE_ERRORS) {
+ 			err = (irq & SE_NACK) ? ENXIO : EIO;
+ 			/* A completed NACK is normal during address probing. Aborting an
+@@ -282,85 +297,99 @@
+ 			 * and leave a clean idle engine available for the other IC. */
+ 			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+ 				delay(1);
+-				irq = touch_irq();
++				irq = touch_irq(b);
+ 			}
+-			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-				touch_wr(st.se, SE_IRQ_CLR, irq);
++			if ((irq & SE_DONE) && !(touch_rd(b->se, SE_STATUS) & 1u) &&
++			    !(touch_rd(b->se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(touch_rd(b->se, SE_RX_COUNT) & 0x1ffffffu)) {
++				touch_wr(b->se, SE_IRQ_CLR, irq);
+ 				return err;
+ 			}
+ 			break;
+ 		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
++		if (nt && !b->sent && (irq & SE_TX_WM_IRQ)) {
+ 			uint32_t word = 0;
+ 			for (unsigned j = 0; j < nt; ++j) {
+ 				word |= (uint32_t)tx[j] << (8u * j);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
++			touch_wr(b->se, SE_TX, word);
++			b->sent = nt;
++			touch_wr(b->se, SE_TX_WM, 0);
+ 		}
+-		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
++		uint32_t count = touch_rd(b->se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - b->got + 3u) / 4u) {
+ 			err = EIO;
+ 			break;
+ 		}
+ 		while (count--) {
+-			uint32_t word = touch_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
++			uint32_t word = touch_rd(b->se, SE_RX);
++			for (unsigned j = 0; j < 4 && b->got < nr; ++j) {
++				rx[b->got++] = (uint8_t)(word >> (8u * j));
+ 			}
+ 		}
+ 		/* DONE is checked after draining RX, so final short words aren't lost. */
+ 		if (irq & SE_DONE) {
+ 			/* Re-sample after the final drain; a late error must beat DONE. */
+-			irq = touch_irq();
++			irq = touch_irq(b);
+ 			if (irq & SE_ERRORS) {
+ 				continue;
+ 			}
+-			touch_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
++			touch_wr(b->se, SE_IRQ_CLR, irq);
++			if (b->got == nr && b->sent == nt) {
+ 				return 0;
+ 			}
+ 			err = EIO;
+ 			break;
+ 		}
+ 		/* Preserve DONE/errors if they arrive during this iteration. */
+-		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		touch_wr(b->se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+ 		delay(1);
+ 	}
+-	touch_abort();
++	touch_abort(b);
+ 	return err;
+ }
+ 
+ static int
+-touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++geni_msg(struct touch_state *b, uint8_t addr, const uint8_t *tx, unsigned nt,
++    uint8_t *rx, unsigned nr, bool stretch)
+ {
+-	st.irq_status = st.irq_last = 0;
+-	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+-	if (st.probing) {
+-		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
++	b->irq_status = b->irq_last = 0;
++	b->sent = b->got = 0;
++	int err = touch_msg_run(b, addr, tx, nt, rx, nr, stretch);
++	if (b->probing) {
++		printf("SWEET %s: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    b->name, addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		    err, b->irq_last, b->irq_status, b->sent, b->got,
++		    touch_rd(b->se, SE_STATUS));
+ 	}
+ 	return err;
+ }
+ 
+ static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++geni_read(struct touch_state *b, uint8_t addr, uint16_t reg, bool wide,
++    uint8_t *buf, unsigned len)
+ {
+ 	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
++	int err = geni_msg(b, addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+ 	    NULL, 0, true);
+ 	if (err) {
+ 		return err;
+ 	}
+ 	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
++	return geni_msg(b, addr, NULL, 0, buf, len, false);
++}
++
++static int
++touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	return geni_msg(&st, addr, tx, nt, rx, nr, stretch);
++}
++
++static int
++touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++{
++	return geni_read(&st, addr, reg, wide, buf, len);
+ }
+ 
+ static int
+@@ -534,58 +563,58 @@
+ }
+ 
+ static bool
+-touch_se_init(void)
++touch_se_init(struct touch_state *b)
+ {
+-	uint32_t fw = touch_rd(st.se, SE_FW);
+-	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
++	uint32_t fw = touch_rd(b->se, SE_FW);
++	uint32_t tx = touch_rd(b->se, SE_HW_TX), rx = touch_rd(b->se, SE_HW_RX);
++	printf("SWEET %s: se fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    b->name, fw, (fw >> 8) & 0xffu, touch_rd(b->se, SE_STATUS), tx, rx,
++	    touch_rd(b->se, 0x908));
++	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(b->se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
++		printf("SWEET %s: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n", b->name);
+ 		return false;
+ 	}
+-	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
++	if (touch_rd(b->se, SE_STATUS) & 0x1001u) {
++		printf("SWEET %s: SE already busy; probes skipped\n", b->name);
+ 		return false;
+ 	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	touch_wr(b->se, 0xe18, 0); /* no GSI events */
++	touch_wr(b->se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	touch_wr(b->se, 0x644, 0);
++	touch_wr(b->se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(b->se, 0x648, 0xffffffffu);
++	touch_wr(b->se, SE_DMA, 0);
++	touch_wr(b->se, 0x28, touch_rd(b->se, 0x28) | 0x7fu);
++	touch_wr(b->se, 0xe30, touch_rd(b->se, 0xe30) | 0x0fu);
++	touch_wr(b->se, 0x24, 0x7f);
++	touch_wr(b->se, 0x20, 1);
++	touch_wr(b->se, SE_CLK_SEL, 0);
++	touch_wr(b->se, SE_MCLK, (7u << 4) | 1u);
++	touch_wr(b->se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+-	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+-	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+-	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x254) != 0) {
+-		printf("SWEET TOUCH: packing readback mismatch; probes skipped\n");
++	touch_wr(b->se, 0x254, 0);
++	touch_wr(b->se, 0x260, SE_PACK0);
++	touch_wr(b->se, 0x264, SE_PACK1);
++	touch_wr(b->se, 0x284, SE_PACK0);
++	touch_wr(b->se, 0x288, SE_PACK1);
++	touch_wr(b->se, SE_TX_WM, 0);
++	touch_wr(b->se, 0x810, 0);
++	touch_wr(b->se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	touch_wr(b->se, SE_IRQ_EN, SE_EVENTS);
++	printf("SWEET %s: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n", b->name,
++	    touch_rd(b->se, 0x260), touch_rd(b->se, 0x264),
++	    touch_rd(b->se, 0x284), touch_rd(b->se, 0x288), touch_rd(b->se, 0x254));
++	if (touch_rd(b->se, 0x260) != SE_PACK0 || touch_rd(b->se, 0x264) != SE_PACK1 ||
++	    touch_rd(b->se, 0x284) != SE_PACK0 || touch_rd(b->se, 0x288) != SE_PACK1 ||
++	    touch_rd(b->se, 0x254) != 0) {
++		printf("SWEET %s: packing readback mismatch; probes skipped\n", b->name);
+ 		return false;
+ 	}
+-	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+-	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("SWEET TOUCH: inherited FIFO data; probes skipped\n");
++	if ((touch_rd(b->se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (touch_rd(b->se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET %s: inherited FIFO data; probes skipped\n", b->name);
+ 		return false;
+ 	}
+ 	return true;
+@@ -622,27 +651,29 @@
+ 	return touch_msg(FJ_TS_ADDR, tx, 2, NULL, 0, false);
+ }
+ 
++/* SDM845 wrapper-1 SE clock: vote (m/s AHB + SE branch), RCG to XO/1, poll CBCR.
++ * Used for SE12 (touch) and, 0277, SE10 (fuel gauge). */
+ static bool
+-fajita_clocks(void)
++fajita_clocks(struct touch_state *b, uint32_t vote, uint32_t cbcr, uint32_t rcg)
+ {
+-	touch_wr(st.gcc, FJ_GCC_VOTE, touch_rd(st.gcc, FJ_GCC_VOTE) | FJ_VOTE_MASK);
+-	uint32_t cfg = touch_rd(st.gcc, FJ_GCC_RCG + 4u);
++	gcc_vote(b->gcc, vote);
++	uint32_t cfg = touch_rd(b->gcc, rcg + 4u);
+ 	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* XO parent, divide by 1 */
+-	touch_wr(st.gcc, FJ_GCC_RCG + 4u, cfg);
+-	touch_wr(st.gcc, FJ_GCC_RCG, touch_rd(st.gcc, FJ_GCC_RCG) | 0x3u);
+-	if (!touch_wait_clear(st.gcc, FJ_GCC_RCG, 1u)) {
+-		printf("SWEET TS: RCG update timeout (rcg=%#x)\n", touch_rd(st.gcc, FJ_GCC_RCG));
++	touch_wr(b->gcc, rcg + 4u, cfg);
++	touch_wr(b->gcc, rcg, touch_rd(b->gcc, rcg) | 0x3u);
++	if (!touch_wait_clear(b->gcc, rcg, 1u)) {
++		printf("SWEET %s: RCG update timeout (rcg=%#x)\n", b->name, touch_rd(b->gcc, rcg));
+ 		return false;
+ 	}
+ 	for (unsigned i = 0; i < 200; ++i) {
+-		if (!(touch_rd(st.gcc, FJ_GCC_CBCR) & (1u << 31))) {
+-			printf("SWEET TS: gcc vote=%#x cbcr=%#x\n",
+-			    touch_rd(st.gcc, FJ_GCC_VOTE), touch_rd(st.gcc, FJ_GCC_CBCR));
++		if (!(touch_rd(b->gcc, cbcr) & (1u << 31))) {
++			printf("SWEET %s: gcc vote=%#x cbcr=%#x\n", b->name,
++			    touch_rd(b->gcc, FJ_GCC_VOTE), touch_rd(b->gcc, cbcr));
+ 			return true;
+ 		}
+ 		touch_wait(1);
+ 	}
+-	printf("SWEET TS: SE clock still halted (cbcr=%#x)\n", touch_rd(st.gcc, FJ_GCC_CBCR));
++	printf("SWEET %s: SE clock still halted (cbcr=%#x)\n", b->name, touch_rd(b->gcc, cbcr));
+ 	return false;
+ }
+ 
+@@ -767,6 +798,7 @@
+ {
+ 	unsigned delay_s = 20;
+ 
++	st.name = "TS";
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	/* Panel pixels come from the boot video (ADT sweet-fbcon): 1080x2340 on
+ 	 * the 6T, 1080x2280 on the OnePlus 6. The S3320 reports in panel pixels
+@@ -844,14 +876,14 @@
+ 	}
+ 	if (noclk) {
+ 		printf("SWEET TS: clocks skipped (sweetts_noclk=1)\n");
+-	} else if (!fajita_clocks()) {
++	} else if (!fajita_clocks(&st, FJ_VOTE_MASK, FJ_GCC_CBCR, FJ_GCC_RCG)) {
+ 		goto out;
+ 	}
+ 	if (nose) {
+ 		printf("SWEET TS: SE init skipped (sweetts_nose=1)\n");
+ 		goto out;
+ 	}
+-	if (!touch_se_init()) {
++	if (!touch_se_init(&st)) {
+ 		goto out;
+ 	}
+ 	st.probing = true;
+@@ -925,7 +957,7 @@
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
++	if (!touch_clocks() || !touch_se_init(&st)) {
+ 		goto out;
+ 	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+@@ -994,6 +1026,78 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* ------------------------------------------------- 0277: enchilada fuel gauge */
++
++/*
++ * OnePlus 6 TI bq27541 at 0x55 on QUPv3 SE10 (downstream qupv3_se10_i2c,
++ * i2c@a88000 = wrapper 1 SE2; mainline sdm845.dtsi i2c10). Clock
++ * gcc_qupv3_wrap1_s2_clk: vote 0x5200c bit 24, CBCR 0x18274, RCG 0x18278
++ * (gcc-sdm845.c), plus wrap1 m/s AHB bits 20/21 as for SE12. Pins gpio55/56,
++ * TLMM NORTH, function qup10 (pinctrl-sdm845.c; DT qupv3_se10_i2c_active:
++ * 2 mA, bias-disable). 100 kHz (DT qcom,clk-freq-out). Every transfer is a
++ * one-byte register-pointer write and a repeated-START two-byte read: no
++ * Control() subcommand, no data flash, no other address on this bus (0x26 is
++ * the Dash MCU, 0x08/0x0c smb1355). Called only from SweetBattery's work loop.
++ */
++#define BQ_SE_PA        0x00a88000u
++#define BQ_GCC_CBCR     0x18274u
++#define BQ_GCC_RCG      0x18278u
++#define BQ_VOTE_MASK    ((1u << 20) | (1u << 21) | (1u << 24))
++#define BQ_ADDR         0x55u
++#define BQ_GPIO_SDA     55u
++#define BQ_GPIO_SCL     56u
++
++static struct touch_state bq = { .name = "BATT SE10" };
++static int bq_ready;    /* 0 untried, 1 ready, -1 unavailable for this boot */
++
++static bool
++bq_open(void)
++{
++	bq.gcc = ml_io_map(FJ_GCC_PA, 0x60000);
++	bq.gpio = ml_io_map(FJ_TLMM_NORTH, 0x80000);
++	bq.se = ml_io_map(BQ_SE_PA, 0x4000);
++	if (!bq.gcc || !bq.gpio || !bq.se) {
++		printf("SWEET BATT SE10: MMIO mapping failed\n");
++		return false;
++	}
++	uint32_t sda = touch_rd(bq.gpio, TOUCH_GPIO_CFG(BQ_GPIO_SDA));
++	uint32_t scl = touch_rd(bq.gpio, TOUCH_GPIO_CFG(BQ_GPIO_SCL));
++	printf("SWEET BATT SE10: gpio55 cfg=%#x gpio56 cfg=%#x vote=%#x cbcr=%#x "
++	    "rcg=%#x cfg=%#x dfs=%#x\n", sda, scl, touch_rd(bq.gcc, FJ_GCC_VOTE),
++	    touch_rd(bq.gcc, BQ_GCC_CBCR), touch_rd(bq.gcc, BQ_GCC_RCG),
++	    touch_rd(bq.gcc, BQ_GCC_RCG + 4u), touch_rd(bq.gcc, BQ_GCC_RCG + 0x14u));
++	if (((sda >> 2) & 0xfu) != 1u || ((scl >> 2) & 0xfu) != 1u) {
++		/* Linux applies qupv3_se10_i2c_active at probe: qup10, 2 mA, no bias. */
++		touch_gpio_at(bq.gpio, BQ_GPIO_SDA, 1, 0, 0, false, false);
++		touch_gpio_at(bq.gpio, BQ_GPIO_SCL, 1, 0, 0, false, false);
++		printf("SWEET BATT SE10: gpio55/56 -> qup10 (cfg=%#x/%#x)\n",
++		    touch_rd(bq.gpio, TOUCH_GPIO_CFG(BQ_GPIO_SDA)),
++		    touch_rd(bq.gpio, TOUCH_GPIO_CFG(BQ_GPIO_SCL)));
++	}
++	return fajita_clocks(&bq, BQ_VOTE_MASK, BQ_GCC_CBCR, BQ_GCC_RCG) &&
++	       touch_se_init(&bq);
++}
++
++/* One 16-bit little-endian standard command. 0 = ok, ENODEV = SE10 unusable
++ * for this boot (already logged), anything else is a transient bus error. */
++int
++sweet_bq_read(uint8_t reg, uint16_t *out)
++{
++	uint8_t v[2];
++	if (bq_ready == 0) {
++		bq_ready = bq_open() ? 1 : -1;
++	}
++	if (bq_ready < 0 || bq.dead) {
++		return ENODEV;
++	}
++	delay(100); /* bus-free gap between gauge transactions (TI: >= 66 us) */
++	int err = geni_read(&bq, BQ_ADDR, reg, false, v, sizeof(v));
++	if (!err) {
++		*out = (uint16_t)(v[0] | (v[1] << 8));
++	}
++	return err;
++}
++
+ void
+ sweet_touch_init(void)
+ {
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -5,6 +5,9 @@
+  * See report.md for binary evidence, register provenance and integration.
+  * 0275: no boot-arg = auto-detect PMI8998 on SID 2 (OnePlus 6), read only;
+  * sweetbattery=0 forces the fallback. See pollPmi().
++ * 0277: on the PMI8998 path, SOC/capacities/V/I/T come from the bq27541 fuel
++ * gauge on SE10 when it answers plausibly (pollGauge()); PMI8998 keeps the
++ * charger state; the 0275 voltage estimate is the fallback.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -14,9 +17,12 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <sys/errno.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_touch.c (0277): bq27541 standard command, SE10 address 0x55 */
++extern "C" int sweet_bq_read(uint8_t reg, uint16_t *out);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -35,6 +41,11 @@
+ 	unsigned fDesign, fTemp, fPct, fOcv, fFailures, fTicks, fPollTick, fLogTick, fQuiet;
+ 	int fLastUsb, fLastState;
+ 	uint8_t fRevMajor, fRevMinor;
++	/* 0277 bq27541 state: map -1 undetected, -2 off for this boot */
++	int fBqMap, fBqMv, fBqMa, fBqDeciC;
++	bool fBqOk, fBqHave;
++	unsigned fBqSoc, fFcc, fRm, fCycles, fBqSkip, fBqBackoff, fBqFails, fBqTick, fBqLogTick;
++	uint16_t fBqFlags;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -42,6 +53,9 @@
+ 	void poll(void);
+ 	bool detectPmi(void);
+ 	void pollPmi(void);
++	bool pollGauge(void);
++	int detectGauge(const char **why);
++	int readGauge(const char **why);
+ 	void tick(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+@@ -69,6 +83,12 @@
+ 	fLogTick = 0u - 5u; /* the first change after boot is logged */
+ 	fLastUsb = fLastState = -1;
+ 	fRevMajor = fRevMinor = 0;
++	fBqMap = -1;
++	fBqMv = fBqMa = fBqDeciC = 0;
++	fBqOk = fBqHave = false;
++	fBqSoc = fFcc = fRm = fCycles = fBqSkip = fBqBackoff = fBqFails = fBqTick = 0;
++	fBqLogTick = 0u - 300u;
++	fBqFlags = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -119,12 +139,15 @@
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+ 	/* Use consistent mAh units (sweet DT nominal=5020, enchilada 3300).
+-	 * powerd computes C*100/M. */
++	 * powerd computes C*100/M: C is rounded up so that floor gives percent.
++	 * 0277: with the gauge, M = FullChargeCapacity and raw C = RemainingCapacity. */
+ 	const unsigned design = fDesign;
+-	const unsigned capacity = (design * percent + 50u) / 100u;
++	const unsigned max = fBqOk ? fFcc : design;
++	const unsigned capacity = (max * percent + 99u) / 100u;
++	const unsigned cycles = fBqOk ? fCycles : 0;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(design);
++	setMaxCapacity(max);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -134,18 +157,19 @@
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(cycles); /* 0 unless the gauge reports it (0277). */
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+-	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", design);
++	putNumber("AppleRawCurrentCapacity", fBqOk ? fRm : capacity);
++	putNumber("AppleRawMaxCapacity", max);
+ 	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; 25 C unless measured (0275). */
+ 	putNumber("Temperature", fTemp);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
++	putBool("SweetBatterySOCEstimated", measured && !fBqOk);
++	putBool("SweetBatteryGauge", fBqOk);
+ 	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+@@ -156,7 +180,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, design, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, max, mv, (UInt32)ma, cycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -350,6 +374,7 @@
+ 		 * samples (or none ever) fall back to the static source. */
+ 		if (fPct == 0 || ++fFailures >= 10) {
+ 			fPct = 0;
++			fBqOk = false;
+ 			fTempMeasured = false;
+ 			fTemp = 2500;
+ 			publish(100, 4200, 0, true, true, false, true, false, false);
+@@ -392,9 +417,21 @@
+ 	putNumber("SweetBatteryRawSMB2", (UInt32)st1 | (UInt32)st2 << 8 |
+ 	    (UInt32)usb << 16 | (UInt32)path << 24);
+ 	putNumber("SweetBatteryOCV", fOcv);
++	putNumber("SweetBatteryVEstimate", pct);
+ 	bool first = fPct == 0;
+ 	fPct = pct;
+ 	fLastUsb = external;
++	/* 0277: never from start(); the first SE10 access is a work-loop poll. */
++	fBqOk = fTimerAdded && pollGauge();
++	if (fBqOk) {
++		pct = fBqSoc;
++		mv = fBqMv;
++		ma = fBqMa;
++		currentValid = true;
++		/* Same 0-45 C guard as above, clamped: this is the cell's own sensor. */
++		fTempMeasured = true;
++		fTemp = (unsigned)(fBqDeciC < 0 ? 0 : fBqDeciC > 450 ? 450 : fBqDeciC) * 10u;
++	}
+ 	publish(pct, (unsigned)mv, ma, external, online, charging, full, true, currentValid);
+ 
+ 	int st = !external ? 0 : charging ? 2 : full ? 3 : 1;
+@@ -409,8 +446,9 @@
+ 	} else if (st != fLastState) {
+ 		/* At most one line per 10 s; bounces are counted, not printed. */
+ 		if (fLastState < 0 || fTicks - fLogTick >= 5) {
+-			IOLog("SWEET BATT: %s, SOC %u%% %d mV %d mA, USB %s (%u changes not logged)\n",
+-			    names[st], pct, mv, ma, external ? "present" : "absent", fQuiet);
++			IOLog("SWEET BATT: %s, SOC %u%% (%s) %d mV %d mA, USB %s (%u changes not logged)\n",
++			    names[st], pct, fBqOk ? "gauge" : "V-estimate", mv, ma,
++			    external ? "present" : "absent", fQuiet);
+ 			fLogTick = fTicks;
+ 			fQuiet = 0;
+ 		} else {
+@@ -420,6 +458,143 @@
+ 	fLastState = st;
+ }
+ 
++/*
++ * 0277: OnePlus 6 fuel gauge, TI bq27541 at 0x55 on SE10 (downstream dtbo
++ * "ti,bq27541-battery"; mainline sdm845-oneplus-common.dtsi says "ti,bq27411").
++ * Linux bq27xxx_battery.c register maps (bq27541_regs, and bq27421_regs which
++ * "ti,bq27411" uses): mV, mA (s16, + = charging), mAh, 0.1 K; bq27411 has no
++ * CycleCount; DesignCapacity 0x3c in both. The variant is chosen by which map
++ * reads plausibly; Control() DEVICE_TYPE would need a subcommand WRITE.
++ */
++struct BqMap {
++	const char *name;
++	uint8_t temp, volt, flags, avgCurrent, soc, fcc, rm, cycles;
++};
++static const BqMap kBqMaps[] = {
++	{"bq27541", 0x06, 0x08, 0x0a, 0x14, 0x2c, 0x12, 0x10, 0x2a},
++	{"bq27411", 0x02, 0x04, 0x06, 0x10, 0x1c, 0x0e, 0x0c, 0x00},
++};
++
++static bool
++bqPlausible(uint16_t t, uint16_t mv, uint16_t soc)
++{
++	return mv >= 3000 && mv <= 4500 && soc <= 100 && t >= 2330 && t <= 3730; /* -40..100 C */
++}
++
++int
++SweetBattery::detectGauge(const char **why)
++{
++	uint16_t t[2] = {0, 0}, v[2] = {0, 0}, soc[2] = {0, 0}, dcap = 0;
++	int map = -1, err = 0;
++	for (int i = 0; i < 2; ++i) {
++		const BqMap &m = kBqMaps[i];
++		int e;
++		if ((e = sweet_bq_read(m.temp, &t[i])) || (e = sweet_bq_read(m.volt, &v[i])) ||
++		    (e = sweet_bq_read(m.soc, &soc[i]))) {
++			err = e;
++			if (e == ENODEV) {
++				return e;
++			}
++		} else if (bqPlausible(t[i], v[i], soc[i])) {
++			map = map == -1 ? i : -3;
++		}
++	}
++	(void)sweet_bq_read(0x3c, &dcap);
++	static bool logged; /* the raw words are the variant evidence; once */
++	if (!logged && (map >= 0 || !err)) {
++		logged = true;
++		IOLog("SWEET BATT: SE10 0x55 T/V/SOC 06/08/2c = %u/%u/%u, 02/04/1c = %u/%u/%u, "
++		    "3c = %u -> %s\n", t[0], v[0], soc[0], t[1], v[1], soc[1], dcap,
++		    map >= 0 ? kBqMaps[map].name : map == -3 ? "ambiguous" : "no plausible map");
++	}
++	if (map < 0) {
++		*why = map == -3 ? "variant detection (both maps plausible)" :
++		    err ? "probe read" : "variant detection (no plausible map)";
++		return err ? err : EINVAL;
++	}
++	fBqMap = map;
++	if (dcap >= 1000 && dcap <= 10000) {
++		fDesign = dcap; /* DesignCapacity -> DesignCapacity / battery health */
++	}
++	return 0;
++}
++
++int
++SweetBattery::readGauge(const char **why)
++{
++	const BqMap &m = kBqMaps[fBqMap];
++	uint16_t t, v, flags, ai, soc, fcc, rm, cyc = 0;
++	int err;
++	if ((err = sweet_bq_read(m.temp, &t)) || (err = sweet_bq_read(m.volt, &v)) ||
++	    (err = sweet_bq_read(m.flags, &flags)) || (err = sweet_bq_read(m.avgCurrent, &ai)) ||
++	    (err = sweet_bq_read(m.soc, &soc)) || (err = sweet_bq_read(m.fcc, &fcc)) ||
++	    (err = sweet_bq_read(m.rm, &rm)) || (m.cycles && (err = sweet_bq_read(m.cycles, &cyc)))) {
++		*why = "I2C read";
++		return err;
++	}
++	if (!bqPlausible(t, v, soc) || fcc < 500 || fcc > 10000) {
++		*why = "sample range check";
++		return EINVAL;
++	}
++	fBqMv = v;
++	fBqMa = (int16_t)ai;
++	fBqDeciC = (int)t - 2731;
++	fBqSoc = soc < 1 ? 1 : soc; /* 0 % could make powerd shut down on a glitch */
++	fFcc = fcc;
++	fRm = rm > fcc ? fcc : rm;
++	fCycles = cyc;
++	fBqFlags = flags;
++	return 0;
++}
++
++/* Each full poll (30 s or a cable change). Errors back off 1, 2, 4 .. 32 polls;
++ * the last good sample is kept for 5 minutes, then the 0275 estimate is used. */
++bool
++SweetBattery::pollGauge(void)
++{
++	bool held = fBqHave && fTicks - fBqTick < 150;
++	if (fBqMap == -2) {
++		return false;
++	}
++	if (fBqSkip) {
++		--fBqSkip;
++		return held;
++	}
++	const char *why = "read";
++	int err = fBqMap < 0 ? detectGauge(&why) : 0;
++	if (!err) {
++		err = readGauge(&why);
++	}
++	if (!err) {
++		if (!fBqHave) {
++			IOLog("SWEET BATT: %s at SE10 0x55: SOC %u%% FCC %u mAh RM %u mAh cycles %u "
++			    "V %d mV I %d mA T %d dC (flags %#x, design %u mAh)\n", kBqMaps[fBqMap].name,
++			    fBqSoc, fFcc, fRm, fCycles, fBqMv, fBqMa, fBqDeciC, fBqFlags, fDesign);
++		} else if (fBqFails) {
++			IOLog("SWEET BATT: gauge back after %u failed polls, SOC %u%%\n", fBqFails, fBqSoc);
++		}
++		putNumber("SweetBatteryGaugeFlags", fBqFlags);
++		fBqHave = true;
++		fBqTick = fTicks;
++		fBqFails = fBqBackoff = 0;
++		return true;
++	}
++	if (err == ENODEV) {
++		fBqMap = -2;
++		IOLog("SWEET BATT: bq27541 unavailable for this boot (SWEET BATT SE10 lines say why); "
++		    "voltage estimate\n");
++		return false;
++	}
++	if (fBqFails++ == 0 && fTicks - fBqLogTick >= 300) {
++		IOLog("SWEET BATT: bq27541 %s failed (err %d); %s, backing off\n", why, err,
++		    held ? "holding the last sample" : "voltage estimate");
++		fBqLogTick = fTicks;
++	}
++	fBqBackoff = fBqBackoff ? (fBqBackoff < 32 ? 2 * fBqBackoff : 32) : 1;
++	fBqSkip = fBqBackoff;
++	return held;
++}
++
+ /* Every 2 s: one USBIN read; a full sample on a cable change or every 30 s. */
+ void
+ SweetBattery::tick(void)
