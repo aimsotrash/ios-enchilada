@@ -1,0 +1,305 @@
+enchilada: display: the scanout pool says who holds its slots, and why a frame missed it
+
+Boot 27 (sweetzc=1, GL armed at 354 s): the CPU-mode surfaces 2 and 3 gave their slots back
+when backboardd exited (GL surface 19 took 0x9eab4000 at 360.31, surface 20 0x9dd68000 at
+360.73), but from surface 21 on no canvas surface got a slot again until the log ends at 497 s
+(no further "in the scanout pool" line although 0251 logged the first 8 and only 4 were used,
+and no "freed while ... still mapped"): surfaces 19 and 20 were never freed, while CA made a new
+display surface every frame. Every later swap was copied ("not in the scanout pool (pool full,
+or not a canvas-sized BGRA surface)"), and nothing said who kept 19 and 20.
+The pool now records which surface has each slot (under a lock; give() clears the entry before
+the surface's memory goes) and, rate-limited (the first 48 decisions, then one in 64; boot-arg
+sweetzc_log=0: off), says:
+  "SWEET SURF: surface N (1125x2436) in the scanout pool at PA ..."           (take)
+  "SWEET FB: a new 1125x2436 surface of backboardd (#K): every scanout slot is taken: slot 0
+   surface A (refs R, gpu G, on the panel|flip pending|not shown, T ms); ..."  (refused)
+  "SWEET FB: surface N gives scanout slot I back after T ms (#K)"             (give)
+refs is the surface's retain count: 1 for the id table, 1 per client mapping it, 1 per GPU
+import (gpu, counted in SURFACE_BO / releaseGem), 1 for the panel and 1 for a pending flip, so
+refs - 1 - gpu - panel/pending is the number of processes still holding it (CoreAnimation, or
+eagl.c's image table). A slot freed while still mapped is marked leaked (logged always, as
+before) instead of keeping a pointer to the freed surface. zcFlip's reason now tells "every slot
+was taken when it was made" from "not a canvas-sized BGRA surface"; the 10 s line says
+"pool slots in use B/N". No behaviour change besides the lines.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -466,6 +466,9 @@
+ 			}
+ 			sweet_gpu_free_pages(g->pa, g->size);
+ 		}
++		if (g->surface != NULL && g->surface->gpuImports != 0) {
++			g->surface->gpuImports--;       /* 0259: a leaked one stays counted */
++		}
+ 	}
+ 	OSSafeReleaseNULL(g->md);
+ 	g->buf = NULL;
+@@ -1103,6 +1106,7 @@
+ 				} else {
+ 					fNextGem = i + 1;
+ 					r->iova = g->iova;
++					s->gpuImports++;        /* 0259: for the scanout pool's "who holds it" line */
+ 					s = NULL;
+ 				}
+ 				break;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -48,6 +48,11 @@
+ 	uint64_t                  scanoutPA;
+ 	/* 0255: write-locked since the display last showed it (sweet_scanout_lock; SweetFramebuffer.cpp fMdpLock) */
+ 	bool                      zcLocked;
++	/* 0259: canvas-sized BGRA, but every scanout slot was taken when it was made */
++	bool                      poolMissed;
++	/* 0259: SURFACE_BO imports (GEMs) holding it (SweetAdreno.cpp, gAdrenoLock); when its slot was taken */
++	uint32_t                  gpuImports;
++	uint64_t                  poolSince;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE
+ 	{
+@@ -57,6 +62,9 @@
+ 		gpuFence = 0;
+ 		scanoutPA = 0;
+ 		zcLocked = false;
++		poolMissed = false;
++		gpuImports = 0;
++		poolSince = 0;
+ 		return OSObject::init();
+ 	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -75,10 +83,14 @@
+ /*
+  * 0251 (SweetFramebuffer.cpp, boot-arg sweetzc): a canvas-sized surface can live in memory the
+  * display's source pipe scans in place. take: the physical address of a free pool slot that fits
+- * s (its size, format and allocSize are set), or 0. give: the slot is free again.
++ * s (its size, format and allocSize are set), or 0. give: s's slot is free again (reusable), or
++ * stays taken for good because something still maps it (not reusable).
++ * 0259: the pool knows which surface holds each slot; take says who holds them when none is
++ * free, give how long the surface had its slot; sweet_scanout_say() rate-limits those lines.
+  */
+ uint64_t sweet_scanout_take(SweetSurface *s);
+-void sweet_scanout_give(uint64_t pa);
++void sweet_scanout_give(SweetSurface *s, bool reusable);
++bool sweet_scanout_say(void);
+ /*
+  * 0255: IOSurfaceLock for writing on a pool surface: returns once the display no longer scans it
+  * (at most 50 ms), so SwapEnd need not wait for the frame that takes its flip.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -96,11 +96,7 @@
+ 		 * 0251: the slot goes back only if nothing else still maps it.
+ 		 * ponytail: a leaked slot stays leaked until reboot (the copy path takes over).
+ 		 */
+-		if (memory->getRetainCount() == 1) {
+-			sweet_scanout_give(scanoutPA);
+-		} else {
+-			IOLog("SWEET SURF: surface %u freed while its scanout slot 0x%llx is still mapped: slot kept\n", id, scanoutPA);
+-		}
++		sweet_scanout_give(this, memory->getRetainCount() == 1);       /* 0259: says which, rate-limited */
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -726,14 +722,13 @@
+ 	s->scanoutPA = pa;
+ 	s->mapCache = kIOMapCopybackCache;
+ 	uintptr_t kva = s->memory != NULL ? s->kernelAddress() : 0;
+-	static uint32_t told;
+ 	if (kva == 0 || !sweet_va_writeback(kva)) {
+ 		IOLog("SWEET SURF: scanout slot 0x%llx: kernel mapping %s; ordinary memory instead\n", pa,
+ 		    kva == 0 ? "failed" : "is not write-back");
+ 		OSSafeReleaseNULL(s->kernelMap);
+ 		OSSafeReleaseNULL(s->memory);
++		sweet_scanout_give(s, true);
+ 		s->scanoutPA = 0;
+-		sweet_scanout_give(pa);
+ 		return kIOReturnSuccess;
+ 	}
+ 	bzero((void *)kva, s->allocSize);       /* write-back: dc zva is fine here */
+@@ -741,7 +736,7 @@
+ 		IOLog("SWEET SURF: scanout surface at 0x%llx: surface table full\n", pa);
+ 		return kIOReturnNoResources;
+ 	}
+-	if (told++ < 8) {
++	if (sweet_scanout_say()) {      /* 0259: rate-limited, no longer only the first 8 */
+ 		IOLog("SWEET SURF: surface %u (%ux%u) in the scanout pool at 0x%llx (%u bytes, copyback)\n",
+ 		    s->id, s->width, s->height, pa, s->allocSize);
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -81,6 +81,7 @@
+ /* 0255: waits for a frame to take a flush (zcLatch sleeping at all), of which at a write lock; their time */
+ static uint64_t sweet_fb_stat_wait, sweet_fb_stat_lockwait, sweet_fb_stat_wait_abs, sweet_fb_stat_wait_max;
+ static uint32_t sweet_scanout_slots_busy(void);
++static uint32_t sweet_scanout_n = 2;     /* 0259: scanout pool slots (0264: 3 with sweetzc_slots=3) */
+ static uint64_t sweet_fb_stat_zcno;             /* 0253: swaps zcFlip did not scan in place */
+ static const char *sweet_fb_stat_zcwhy;         /* 0253: and the last reason */
+ /*
+@@ -701,11 +702,11 @@
+ 		absolutetime_to_nanoseconds(sweet_fb_stat_wait_max, &wmax_ns);
+ 		/* 0255: waits = zcLatch had to sleep (SwapEnd, a write lock, a restore); slots = scanout pool slots taken */
+ 		IOLog("SWEET FB: last 10 s: %llu swaps (%llu.%llu/s), %llu in place (%llu without waiting in SwapEnd), "
+-		    "%llu waits for a frame (%llu at a write lock; avg %llu us max %llu us), pool slots in use %u/2, "
++		    "%llu waits for a frame (%llu at a write lock; avg %llu us max %llu us), pool slots in use %u/%u, "
+ 		    "%llu panel copies (avg %llu us max %llu us), %llu not in place (last: %s)\n",
+ 		    sweet_fb_stat_swaps, sweet_fb_stat_swaps / 10, sweet_fb_stat_swaps % 10, sweet_fb_stat_zc,
+ 		    sweet_fb_stat_zcasync, sweet_fb_stat_wait, sweet_fb_stat_lockwait, wavg_ns / 1000, wmax_ns / 1000,
+-		    sweet_scanout_slots_busy(), sweet_fb_stat_copies, avg_ns / 1000, max_ns / 1000,
++		    sweet_scanout_slots_busy(), sweet_scanout_n, sweet_fb_stat_copies, avg_ns / 1000, max_ns / 1000,
+ 		    sweet_fb_stat_zcno, sweet_fb_stat_zcwhy != NULL ? sweet_fb_stat_zcwhy : "-");
+ 		sweet_fb_stat_swaps = sweet_fb_stat_copies = sweet_fb_stat_copy_abs = sweet_fb_stat_copy_max = 0;
+ 		sweet_fb_stat_zc = sweet_fb_stat_zcasync = sweet_fb_stat_zcno = 0;
+@@ -974,7 +975,65 @@
+ static uint64_t        sweet_scanout_pa[2];
+ static uint32_t        sweet_scanout_size;      /* bytes a slot holds; 0: no pool */
+ static uint32_t        sweet_scanout_w, sweet_scanout_h;
+-static volatile UInt32 sweet_scanout_busy[2];
++/*
++ * 0259: who has each slot (no reference: give() clears it under the lock before the surface's
++ * memory goes, so a describe under the lock never sees a freed one); SWEET_SCANOUT_GONE: its
++ * surface was freed while something still mapped the slot, which then stays taken for good.
++ */
++#define SWEET_SCANOUT_GONE     ((SweetSurface *)1)
++static SweetSurface   *sweet_scanout_owner[2];
++static IOLock         *sweet_pool_lock;         /* sweet_scanout_owner */
++static AppleCLCD *sweet_fb_zc;          /* 0255: the armed framebuffer, for sweet_scanout_lock */
++static int             sweet_pool_log = -1;     /* 0259: sweetzc_log=0: no pool lines (but a leaked slot) */
++static uint32_t        sweet_pool_said;
++
++/* 0259: the first 48 pool decisions, then one in 64 (each line says which one it is). */
++bool
++sweet_scanout_say(void)
++{
++	if (sweet_pool_log < 0) {
++		int on = 1;
++		PE_parse_boot_argn("sweetzc_log", &on, sizeof(on));
++		sweet_pool_log = on != 0;
++	}
++	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&sweet_pool_said);
++	return sweet_pool_log && (n < 48 || (n % 64) == 0);
++}
++
++static uint64_t
++sweet_ms_since(uint64_t t)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/*
++ * 0259: one line naming what holds every slot: refs is the surface's retain count (the id
++ * table 1, each client that maps it 1, each GPU import 1, the panel and a pending flip 1 each),
++ * so refs - 1 - gpu - panel/pending is how many processes still have it. sweet_pool_lock held.
++ */
++static void
++sweet_scanout_describe(SweetSurface *s)
++{
++	char line[320], name[32];
++	proc_selfname(name, sizeof(name));      /* (s has no id yet: take runs before it is published) */
++	int used = snprintf(line, sizeof(line), "SWEET FB: a new %ux%u surface of %s (#%u): every scanout slot is taken:",
++	    s->width, s->height, name, sweet_pool_said);
++	AppleCLCD *fb = sweet_fb_zc;
++	for (uint32_t i = 0; i < sweet_scanout_n && used > 0 && used < (int)sizeof(line); i++) {
++		SweetSurface *o = sweet_scanout_owner[i];
++		if (o == SWEET_SCANOUT_GONE) {
++			used += snprintf(line + used, sizeof(line) - used, " slot %u leaked;", i);
++			continue;
++		}
++		const char *where = fb != NULL && o == fb->fZcHeld ? "on the panel" : fb != NULL && o == fb->fZcPend ?
++		    "flip pending" : "not shown";
++		used += snprintf(line + used, sizeof(line) - used, " slot %u surface %u (refs %d, gpu %u, %s, %llu ms);", i,
++		    o->id, o->getRetainCount(), o->gpuImports, where, sweet_ms_since(o->poolSince));
++	}
++	IOLog("%s\n", line);
++}
+ 
+ uint64_t
+ sweet_scanout_take(SweetSurface *s)
+@@ -985,32 +1044,57 @@
+ 	    s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->allocSize > size) {
+ 		return 0;
+ 	}
+-	for (uint32_t i = 0; i < 2; i++) {
+-		if (OSCompareAndSwap(0, 1, &sweet_scanout_busy[i])) {
+-			return sweet_scanout_pa[i];
++	uint64_t pa = 0;
++	IOLockLock(sweet_pool_lock);
++	for (uint32_t i = 0; i < sweet_scanout_n && pa == 0; i++) {
++		if (sweet_scanout_owner[i] == NULL) {
++			sweet_scanout_owner[i] = s;
++			s->poolSince = mach_absolute_time();
++			pa = sweet_scanout_pa[i];
++		}
++	}
++	if (pa == 0) {
++		s->poolMissed = true;
++		if (sweet_scanout_say()) {
++			sweet_scanout_describe(s);
+ 		}
+ 	}
+-	return 0;
++	IOLockUnlock(sweet_pool_lock);
++	return pa;
+ }
+ 
+ void
+-sweet_scanout_give(uint64_t pa)
++sweet_scanout_give(SweetSurface *s, bool reusable)
+ {
+-	for (uint32_t i = 0; i < 2; i++) {
+-		if (pa != 0 && pa == sweet_scanout_pa[i]) {
+-			OSCompareAndSwap(1, 0, &sweet_scanout_busy[i]);
++	if (sweet_pool_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_pool_lock);
++	for (uint32_t i = 0; i < sweet_scanout_n; i++) {
++		if (sweet_scanout_owner[i] == s) {
++			sweet_scanout_owner[i] = reusable ? NULL : SWEET_SCANOUT_GONE;
++			if (!reusable) {
++				IOLog("SWEET SURF: surface %u freed while its scanout slot 0x%llx is still mapped: slot kept\n",
++				    s->id, sweet_scanout_pa[i]);
++			} else if (sweet_scanout_say()) {
++				IOLog("SWEET FB: surface %u gives scanout slot %u back after %llu ms (#%u)\n", s->id, i,
++				    sweet_ms_since(s->poolSince), sweet_pool_said);
++			}
+ 		}
+ 	}
++	IOLockUnlock(sweet_pool_lock);
+ }
+ 
+ static uint32_t
+ sweet_scanout_slots_busy(void)
+ {
+-	return (sweet_scanout_busy[0] != 0) + (sweet_scanout_busy[1] != 0);
++	uint32_t n = 0;
++	for (uint32_t i = 0; i < sweet_scanout_n; i++) {
++		n += sweet_scanout_owner[i] != NULL;
++	}
++	return n;
+ }
+ 
+-static AppleCLCD *sweet_fb_zc;          /* 0255: the armed framebuffer, for sweet_scanout_lock */
+-
+ /*
+  * 0255: IOSurfaceLock for writing on a pool surface (SweetSurface.cpp trapLock, after the GPU
+  * wait). Notes the draw for zcAsyncOk, and while the surface is still on the panel with a flip
+@@ -1107,7 +1191,7 @@
+ 		why = "no room for two canvases in the splash region";
+ 	} else if (consoleOnly > 0) {
+ 		why = "sweetfb_console=1";
+-	} else if ((fMdpLock = IOLockAlloc()) == NULL) {
++	} else if ((fMdpLock = IOLockAlloc()) == NULL || (sweet_pool_lock = IOLockAlloc()) == NULL) {
+ 		why = "no lock";
+ 	}
+ 	if (why != NULL) {
+@@ -1458,7 +1542,9 @@
+ 	} else if (s == NULL || s == fSurface) {
+ 		why = "not a client surface: copied";
+ 	} else if (s->scanoutPA == 0) {
+-		why = "not in the scanout pool (pool full, or not a canvas-sized BGRA surface): copied";
++		/* 0259: which of the two (the take that refused it said who held the slots) */
++		why = s->poolMissed ? "not in the scanout pool (every slot was taken when it was made): copied" :
++		    "not in the scanout pool (not a canvas-sized BGRA surface): copied";
+ 	} else if (get32(a, 0) || get32(a, 4) || get32(b, 0) || get32(b, 4) ||
+ 	    !((w == 0 && h == 0) || (w == (int32_t)fLogicalW && h == (int32_t)fLogicalH))) {
+ 		why = "layer is not the whole canvas: copied";

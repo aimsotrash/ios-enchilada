@@ -1,0 +1,152 @@
+enchilada: GPU: one SMMU TLB invalidate per mapped BO, not per 4 KiB page
+
+Boots 24 and 27 (OpenGL ES CoreAnimation at 675 MHz): every GL frame spent ~95 ms in eagl.c's
+"before it for the IOSurfaces" (frames came ~100 ms apart, ~9 fps) against ~20 ms in boot 22,
+where the SURFACE_BO import of the display surface was refused and only the CPU refill ran. CA's
+GL renderer makes a new 1125x2436 display surface every frame (ids 19, 20, 21 ... 56), so every
+frame imports 13.9 MB, and mapGem() entered it with sweet_gpu_vm_map(), which ends each 4 KiB
+PTE with gpu_tlb_invalidate(): TLBIALL on both context banks and TLBIALLNSNH, each polled over
+MMIO -- 3392 times per surface (and 3072 for every fresh 12 MB texture BO). Now the pages go in
+with sweet_gpu_vm_map_nosync() and one sweet_gpu_vm_sync() (barrier + the same invalidate) runs
+after the last one, before the handle is handed out; GEM_INFO SET_IOVA's remap does the same.
+Nothing can use the new range earlier: the GPU only sees an iova once a later SUBMIT names it,
+and SUBMIT takes gAdrenoLock, which mapGem holds. Unmapping already invalidated once per range.
+The first 8 surface imports log their time ("SWEET GPU: surface N: K KB entered for the GPU in
+U us (0258)"). boot-arg sweetgputlbi=1: an invalidate after every page, as before.
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1943,8 +1943,14 @@
+ 	}
+ }
+ 
++/*
++ * 0258: the PTE only, no TLB invalidate. A caller that enters many pages (SweetAdreno's mapGem:
++ * 3392 for a 1125x2436 display surface) calls sweet_gpu_vm_sync() once after the last one;
++ * nothing can use the new range before that call returns (the GPU only sees an iova once a
++ * later SUBMIT names it, and that takes the same lock).
++ */
+ bool
+-sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
++sweet_gpu_vm_map_nosync(uint64_t iova, uint64_t pa, bool readonly)
+ {
+ 	if (!gpu_live || !gpu_va_to_local(iova, 0x1000, NULL)) {
+ 		return false;
+@@ -1956,8 +1962,27 @@
+ 	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
+ 	    (readonly ? (1ull << 7) : 0ull);
+ 	gpu_pte_clean((vm_offset_t)&l3[(iova >> 12) & 0x1ff], 8);
++	return true;
++}
++
++/* 0258: make the PTEs written so far visible to the GPU: barrier, then the full invalidate. */
++void
++sweet_gpu_vm_sync(void)
++{
++	if (!gpu_live) {
++		return;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	gpu_tlb_invalidate();
++}
++
++bool
++sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
++{
++	if (!sweet_gpu_vm_map_nosync(iova, pa, readonly)) {
++		return false;
++	}
++	sweet_gpu_vm_sync();
+ 	return true;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -46,6 +46,8 @@
+ bool sweet_gpu_iova_reserve(uint64_t iova, uint64_t size);
+ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
++bool sweet_gpu_vm_map_nosync(uint64_t iova, uint64_t pa, bool readonly);       /* 0258 */
++void sweet_gpu_vm_sync(void);                                                   /* 0258 */
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+@@ -476,6 +478,35 @@
+ 	g->iova = IOVA_UNSET;
+ }
+ 
++/*
++ * 0258: a BO's pages are entered with one SMMU TLB invalidate after the last PTE instead of one
++ * per 4 KiB page. Each invalidate is two context-bank TLBIALLs and the global one, each polled
++ * over MMIO: 3392 of them for every 1125x2436 display surface, and CoreAnimation's OpenGL ES
++ * renderer makes a new one of those every frame (boots 24/27: ~95 ms "before it for the
++ * IOSurfaces" a frame with SURFACE_BO, ~20 ms in boot 22 where the import was refused).
++ * boot-arg sweetgputlbi=1: one invalidate per page, as before.
++ */
++static int gTlbiEach = -1;
++
++static bool
++tlbiEach(void)
++{
++	if (gTlbiEach < 0) {
++		uint32_t each = 0;
++		(void)PE_parse_boot_argn("sweetgputlbi", &each, sizeof(each));
++		gTlbiEach = each != 0;
++		IOLog("SWEET GPU: BO mapping: %s (sweetgputlbi=%u)\n",
++		    gTlbiEach ? "a TLB invalidate after every 4 KiB page" : "one TLB invalidate per BO", each);
++	}
++	return gTlbiEach != 0;
++}
++
++static bool
++vmMapPage(uint64_t iova, uint64_t pa, bool ro)
++{
++	return tlbiEach() ? sweet_gpu_vm_map(iova, pa, ro) : sweet_gpu_vm_map_nosync(iova, pa, ro);
++}
++
+ /* Enter the pages of g->md into the GPU address space and give out a handle (lock held). */
+ IOReturn
+ SweetAdrenoUserClient::mapGem(struct sweet_gem *slot, uint32_t flags, uint32_t *handle, uint64_t setIova)
+@@ -503,10 +534,13 @@
+ 			IOByteCount length = 0;
+ 			pa = (uint64_t)slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 		}
+-		if (pa == 0 || (pa & (GPU_PAGE - 1)) != 0 || !sweet_gpu_vm_map(iova + mapped, pa, ro)) {
++		if (pa == 0 || (pa & (GPU_PAGE - 1)) != 0 || !vmMapPage(iova + mapped, pa, ro)) {
+ 			break;
+ 		}
+ 	}
++	if (mapped == size && !tlbiEach()) {
++		sweet_gpu_vm_sync();    /* 0258: once, before the handle is given out */
++	}
+ 	if (mapped < size) {
+ 		/* Pages [0, mapped) are in; undo them and the address range, then fail the call (was a DIAG panic). */
+ 		sweet_gpu_vm_unmap(iova, mapped);
+@@ -625,7 +659,10 @@
+ 				for (; mapped < g->size && ok; mapped += GPU_PAGE) {     /* K2(a): every 4 KiB PTE */
+ 					IOByteCount length = 0;
+ 					addr64_t pa = g->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+-					ok = pa != 0 && sweet_gpu_vm_map(newIova + mapped, pa, (g->flags & SWEET_MSM_BO_GPU_READONLY) != 0);
++					ok = pa != 0 && vmMapPage(newIova + mapped, pa, (g->flags & SWEET_MSM_BO_GPU_READONLY) != 0);
++				}
++				if (ok && !tlbiEach()) {
++					sweet_gpu_vm_sync();    /* 0258 */
+ 				}
+ 				if (!ok) {
+ 					sweet_gpu_vm_unmap(newIova, mapped);
+@@ -1051,7 +1088,15 @@
+ 				g->kva = (uint8_t *)s->kernelAddress();
+ 				g->size = size;
+ 				g->zc = zc;
++				uint64_t t0 = mach_absolute_time();
+ 				ret = mapGem(g, 0, &r->handle, 0);
++				static uint32_t timed;
++				if (ret == kIOReturnSuccess && timed++ < 8) {
++					uint64_t ns = 0;
++					absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++					IOLog("SWEET GPU: surface %u: %llu KB entered for the GPU in %llu us (0258)\n", s->id,
++					    (unsigned long long)(size >> 10), (unsigned long long)(ns / 1000));
++				}
+ 				if (ret != kIOReturnSuccess) {
+ 					g->md->release();
+ 					bzero(g, sizeof(*g));

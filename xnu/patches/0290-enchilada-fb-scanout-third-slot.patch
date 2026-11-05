@@ -1,0 +1,61 @@
+enchilada: display: an opt-in third scanout slot in pil_slpi_mem (sweetzc_slots=3)
+
+CoreAnimation's OpenGL ES renderer draws every frame into a new canvas surface (boot 27: ids
+19 ... 56, one per frame), so in-place scanout needs a free slot at every create. With 0255's
+async flips one slot is on the panel and one is the pending flip until a frame takes it, and the
+surface before may not be freed yet: two slots leave nothing for the next frame. boot-arg
+sweetzc_slots=3 adds 0x96800000 (enchilada2.dtb pil_slpi_mem, slpi_region@0x96800000, 20 MiB,
+no-map, referenced only by the SLPI PIL node, qcom,firmware-name "slpi", pas-id 12): a sensor DSP
+this port never loads, so the region was never assigned away from the HLOS; below 4 GiB as
+SRC0_ADDR needs; not mpss/mba/wlan/rmtfs/ipa/smem. Slots keep the splash slots' size (13616 KB).
+Opt-in because nothing on this port has touched that region yet: if the hypervisor or an xPU
+did protect it, the first bzero of the slot (a 1125x2436 surface made while slots 0 and 1 are
+taken) would abort; an MDP fetch fault is caught like any failed flip (SMMU fault registers,
+50 ms latch) and turns in-place scanout off. One line at arm: "SWEET FB: N scanout slots ...".
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -972,7 +972,18 @@
+ #define SWEET_ZC_LATCH_MS       50
+ #define SWEET_MDP_SAVE_MAX      40
+ 
+-static uint64_t        sweet_scanout_pa[2];
++/*
++ * 0264: a third slot outside the splash region, opt-in (boot-arg sweetzc_slots=3): pil_slpi_mem
++ * of enchilada2.dtb (slpi_region@0x96800000, 20 MiB, no-map), referenced only by the SLPI's PIL
++ * node (qcom,firmware-name "slpi", pas-id 12), a sensor DSP this port never loads, so nothing has
++ * handed it to TrustZone. Not mpss/mba/wlan/rmtfs/ipa/smem. CoreAnimation's OpenGL ES renderer
++ * makes a new canvas surface every frame; with 0255's async flips one slot is on the panel, one
++ * is the pending flip and the new frame needs a third.
++ */
++#define SWEET_SLPI_PA          0x96800000ull
++#define SWEET_SLPI_SIZE        0x1400000u
++#define SWEET_SCANOUT_SLOTS    3
++static uint64_t        sweet_scanout_pa[SWEET_SCANOUT_SLOTS];
+ static uint32_t        sweet_scanout_size;      /* bytes a slot holds; 0: no pool */
+ static uint32_t        sweet_scanout_w, sweet_scanout_h;
+ /*
+@@ -981,7 +992,7 @@
+  * surface was freed while something still mapped the slot, which then stays taken for good.
+  */
+ #define SWEET_SCANOUT_GONE     ((SweetSurface *)1)
+-static SweetSurface   *sweet_scanout_owner[2];
++static SweetSurface   *sweet_scanout_owner[SWEET_SCANOUT_SLOTS];
+ static IOLock         *sweet_pool_lock;         /* sweet_scanout_owner */
+ static AppleCLCD *sweet_fb_zc;          /* 0255: the armed framebuffer, for sweet_scanout_lock */
+ static int             sweet_pool_log = -1;     /* 0259: sweetzc_log=0: no pool lines (but a leaked slot) */
+@@ -1249,6 +1260,14 @@
+ 	sweet_scanout_pa[1] = fPhys + start + slot;
+ 	sweet_scanout_w = fLogicalW;
+ 	sweet_scanout_h = fLogicalH;
++	int slots = 2;
++	PE_parse_boot_argn("sweetzc_slots", &slots, sizeof(slots));
++	if (slots >= 3 && slot <= SWEET_SLPI_SIZE) {
++		sweet_scanout_pa[2] = SWEET_SLPI_PA;    /* 0264: below 4 GiB too (SRC0_ADDR is 32 bits) */
++		sweet_scanout_n = 3;
++	}
++	IOLog("SWEET FB: %u scanout slots%s (sweetzc_slots=%d)\n", sweet_scanout_n,
++	    sweet_scanout_n == 3 ? ", the third at 0x96800000 (pil_slpi_mem)" : ": both in the splash region", slots);
+ 	sweet_scanout_size = slot;      /* last: opens the pool */
+ 	IOLog("SWEET FB: in-place scanout armed (sweetzc=%d): SSPP %s via CTL%d %s, %s %ux%u->%dx%d at %d,%d; "
+ 	    "pool 0x%llx 0x%llx (%u KB each) for %ux%u BGRA surfaces; MDP SMMU %s; %u ABL registers saved; SwapEnd %s\n",
