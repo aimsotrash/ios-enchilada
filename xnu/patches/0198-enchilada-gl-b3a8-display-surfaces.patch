@@ -1,0 +1,77 @@
+enchilada: GL display surfaces: 'b3a8' made as BGRA, cacheable surfaces kept off the GPU
+
+With the OpenGL ES renderer on, CoreAnimation makes the display's surfaces 'b3a8'
+(30RGBLE_8A_BiPlanar: 10-bit RGB in 32-bit pixels plus an 8-bit alpha plane; seen 1125x2436
+bpe 4 bpr 4544, 2 planes). eagl.c's -attachImage takes only single-plane 'BGRA' (or no format)
+with 4 bytes a pixel, so it said "not done", CA's framebuffer had a texture without storage as
+its colour attachment, every glDrawElements was GL_INVALID_FRAMEBUFFER_OPERATION (0x506), no
+target was ever drawn ("0 pictures copied out, 0 drawn in place") and the panel stayed black.
+SweetSurface now makes such a surface as one plane of BGRA with the requested size and row
+pitch, as HakiOS' kernel does (the panel is 8-bit sRGB anyway); IOSurface.framework reads
+format and planes from the kernel, so CA, the GL layer and the framebuffer all see BGRA and
+the existing BGRA attach and present paths take it. Unexpected geometry keeps 'b3a8' (the old
+behaviour). Once BGRA, the surface also passes the zero-copy checks, but SURFACE_BO of a
+cacheable surface gave the GPU memory nobody keeps coherent: the GPU does not snoop, boFlush()
+needs an arena pa (surface BOs have none) and sweet_gpu_cache_sync() is only a barrier, so the
+panel copy would read stale lines of GPU-written frames. SURFACE_BO now maps only uncached
+(write-combined) surfaces; for the rest the client copies: eagl.c renders into its own texture
+and glReadPixels it into the surface at the frame's end (0197 makes that readback cacheable).
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -880,6 +880,22 @@
+ 		s->release();
+ 		return kIOReturnSuccess;
+ 	}
++	/*
++	 * 0198: the GPU does not snoop the CPU's caches, and nothing keeps a surface BO coherent:
++	 * boFlush() needs an arena pa (surface BOs have none) and sweet_gpu_cache_sync() is a barrier.
++	 * A cacheable surface (IOBufferMemoryDescriptor or client memory) shared with the GPU would
++	 * show stale lines both ways (the panel copy reading old frames, CPU-drawn pictures not yet
++	 * in DRAM). Only uncached ones (the panel) are mapped; the client copies the rest.
++	 */
++	if (s->mapCache != kIOMapWriteCombineCache) {
++		static uint32_t told;
++		if (told++ < 4) {
++			IOLog("SWEET GPU: surface %u (%ux%u fmt 0x%x) is cacheable: no GPU mapping, the client copies\n",
++			    s->id, s->width, s->height, s->pixelFormat);
++		}
++		s->release();
++		return kIOReturnUnsupported;
++	}
+ 	if (size == 0 || size > GEM_SIZE_MAX) {
+ 		s->release();
+ 		return kIOReturnBadArgument;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -308,7 +308,29 @@
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	/*
++	 * 0198: 'b3a8' (30RGBLE_8A_BiPlanar: 10-bit RGB in 32-bit pixels, alpha in a second plane)
++	 * is what CoreAnimation makes the display's surfaces of once it renders with OpenGL ES. The
++	 * GL layer attaches only single-plane BGRA, so CA's framebuffer stayed incomplete (every
++	 * draw GL_INVALID_FRAMEBUFFER_OPERATION, black panel); the panel is 8-bit sRGB anyway. Made
++	 * as one plane of BGRA with the same size and row pitch; IOSurface.framework takes format
++	 * and planes from this layout, so every user sees BGRA. Other geometry: left as asked.
++	 */
++	bool asBGRA = false;
++	if (s->pixelFormat == 0x62336138 /* 'b3a8' */) {
++		static uint32_t told;
++		asBGRA = s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1;
++		if (told++ < 4) {
++			IOLog("SWEET SURF: 'b3a8' %ux%u bpe %u bpr %u: %s\n", s->width, s->height, s->bytesPerElement,
++			    s->bytesPerRow, asBGRA ? "made as one plane of BGRA (alpha plane dropped)" :
++			    "unexpected geometry, left as b3a8");
++		}
++		if (asBGRA) {
++			s->pixelFormat = 0x42475241;    /* 'BGRA' */
++		}
++	}
++
++	OSArray *planes = asBGRA ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;

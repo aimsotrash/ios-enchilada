@@ -1,0 +1,262 @@
+enchilada: kernel reboots and panics reset into fastboot (PON reboot reason)
+
+A kernel restart did nothing on this port: PE_halt_restart was NULL, so PEHaltRestart() returned
+-1 and halt_all_cpus() spun (osfmk/arm64/machine_routines.c), and a panic ended in
+panic_spin_forever() (debug=0xc sets panicDebugging). A reset that does happen (PSCI
+SYSTEM_RESET from the shim, a long Power press) boots Android from boot_a. The SDM845 ABL takes
+the reboot reason from the PMIC: PON SOFT_RB_SPARE (PM8998 SID 0, 0x88f), bits 7:1, 0x02 =
+bootloader (Linux qcom-pon "qcom,pm8998-pon", pm8998.dtsi mode-bootloader = <0x2>, made for
+Pixel 3 / DB845; downstream qpnp_pon_set_restart_reason()). IMEM restart_reason = 0x77665500
+alone did not work (the shim wrote it and still landed in Android); it is written too.
+SweetPlatformExpert now sets PE_halt_restart: kPERestartCPU and kPEPanicRestartCPU go to
+sweet_reboot_fastboot() in sweet_spmi.c, which holds the keys thread (it polls PON on the same
+observer channel), read-modify-writes only bits 7:1 of SOFT_RB_SPARE through the PON APID's RW
+channel (chnls 0x0c600000 + 0x10000 * APID, EXT_WRITEL as in spmi-pmic-arb.c v5; mapped at boot
+only if the arbiter says the APID belongs to EE 0 and PON_SUBTYPE reads GEN2_PRIMARY), reads it
+back, writes IMEM, logs "SWEET RB: restart -> fastboot (pon spare 0x.., imem 0x..)" and issues
+PSCI SYSTEM_RESET. If the spare register does not read back as bootloader there is no reset (an
+unmarked reset boots Android, which would reformat userdata): the old spin. panic_spin_forever()
+first keeps the panic screen pfb seconds (default 60, spin delays with interrupts off), then
+does the same. Boot logs "SWEET RB: boot with pon spare ..." (what the last reset left).
+Boot-args: rbfb=0 = reboots do nothing as before; pfb=N seconds, pfb=0 = panic screen forever.
+
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -31,6 +31,8 @@
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
++/* Set by sweet_reboot_fastboot() (sweet_spmi.c) while it uses the PON observer channel. */
++volatile int sweet_keys_hold;
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -100,6 +102,10 @@
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
++		if (sweet_keys_hold) {
++			keys_wait();
++			continue;
++		}
+ 		uint8_t pon = 0, gpio = 0, gpio2 = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,8 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
++ * PMIC READ ONLY, except sweet_reboot_fastboot() below: one masked write of
++ * PON SOFT_RB_SPARE (SID 0 0x88f, bits 7:1) on the way into a reset.
++ * No interrupt clear, peripheral enable or charger config.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -124,4 +125,155 @@
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * Reboot into fastboot instead of Android (patch 0200). The stock SDM845 ABL takes the
++ * reboot reason from the PMIC: PON SOFT_RB_SPARE (PM8998 SID 0, 0x800 + 0x8f), reason in
++ * bits 7:1, 0x02 = bootloader (Linux qcom-pon "qcom,pm8998-pon" + pm8998.dtsi
++ * mode-bootloader = <0x2>; downstream qpnp_pon_set_restart_reason(PON_RESTART_REASON_
++ * BOOTLOADER)). Downstream msm-poweroff also stores 0x77665500 in IMEM restart_reason
++ * (0x146bf65c, enchilada DT); written too, but alone it does not work: the shim's
++ * IMEM + PSCI reset landed in Android. The reset is PSCI SYSTEM_RESET, as in the shim and
++ * mainline. Reset only when the spare register reads back as bootloader: an unmarked reset
++ * boots Android from boot_a, which would reformat userdata.
++ *
++ * The write follows spmi-pmic-arb.c v5: RW channel chnls + 0x10000 * APID, WDATA0 then
++ * EXT_WRITEL (opcode 0, BC 0), allowed only when the APID's owner is EE 0 (the apps EE,
++ * DT qcom,ee = <0>), as Linux checks. Reads use the observer channel like the rest of the
++ * file; the keys thread polls PON on that same channel, so it is held first.
++ *
++ *   rbfb=0   kernel reboots do what they did before (nothing)
++ *   pfb=N    after a panic, keep the screen N s (default 60), then reset; pfb=0 = forever
++ */
++#include <pexpert/pexpert.h>
++
++#define SP_CHNLS_PA     0x0c600000u
++#define RB_PON_PPID     0x008u
++#define RB_PON_SUBTYPE  0x05u           /* 0x04 = GEN2_PRIMARY (pm8941-pwrkey.c): reason shift 1 */
++#define RB_SPARE        0x8fu           /* PON_SOFT_RB_SPARE */
++#define RB_BOOTLOADER   (0x02u << 1)
++#define RB_IMEM_PA      0x146bf000u
++#define RB_IMEM_REASON  0x65cu
++#define RB_IMEM_FB      0x77665500u
++
++extern volatile int sweet_keys_hold;
++
++static vm_offset_t rb_chan, rb_obs, rb_imem;
++static uint32_t rb_on = 1, rb_panic_s = 60;
++static int rb_panicking;
++
++/* One command on one channel, spinning (also used in panic context: no lock, no block). */
++static int
++rb_xfer(vm_offset_t chan, uint32_t cmd, uint8_t *data)
++{
++	if ((cmd >> 27) == 0) {
++		*(volatile uint32_t *)(chan + 0x10u) = *data;  /* WDATA0 */
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)chan = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(chan, 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return -1;
++			}
++			if (cmd >> 27) {
++				*data = (uint8_t)sp_rd(chan, 0x18u);
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++rb_read(unsigned reg, uint8_t *out)
++{
++	return rb_xfer(rb_obs, (1u << 27) | (reg << 4), out);          /* EXT_READL */
++}
++
++/* Thread context, after sweet_spmi_init(). */
++void
++sweet_reboot_init(void)
++{
++	uint8_t subtype = 0, spare = 0;
++	uint32_t imem = 0;
++	unsigned apid = SP_NO_APID, owner = 7;
++
++	(void)PE_parse_boot_argn("rbfb", &rb_on, sizeof(rb_on));
++	(void)PE_parse_boot_argn("pfb", &rb_panic_s, sizeof(rb_panic_s));
++	rb_imem = ml_io_map(RB_IMEM_PA, 0x1000);
++	if (rb_imem) {
++		imem = *(volatile uint32_t *)(rb_imem + RB_IMEM_REASON);
++	}
++	if (sp_ready) {
++		apid = sp_find_apid(RB_PON_PPID);
++	}
++	if (apid != SP_NO_APID) {
++		owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++		rb_obs = sp_obs + 0x80u * apid;
++		sweet_keys_hold = 1;
++		delay(50 * 1000);
++		if (rb_read(RB_PON_SUBTYPE, &subtype) != 0 || rb_read(RB_SPARE, &spare) != 0) {
++			subtype = 0;
++		}
++		sweet_keys_hold = 0;
++		if (owner == 0 && subtype == 0x04) {
++			rb_chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		}
++	}
++	printf("SWEET RB: boot with pon spare %#x (reason %u, 2 = fastboot), imem %#x; pon apid %u owner %u "
++	    "subtype %#x; reboot -> %s, panic -> %s after %u s\n", spare, (unsigned)(spare >> 1), imem, apid, owner, subtype,
++	    rb_chan && rb_on ? "fastboot" : "nothing", rb_chan && rb_panic_s ? "fastboot" : "nothing", rb_panic_s);
++}
++
++/* Returns only when no reset was made (the caller keeps its old behaviour). */
++int
++sweet_reboot_fastboot(int panic)
++{
++	uint8_t spare = 0, back = 0;
++	uint32_t imem = 0;
++
++	if (panic) {
++		if (__atomic_exchange_n(&rb_panicking, 1, __ATOMIC_SEQ_CST) || rb_chan == 0 || rb_panic_s == 0) {
++			return -1;
++		}
++		(void)ml_set_interrupts_enabled(FALSE);        /* delay() then spins, never blocks */
++		printf("SWEET RB: panic -> fastboot in %u s (boot-arg pfb=0 keeps this screen)\n", rb_panic_s);
++		for (uint32_t s = 0; s < rb_panic_s; s++) {
++			delay(1000 * 1000);
++		}
++	} else if (rb_panicking || rb_chan == 0 || rb_on == 0) {
++		return -1;
++	}
++	sweet_keys_hold = 1;
++	delay(50 * 1000);
++	if (rb_read(RB_SPARE, &spare) != 0) {
++		printf("SWEET RB: cannot read pon spare, no reset\n");
++		sweet_keys_hold = 0;
++		return -1;
++	}
++	uint8_t want = (uint8_t)((spare & 1u) | RB_BOOTLOADER);
++	if (rb_xfer(rb_chan, RB_SPARE << 4, &want) != 0 || rb_read(RB_SPARE, &back) != 0 ||
++	    (back & 0xfeu) != RB_BOOTLOADER) {
++		printf("SWEET RB: pon spare %#x -> %#x failed (reads %#x), no reset\n", spare, want, back);
++		sweet_keys_hold = 0;
++		return -1;
++	}
++	if (rb_imem) {
++		*(volatile uint32_t *)(rb_imem + RB_IMEM_REASON) = RB_IMEM_FB;
++		__asm__ volatile("dsb sy" ::: "memory");
++		imem = *(volatile uint32_t *)(rb_imem + RB_IMEM_REASON);
++	}
++	printf("SWEET RB: restart -> fastboot (pon spare %#x, imem %#x)\n", back, imem);
++	delay(100 * 1000);
++
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;       /* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	printf("SWEET RB: PSCI SYSTEM_RESET returned %d\n", (int)x0);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,21 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void sweet_reboot_init(void);
++extern "C" int sweet_reboot_fastboot(int panic);
++
++/*
++ * Kernel restarts (reboot, launchctl reboot, PEHaltRestart) and panic restarts go to fastboot
++ * (bsd/dev/sweet_spmi.c). Other types return -1, as with no PE_halt_restart at all.
++ */
++static int
++sweet_halt_restart(unsigned int type)
++{
++	if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
++		return sweet_reboot_fastboot(type == kPEPanicRestartCPU);
++	}
++	return -1;
++}
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -223,6 +238,8 @@
+ 		publishResource("IORTC", this);
+ 	}
+ 	sweet_cpu_clocks();
++	sweet_reboot_init();
++	PE_halt_restart = sweet_halt_restart;
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1169,6 +1169,13 @@
+ void
+ panic_spin_forever(void)
+ {
++#if defined(SWEET)
++	/* Keep the panic screen pfb seconds (default 60), then reset into fastboot. */
++	{
++		extern int sweet_reboot_fastboot(int panic);
++		(void)sweet_reboot_fastboot(1);
++	}
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
