@@ -1,0 +1,273 @@
+enchilada: GPU: v1 DCVS perf and bandwidth tables, then raise the GPU level (gpulvl=)
+
+The GPU ran at its boot level: gpu_gx_rail_on() votes the 257 MHz ARC indices (VLVL 64) and HFI
+start sent only INIT, FW_VER and TEST, so the GMU never had a perf table and nothing asked for
+more (four full-screen 1125x2436 draws took ~67 ms of GPU time, gl-run-23). Now the v1 start
+does what Linux a6xx_hfi_start_v1 does between FW_VERSION and TEST (after TEST the GMU takes no
+more HFI messages): H2F_MSG_PERF_TABLE (id 4, a6xx_hfi_msg_perf_table_v1, 43 dwords: 8 GPU
+levels = Linux's gmu->gpu_freqs for sdm845, 0/257/342/414/520/596/675/710 MHz in kHz, each with
+the ARC vote a6xx_gmu_rpmh_arc_votes_init builds from cmd-db gfx.lvl (primary, first index at or
+above the OPP's opp-level) and mx.lvl (secondary, first at or above it, else the highest
+non-zero); 3 GMU levels 0/200/400 MHz from cx.lvl/mx.lvl at MIN_SVS/SVS) and H2F_MSG_BW_TABLE
+(id 3, 160 dwords, a6xx_build_bw_table verbatim: one "off" DDR level and the fixed CNOC votes,
+the a630 GMU does no bus scaling). Once GX is up and the core answers, before the CP's hw_init
+(where Linux's a6xx_gmu_set_initial_freq runs), the legacy a6xx_gmu_set_freq sequence asks for
+the level: GMU_DCVS_ACK_OPTION (0x23fc) = 0, GMU_DCVS_PERF_SETTING (0x23fd) = 3 << 28 | index,
+GMU_DCVS_BW_SETTING (0x23fe) = 0xff, OOB DCVS_SET (set bit 23, ack bit 31, clear bit 31), then
+GMU_DCVS_RETURN (0x23ff) must read 0. On this phone's cmd-db (gfx 0 16 48 64 128 192 256 320
+384 416, mx 0 16 16 256 384) the votes are 0x400303 (257 MHz, the indices the boot already uses)
+... 0x1800408 (675) and 0x1a00409 (710, mx at its top 384 as Linux does). Boot-arg gpulvl=N: the
+default is the highest level whose VLVL gfx.lvl and mx.lvl both hold exactly (6, 675 MHz here);
+gpulvl=7 is Linux's 710 MHz; 0 sends the tables but keeps the boot level; 1 sends neither (the
+behaviour before this patch); anything else is 1. Any missing table, unacknowledged message or
+level outside gfx.lvl leaves the boot level alone. One line per boot:
+"SWEET GPU: DCVS level N (X MHz, bw idx 255): acked|failed".
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -241,6 +241,8 @@
+ #define HFI_H2F_INIT          0u
+ #define HFI_H2F_FW_VER        1u
+ #define HFI_H2F_TEST          5u
++#define HFI_H2F_BW_TBL        3u
++#define HFI_H2F_PERF_TBL      4u
+ #define GPU_GMU_HFI_CTRL_INIT 0x14618u   /* 0x5186 */
+ #define GPU_GMU_GMU2HOST_CLR  0x14644u   /* 0x5191 */
+ #define GPU_GMU_GMU2HOST_INFO 0x14648u   /* 0x5192 */
+@@ -895,6 +897,11 @@
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+ #define GPU_GMU_MX_VOTE_IDX   0x8fe8u   /* 0x23fa */
+ #define GPU_OOB_BOOT_SLUMBER  6u        /* set bit 22, ack bit 30 */
++#define GPU_GMU_DCVS_ACK_OPTION 0x8ff0u /* 0x23fc */
++#define GPU_GMU_DCVS_PERF     0x8ff4u   /* 0x23fd */
++#define GPU_GMU_DCVS_BW       0x8ff8u   /* 0x23fe */
++#define GPU_GMU_DCVS_RETURN   0x8ffcu   /* 0x23ff */
++#define GPU_OOB_DCVS_SET      7u        /* set bit 23, ack and clear bit 31 */
+ #define GPU_RSCC(off)         (0x23000u + 4u * (off))
+ #define GPU_PDCR(off)         (4u * (off))
+ 
+@@ -2889,15 +2896,22 @@
+ 
+ /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
+ 
++/*
++ * Linux's gmu->gpu_freqs for sdm845 (index 0 is "off") with the opp-level (RPMh
++ * VLVL) of each sdm845.dtsi GPU OPP; the GMU's own OPPs are 200 MHz MIN_SVS and
++ * 400 MHz SVS. The index is the DCVS perf index.
++ */
++static const struct { uint32_t mhz, vlvl; } gpu_levels[8] = {
++	{ 0, 0 }, { 257, 64 }, { 342, 128 }, { 414, 192 },
++	{ 520, 256 }, { 596, 320 }, { 675, 384 }, { 710, 416 },
++};
++static const struct { uint32_t mhz, vlvl; } gpu_gmu_levels[3] = { { 0, 0 }, { 200, 48 }, { 400, 128 } };
++static int gpu_dcvs_level = -1;   /* perf index the tables were sent for; -1 none, 0 tables only */
++
+ /* a6xx_gmu_gfx_rail_on: vote the boot level's ARC indices, then the boot OOB. */
+ static bool
+ gpu_gx_rail_on(vm_offset_t gmu)
+ {
+-	/* gpu_levels[] for a630: MHz and the VLVL Linux sends for each. */
+-	static const struct { uint32_t mhz, vlvl; } levels[] = {
+-		{ 0, 0 }, { 257, 64 }, { 342, 128 }, { 414, 192 },
+-		{ 520, 256 }, { 596, 320 }, { 675, 384 }, { 710, 416 },
+-	};
+ 	uint16_t gfx[16], mx[16], cx[16];
+ 	uint32_t a = 0;
+ 	unsigned ngfx = 0, nmx = 0, ncx = 0;
+@@ -2937,7 +2951,6 @@
+ 		return false;
+ 	}
+ 	printf("SWEET GPU: GX rail at 257 MHz (VLVL %u): gfx ARC %u, mx ARC %u\n", boot_vlvl, gi, mi);
+-	(void)levels;
+ 
+ 	gpu_probe_wr("gmu boot slumber opt", gmu, GPU_GMU_BOOT_SLUMBER, 0);
+ 	gpu_probe_wr("gmu gx vote idx", gmu, GPU_GMU_GX_VOTE_IDX, gi);
+@@ -3041,6 +3054,170 @@
+ 	return (int)(ack_hdr & 0xffu);
+ }
+ 
++/* ---- DCVS (0240): the v1 perf and bandwidth tables, then a GPU level --- */
++
++/*
++ * a6xx_gmu_rpmh_arc_votes_init: the first primary index at or above the VLVL;
++ * the first mx index at or above it, else the highest non-zero one (then
++ * *sec_ok is false). Unused table entries read as 0.
++ */
++static bool
++gpu_arc_vote(const uint16_t *pri, const uint16_t *sec, uint32_t vlvl, uint32_t *vote, bool *sec_ok)
++{
++	unsigned p = 0, s = 0, j;
++
++	while (p < 16 && pri[p] < vlvl) {
++		p++;
++	}
++	if (p == 16) {
++		return false;
++	}
++	for (j = 0; j < 16; j++) {
++		if (sec[j] >= vlvl) {
++			s = j;
++			break;
++		}
++		if (sec[j]) {
++			s = j;
++		}
++	}
++	*sec_ok = j < 16;
++	*vote = ((uint32_t)pri[p] << 16) | (s << 8) | p;
++	return true;
++}
++
++/*
++ * a6xx_hfi_start_v1 sends PERF_TABLE and BW_TABLE between FW_VERSION and TEST
++ * (after TEST the GMU takes no more HFI messages). gpulvl=N picks the perf
++ * index raised to later: 2..7, 0 = tables only, 1 = neither tables nor DCVS
++ * (the boot level, as before 0240). Default: the highest level whose VLVL both
++ * gfx.lvl and mx.lvl hold exactly.
++ */
++static void
++gpu_dcvs_tables(void)
++{
++	uint16_t gfx[16], mx[16], cx[16];
++	uint32_t a = 0, gx_votes[8], cx_votes[3], m[160];
++	int want = -1, top = -1;
++	bool sec_ok = false;
++
++	(void)PE_parse_boot_argn("gpulvl", &want, sizeof(want));
++	if (want == 1 || want < -1 || want > 7) {
++		printf("SWEET GPU: DCVS off (gpulvl=%d): no perf/bw table, boot level only\n", want);
++		return;
++	}
++	if (gpu_cmddb_lookup("gfx.lvl", &a, gfx, 16) != (int)GPU_CMDDB_SLAVE_ARC ||
++	    gpu_cmddb_lookup("mx.lvl", &a, mx, 16) != (int)GPU_CMDDB_SLAVE_ARC ||
++	    gpu_cmddb_lookup("cx.lvl", &a, cx, 16) != (int)GPU_CMDDB_SLAVE_ARC) {
++		printf("SWEET GPU: DCVS off: gfx/mx/cx.lvl not all in the command DB\n");
++		return;
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		if (!gpu_arc_vote(gfx, mx, gpu_levels[i].vlvl, &gx_votes[i], &sec_ok)) {
++			printf("SWEET GPU: DCVS off: VLVL %u (%u MHz) above gfx.lvl\n",
++			    gpu_levels[i].vlvl, gpu_levels[i].mhz);
++			return;
++		}
++		if (i >= 2 && sec_ok && (gx_votes[i] >> 16) == gpu_levels[i].vlvl) {
++			top = (int)i;
++		}
++		printf("SWEET GPU: DCVS table %u: %u MHz VLVL %u vote %#x (gfx %u, mx %u%s)\n", i,
++		    gpu_levels[i].mhz, gpu_levels[i].vlvl, gx_votes[i], gx_votes[i] & 0xffu,
++		    (gx_votes[i] >> 8) & 0xffu, sec_ok ? "" : ", highest mx");
++	}
++	for (unsigned i = 0; i < 3; i++) {
++		if (!gpu_arc_vote(cx, mx, gpu_gmu_levels[i].vlvl, &cx_votes[i], &sec_ok)) {
++			printf("SWEET GPU: DCVS off: GMU VLVL %u above cx.lvl\n", gpu_gmu_levels[i].vlvl);
++			return;
++		}
++	}
++	if (want < 0 && top < 0) {
++		printf("SWEET GPU: DCVS off: no level above 257 MHz has exact gfx and mx corners\n");
++		return;
++	}
++
++	bzero(m, sizeof(m));
++	m[0] = HFI_QMARK_HDR(HFI_H2F_PERF_TBL, 43, 0);   /* a6xx_hfi_msg_perf_table_v1 */
++	m[1] = 8;
++	m[2] = 3;
++	for (unsigned i = 0; i < 8; i++) {
++		m[3 + 2 * i] = gx_votes[i];
++		m[4 + 2 * i] = gpu_levels[i].mhz * 1000u;    /* kHz */
++	}
++	for (unsigned i = 0; i < 3; i++) {
++		m[35 + 2 * i] = cx_votes[i];                 /* cx_votes[] after 16 gx levels */
++		m[36 + 2 * i] = gpu_gmu_levels[i].mhz * 1000u;
++	}
++	if (gpu_hfi_send(m, 43, "perf table") != (int)HFI_H2F_PERF_TBL) {
++		printf("SWEET GPU: DCVS off: perf table not acknowledged\n");
++		return;
++	}
++	/* a6xx_build_bw_table (a630): one "off" DDR level, the fixed CNOC votes; the
++	 * a630 GMU does no bus scaling. */
++	bzero(m, sizeof(m));
++	m[0] = HFI_QMARK_HDR(HFI_H2F_BW_TBL, 160, 0);
++	m[1] = 1;                       /* bw_level_num */
++	m[2] = 3;                       /* cnoc_cmds_num */
++	m[3] = 3;                       /* ddr_cmds_num */
++	m[4] = 0x05;                    /* cnoc_wait_bitmask */
++	m[5] = 0x07;                    /* ddr_wait_bitmask */
++	m[6] = 0x50034;                 /* cnoc_cmds_addrs[6] at 6 */
++	m[7] = 0x5007c;
++	m[8] = 0x5004c;
++	m[12] = 0x40000000;             /* cnoc_cmds_data[0][6] at 12 */
++	m[14] = 0x40000000;
++	m[18] = 0x60000001;             /* cnoc_cmds_data[1][6] at 18 */
++	m[19] = 0x20000001;
++	m[20] = 0x60000001;
++	m[24] = 0x50000;                /* ddr_cmds_addrs[8] at 24 */
++	m[25] = 0x5005c;
++	m[26] = 0x5000c;
++	m[32] = 0x40000000;             /* ddr_cmds_data[0][8] at 32 */
++	m[33] = 0x40000000;
++	m[34] = 0x40000000;
++	if (gpu_hfi_send(m, 160, "bw table") != (int)HFI_H2F_BW_TBL) {
++		printf("SWEET GPU: DCVS off: bw table not acknowledged\n");
++		return;
++	}
++	gpu_dcvs_level = want < 0 ? top : want;
++	printf("SWEET GPU: DCVS tables acknowledged; level %d to follow (%s)\n", gpu_dcvs_level,
++	    want < 0 ? "default" : "gpulvl");
++}
++
++/* a6xx_gmu_set_freq, legacy path: perf index, BW index 0xff (firmware's pick), OOB DCVS_SET. */
++static void
++gpu_dcvs_set(vm_offset_t gmu)
++{
++	unsigned n = (unsigned)gpu_dcvs_level;
++	uint32_t ack = 1u << (GPU_OOB_DCVS_SET + 24), info = 0;
++	bool ok = false;
++
++	if (gpu_dcvs_level < 2) {
++		if (gpu_dcvs_level == 0) {
++			printf("SWEET GPU: DCVS tables only (gpulvl=0): level left at the boot level\n");
++		}
++		return;
++	}
++	gpu_wr_quiet(gmu, GPU_GMU_DCVS_ACK_OPTION, 0);
++	gpu_wr_quiet(gmu, GPU_GMU_DCVS_PERF, (3u << 28) | n);
++	gpu_wr_quiet(gmu, GPU_GMU_DCVS_BW, 0xffu);
++	gpu_wr_quiet(gmu, GPU_GMU_HOST2GMU_SET, 1u << (GPU_OOB_DCVS_SET + 16));
++	for (int i = 0; i < 100; i++) {
++		info = gpu_rd_quiet(gmu, GPU_GMU_GMU2HOST_INFO);
++		if (info & ack) {
++			ok = true;
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	gpu_wr_quiet(gmu, GPU_GMU_GMU2HOST_CLR, ack);
++	gpu_wr_quiet(gmu, GPU_GMU_HOST2GMU_SET, ack);     /* a6xx_gmu_clear_oob, legacy bit */
++	uint32_t ret = gpu_rd_quiet(gmu, GPU_GMU_DCVS_RETURN);
++	printf("SWEET GPU: DCVS level %u (%u MHz, bw idx %u): %s (oob %s, DCVS_RETURN %#x, INTR_INFO %#x)\n",
++	    n, gpu_levels[n].mhz, 0xffu, ok && ret == 0 ? "acked" : "failed",
++	    ok ? "acked" : "TIMED OUT", ret, info);
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -3762,6 +3939,9 @@
+ 			int id = gpu_hfi_send(fwver, 2, "fw version");
+ 			printf("SWEET GPU: hfi firmware version exchange %s (firmware %u.%u)\n",
+ 			    id == 1 ? "ok" : "failed", 0x10070000u >> 24, (0x10070000u >> 16) & 0xffu);
++			if (id == 1) {
++				gpu_dcvs_tables();
++			}
+ 		}
+ 		/* H2F_MSG_TEST: two dwords, the numbers the GMU echoes back. */
+ 		{
+@@ -3830,6 +4010,7 @@
+ 					uint32_t c1 = gpu_rd_quiet(gmu, GPU_GMU_AO_COUNTER_L);
+ 					printf("SWEET GPU: GPU ANSWERS: rbbm_status %#x, cp_status1 %#x, GMU counter %#x -> %#x (%s)\n",
+ 					    rbbm, cp1, c0, c1, c0 != c1 ? "ticking" : "still");
++					gpu_dcvs_set(gmu);
+ 
+ 					/* ---- stage 7a: the CP's hardware initialisation ---- */
+ 					printf("SWEET GPU: --- stage 7a: cp hw_init\n");

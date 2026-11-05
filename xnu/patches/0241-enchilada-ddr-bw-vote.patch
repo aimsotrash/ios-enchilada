@@ -1,0 +1,344 @@
+enchilada: RPMh: apps-side DDR bandwidth vote at boot (ddrbw=)
+
+DDR looked slow to everyone: the kernel's panel copy (presentFit, 1125x2436 -> 1052x2280 BGRA)
+moves ~11 MB in and ~9.6 MB out in ~9.5 ms, about 2 GB/s, and nothing in this kernel votes DDR,
+so the BCMs keep whatever ABL/XBL left. Before the touch thread starts (the only other user of
+the apps RSC) the kernel now sends, through the hardware-verified ACTIVE TCS path of
+sweet_rpmh.c (apps RSC DRV2 0x179e0000, TCS 0x179e0d00), the vote Linux's sdm845 interconnect
+driver sends for a 7216000 kBps peak, the opp-peak-kBps of the 675/710 MHz GPU OPPs and of the
+top CPU OPPs, the most sdm845.dtsi asks for. CPU path acm_l3 -> qns_gnoc_memnoc -> qnm_apps
+(SH5) -> qns_llcc (SH0) -> llcc_mc -> ebi (MC0, ACV); the GPU path qxm_gpu -> qns_llcc -> ebi
+adds no BCM. Each BCM is looked up in cmd-db (slave 5, exactly one match, an 8-byte bcm_db aux
+record) and voted as bcm_aggregate does with avg 0: vote_y = peak * width / node buswidth (32,
+16, 4) * 1000 / unit, width and unit from cmd-db, clamped to 0x3fff; ACV sends its enable mask
+BIT(3). Commands are BCM_TCS_CMD(commit, valid=1, x=0, y), sorted by the VCD from cmd-db, with
+commit, CMD_WAIT_FOR_CMPL and a response requested only on the last BCM of each VCD
+(tcs_list_gen, rpmh-rsc __tcs_buffer_write); every command must report ISSUED and those with a
+response COMPLETE (tcs_tx_done) or the TCS is quarantined as before. rh_send() and rh_lookup()
+take the command list and slave type for this; the ldoa28/ldoc11 path writes the same registers
+and logs the same lines. The vote only goes out with rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00
+(SDM845); a missing BCM, a zero unit or width, or a busy TCS sends nothing. ddrbw=0 skips it.
+
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -13,6 +13,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_ddr_vote(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u     /* sweet (SM7150) default */
+@@ -67,12 +68,16 @@
+ #define RH_TRIGGER      (1u << 24)
+ #define RH_ISSUED       (1u << 8)
+ #define RH_COMPLETE     (1u << 16)
+-#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
++#define RH_RESP_REQ     (1u << 8)
++#define RH_WRITE        (8u | (1u << 16))
++#define RH_WRITE_ACK    (RH_WRITE | RH_RESP_REQ)
++#define RH_MAX_CMDS     4u
+ #define RH_DB_MAGIC     0x0c0330dbu
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -188,8 +193,9 @@
+ 	return 0;
+ }
+ 
++/* One cmd-db entry of the given slave type (VRM or BCM); optionally its aux data. */
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned want, uint32_t *address, uint32_t *aux_off, uint32_t *aux_len)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -216,12 +222,16 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != want || (addr >> 16) != want || (addr & (want == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid slave-%u entry for %s\n", want, res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
++			if (aux_off) {
++				*aux_off = aux + rh_db16(e + 22);
++				*aux_len = rh_db16(e + 20);
++			}
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+@@ -248,10 +258,18 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/*
++ * One ACTIVE (AMC) request of n commands. A command with RH_RESP_REQ in its
++ * msgid must report COMPLETE, every command ISSUED (rpmh-rsc tcs_tx_done).
++ */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(unsigned n, const uint32_t *addr, const uint32_t *data, const uint32_t *msgid,
++    uint32_t wait, const char *what)
+ {
+ 	int chosen = -1;
++	if (n == 0 || n > RH_MAX_CMDS || n > rh_ncpt) {
++		return EINVAL;
++	}
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+@@ -262,10 +280,15 @@
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
++			if (!(enabled & (1u << c))) {
++				continue;
++			}
++			uint32_t busy = rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u;
++			for (unsigned k = 0; k < n; ++k) {
++				if (busy == (addr[k] & ~15u)) {
++					printf("SWEET RPMH: conflicting inherited request %#x in TCS%u\n", busy, t);
++					return EBUSY;
++				}
+ 			}
+ 		}
+ 		if (chosen < 0 && rh_free(t)) {
+@@ -296,33 +319,30 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %s irq-enable=%#x\n", t, what, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
++		if (!rh_sync(cmd + RH_MSGID, msgid[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addr[c]) ||
++		    !rh_sync(cmd + RH_DATA, data[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, wait) || !rh_sync(b + RH_ENABLE, (1u << n) - 1u) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[RH_MAX_CMDS] = {0, 0, 0, 0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
++			uint32_t want = RH_ISSUED | ((msgid[c] & RH_RESP_REQ) ? RH_COMPLETE : 0);
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+-			complete &= status[c] != 0xffffffffu &&
+-			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++			complete &= status[c] != 0xffffffffu && (status[c] & want) == want;
+ 		}
+ 		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+ 		progress |= idle == 0 || !complete;
+@@ -333,8 +353,12 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x", t, done, irq,
++	    idle, rh_read(rh_tcs, b + RH_CONTROL), status[0]);
++	for (unsigned c = 1; c < n; ++c) {
++		printf("/%#x", status[c]);
++	}
++	printf("\n");
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+@@ -350,7 +374,6 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
+@@ -378,10 +401,19 @@
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address, NULL, NULL);
++	}
++	if (!error) {
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t addr[3] = {address, address + 8, address + 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		const uint32_t msgid[3] = {RH_WRITE_ACK, RH_WRITE_ACK, RH_WRITE_ACK};
++		char what[40];
++		snprintf(what, sizeof(what), "%u mV mode=7 enable=1", mv);
++		error = rh_send(3, addr, values, msgid, 7, what);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	}
+ out:
+ 	if (error) {
+@@ -390,4 +422,116 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* bcm-voter.c bcm_div: round a non-zero vote below one unit up to 1. */
++static uint64_t
++rh_bcm_div(uint64_t num, uint64_t base)
++{
++	return (num && num < base) ? 1 : num / base;
++}
++
++/*
++ * 0241: the apps DRV's DDR bandwidth vote, as Linux's sdm845 interconnect
++ * driver sends it for a 7216000 kBps peak (opp-peak-kBps of the 675/710 MHz GPU
++ * OPPs and the top CPU OPPs, the largest sdm845.dtsi asks for). CPU path
++ * acm_l3 -> qns_gnoc_memnoc -> qnm_apps (SH5) -> qns_llcc (SH0) -> llcc_mc ->
++ * ebi (MC0, ACV); the GPU path qxm_gpu -> qns_llcc -> ebi adds no BCM. Per BCM
++ * (bcm_aggregate, peak only, avg 0 as the OPP votes): vote_y = peak * width /
++ * node buswidth * 1000 / unit, width and unit from cmd-db, clamped to 0x3fff;
++ * ACV sends its enable mask BIT(3). Commands go in VCD order with commit, wait
++ * and a response on the last BCM of each VCD (tcs_list_gen), in one ACTIVE TCS.
++ * SDM845 only (rpmhrsc=0x179e0000); ddrbw=0 skips it. Only raises: the BCM
++ * takes the highest vote of all DRVs.
++ */
++int
++sweet_rpmh_ddr_vote(void)
++{
++	static const struct { const char *name; uint32_t buswidth; } bcm[RH_MAX_CMDS] = {
++		{ "SH5", 32 }, { "SH0", 16 }, { "MC0", 4 }, { "ACV", 0 },   /* 0: enable mask */
++	};
++	const uint64_t peak_kbps = 7216000;
++	uint32_t a[RH_MAX_CMDS], v[RH_MAX_CMDS], vcd[RH_MAX_CMDS];
++	uint32_t addr[RH_MAX_CMDS], data[RH_MAX_CMDS], msgid[RH_MAX_CMDS], wait = 0;
++	unsigned order[RH_MAX_CMDS];
++	int on = 1, error = EIO;
++
++	(void)PE_parse_boot_argn("ddrbw", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET RPMH: DDR vote off (ddrbw=0)\n");
++		return 0;
++	}
++	rh_bases();
++	if (rh_rsc_pa != 0x179e0000u || rh_tcs_pa != 0x179e0d00u) {
++		printf("SWEET RPMH: DDR vote is SDM845-only (rsc %#x tcs %#x); not sent\n", rh_rsc_pa, rh_tcs_pa);
++		return ENODEV;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned i = 0; !error && i < RH_MAX_CMDS; ++i) {
++		uint32_t off = 0, len = 0;
++		uint8_t b[8];
++		error = rh_lookup(bcm[i].name, RH_BCM, &a[i], &off, &len);
++		if (error) {
++			break;
++		}
++		if (len < 8) {
++			printf("SWEET RPMH: %s aux data %u bytes; refusing\n", bcm[i].name, len);
++			error = EINVAL;
++			break;
++		}
++		for (unsigned k = 0; k < 8; ++k) {
++			b[k] = (uint8_t)(rh_read(rh_db, (off + k) & ~3u) >> (8u * ((off + k) & 3u)));
++		}
++		uint32_t unit = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++		uint32_t width = b[4] | (uint32_t)b[5] << 8;
++		uint64_t y = 8;   /* ACV: BIT(3) */
++		vcd[i] = b[6];
++		if (bcm[i].buswidth) {
++			if (!unit || !width) {
++				printf("SWEET RPMH: %s unit %u width %u; refusing\n", bcm[i].name, unit, width);
++				error = EINVAL;
++				break;
++			}
++			y = rh_bcm_div(rh_bcm_div(peak_kbps * width, bcm[i].buswidth) * 1000, unit);
++		}
++		v[i] = y > 0x3fff ? 0x3fff : (uint32_t)y;
++		printf("SWEET RPMH: DDR BCM %s addr %#x unit %u width %u vcd %u: vote_y %llu%s\n",
++		    bcm[i].name, a[i], unit, width, vcd[i], (unsigned long long)y,
++		    y > 0x3fff ? " (clamped to 0x3fff)" : "");
++	}
++	if (error) {
++		printf("SWEET RPMH: DDR vote not sent\n");
++		goto out;
++	}
++	/* list_sort(cmp_vcd): stable by VCD. */
++	for (unsigned i = 0; i < RH_MAX_CMDS; ++i) {
++		unsigned j = i;
++		for (; j > 0 && vcd[order[j - 1]] > vcd[i]; --j) {
++			order[j] = order[j - 1];
++		}
++		order[j] = i;
++	}
++	for (unsigned c = 0; c < RH_MAX_CMDS; ++c) {
++		unsigned i = order[c];
++		bool commit = c + 1 == RH_MAX_CMDS || vcd[order[c + 1]] != vcd[i];
++		addr[c] = a[i];
++		data[c] = (commit ? 1u << 30 : 0) | (1u << 29) | v[i];   /* BCM_TCS_CMD(commit, valid, 0, y) */
++		msgid[c] = commit ? RH_WRITE_ACK : RH_WRITE;
++		wait |= commit ? 1u << c : 0;
++		printf("SWEET RPMH: DDR vote cmd%u %s addr %#x data %#x%s\n", c, bcm[i].name, addr[c],
++		    data[c], commit ? " (commit)" : "");
++	}
++	error = rh_send(RH_MAX_CMDS, addr, data, msgid, wait, "DDR BCMs, 7216000 kBps peak");
++	printf("SWEET RPMH: DDR bandwidth vote %s (errno %d)\n",
++	    error ? "FAILED" : "complete, commits acknowledged", error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern int sweet_rpmh_ddr_vote(void);
+ extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_mss_probe(void);
+@@ -658,6 +659,8 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	/* 0241: before touch's thread, the other apps-RSC user (ddrbw=0 skips it). */
++	(void)sweet_rpmh_ddr_vote();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
