@@ -1,0 +1,48 @@
+enchilada: one lock for the shared GCC QUP vote register (touch, battery gauge, Bluetooth)
+
+0276's Bluetooth bring-up did its own read-modify-write of GCC 0x5200c, unlocked, while touch and the
+0277 gauge use sweet_touch.c's sweet_gcc_lock: a lost update could drop another SE's clock vote. sweet_touch.c exports sweet_gcc_vote(); sweet_btq.c calls it.
+
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -179,6 +179,15 @@
+ 	lck_mtx_unlock(&sweet_gcc_lock);
+ }
+ 
++/* 0278: the same locked read-modify-write of the shared GCC QUP vote register for other drivers (sweet_btq.c). */
++void sweet_gcc_vote(vm_offset_t gcc, uint32_t mask);
++
++void
++sweet_gcc_vote(vm_offset_t gcc, uint32_t mask)
++{
++	gcc_vote(gcc, mask);
++}
++
+ static bool
+ touch_clocks(void)
+ {
+--- a/bsd/dev/sweet_btq.c
++++ b/bsd/dev/sweet_btq.c
+@@ -61,6 +61,7 @@
+ #define GCC_PA          0x00100000u
+ #define GCC_VOTE        0x5200cu        /* gcc-sdm845.c enable_reg of the three branches */
+ #define GCC_VOTE_BITS   ((1u << 6) | (1u << 7) | (1u << 16))    /* wrap_0 m_ahb, s_ahb, wrap0_s6 */
++extern void sweet_gcc_vote(vm_offset_t gcc, uint32_t mask);      /* sweet_touch.c (0278) */
+ #define GCC_M_AHB_CBCR  0x17004u
+ #define GCC_S_AHB_CBCR  0x17008u
+ #define GCC_S6_CBCR     0x17750u
+@@ -823,12 +824,8 @@
+ 	for (unsigned pin = 45; pin <= 48; pin++) {
+ 		bq_pin_log(pin);
+ 	}
+-	/*
+-	 * ponytail: read-modify-write of the shared vote register without touch's lock (0277 keeps
+-	 * sweet_gcc_lock static in sweet_touch.c); one write per boot, 10 s after touch's. Exporting
+-	 * its gcc_vote() and calling it here closes the window.
+-	 */
+-	bq_wr(bq.gcc, GCC_VOTE, bq_rd(bq.gcc, GCC_VOTE) | GCC_VOTE_BITS);
++	/* 0278: under sweet_touch.c's lock, shared with touch and the battery gauge (same GCC mapping base). */
++	sweet_gcc_vote(bq.gcc, GCC_VOTE_BITS);
+ 	if (!bq_poll(bq.gcc, GCC_M_AHB_CBCR, CBCR_OFF, 0, 1000) || !bq_poll(bq.gcc, GCC_S_AHB_CBCR, CBCR_OFF, 0, 1000) ||
+ 	    !bq_poll(bq.gcc, GCC_S6_CBCR, CBCR_OFF, 0, 1000)) {
+ 		return BQ_STOP("a branch stays halted: cbcr m_ahb %#x s_ahb %#x s6 %#x (vote %#x)",
