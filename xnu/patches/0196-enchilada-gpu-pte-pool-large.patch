@@ -1,0 +1,219 @@
+enchilada: GPU: a page-table pool for the whole client range, and the range ends at L1[2] (K5)
+
+The PTE pool was fixed at 64 L3 tables (GPU_PTE_TABLES, 2 MiB of GPU VA each, 128 MiB) and
+mapped with ml_io_map(), while the iova allocator hands out the whole range up to 0xc001ffff: the
+first BO past 0x88000000 found no table (the 0195 panic). gpu_bo_init() now takes as many tables
+as the sweetfw3 blob holds, up to 511 (L2[1..511]; L2[0] has the payload's own L3), i.e. every
+2 MiB chunk of the range. More than 64 tables do not go through ml_io_map(): io_submap is 8 MiB
+for every device mapping and kmem_alloc() panics when it is full (0194's analysis). The pool lies
+right behind the arena, below topOfKernelData, so it gets the static aperture alias exactly like
+the arena (the page checks of 0194 move into gpu_aperture_check() and are shared), only when the
+arena's own aperture passed (so sweetarena=0 also keeps 64 ml_io_map tables). That alias is
+cacheable and the SMMU walks the tables uncached (TCR IRGN0/ORGN0 = 0), so every store into a
+pool table - zeroing a new table, a PTE in vm_map and vm_unmap - is cleaned to memory by
+physical address before the barrier and the TLB invalidate. A 64-table blob, or no aperture,
+gives exactly the old pool. The per-table L2-index list (a linear scan per PTE) becomes a
+512-entry L2-index -> table map. GPU_VA_BYTES now ends the range at 0xc0000000: an iova in
+0xc0000000..0xc001ffff is L1[3], but gpu_l3_for() only looks at the L2 index, so it would have
+rewritten the PTE of 0x80000000 + the same offset; MSM_PARAM_VA_SIZE says 0x3ffe0000 instead
+of 0x40000000. The boot line says how many tables, how many MiB that maps and which alias.
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -512,9 +512,14 @@
+ static LCK_MTX_DECLARE(gpu_arena_lock, &gpu_arena_grp);
+ 
+ /* GPU address space (stage 8f): all of L1[2], first fit, a guard page between buffers. */
+-#define GPU_VA_BYTES       0x40000000ull        /* 1 GiB */
++/*
++ * 0196: up to the end of L1[2] (0xc0000000), not 1 GiB past the base: L2 has 512 slots, and an iova
++ * in 0xc0000000..0xc001ffff came out as L2[0] of L1[2] in gpu_l3_for(), i.e. the PTE of 0x80000000.
++ */
++#define GPU_VA_BYTES       (0x40000000ull - (GPU_VA_BASE & 0x3fffffffu))
+ #define GPU_VA_EXTENTS     32u
+-#define GPU_PTE_TABLES     64u                  /* 2 MiB each: 128 MiB mappable */
++#define GPU_PTE_TABLES     64u                  /* 2 MiB each: 128 MiB mappable through ml_io_map */
++#define GPU_PTE_TABLES_MAX 511u                 /* L2[1..511] (L2[0] has its own L3): the whole range */
+ 
+ struct gpu_va_extent {
+ 	uint64_t off;                                   /* from GPU_VA_BASE */
+@@ -523,13 +528,13 @@
+ 
+ static struct gpu_va_extent gpu_va_free[GPU_VA_EXTENTS];
+ 
+-/* Pool of L3 tables from the sweetfw3 blob, and which L2 slot each one serves. */
++/* Pool of L3 tables from the sweetfw3 blob, and which pool table serves each L2 slot. */
+ static vm_offset_t gpu_pte_pool;
+ static uint64_t gpu_pte_pool_pa;
+ static uint32_t gpu_pte_tables;
+-static uint32_t gpu_pte_l2i[GPU_PTE_TABLES];
+-static uint32_t gpu_pte_off[GPU_PTE_TABLES];
++static uint16_t gpu_pte_slot[512];          /* L2 index -> pool table + 1; 0: none yet */
+ static uint32_t gpu_pte_used;
++static bool gpu_pte_cached;                 /* the pool is the cacheable aperture: clean every store */
+ static vm_offset_t gpu_smmu;    /* SMMU base, for TLB invalidation after PTE changes */
+ 
+ static void gpu_tlb_invalidate(void);
+@@ -566,6 +571,34 @@
+  */
+ static vm_offset_t gpu_arena_aperture;      /* aperture alias of arena+0; 0: none */
+ 
++/* The aperture alias of [pa, end) in *base, or why there is none (0196: shared with the PTE pool). */
++static const char *
++gpu_aperture_check(uint64_t pa, uint64_t end, vm_offset_t *base)
++{
++	vm_size_t n = PAGE_SIZE;
++
++	*base = 0;
++	if (pa < gPhysBase || end > gPhysBase + gPhysSize) {
++		return "outside gPhysBase..+gPhysSize";     /* phystokv_range would panic */
++	}
++	vm_offset_t b = (vm_offset_t)phystokv_range(pa, &n);
++	for (uint64_t p = pa; p < end; p += PAGE_SIZE) {
++		vm_offset_t va;
++		uint64_t got;
++
++		n = PAGE_SIZE;
++		va = (vm_offset_t)phystokv_range(p, &n);
++		got = va == b + (p - pa) ? mmu_kvtop_wpreflight(va) : 0;
++		if (trunc_page(got) != trunc_page(p)) {
++			printf("SWEET GPU: aperture: pa %#llx -> va %#lx -> %#llx\n",
++			    (unsigned long long)p, (unsigned long)va, (unsigned long long)got);
++			return va == b + (p - pa) ? "page not mapped writable there" : "aperture not linear";
++		}
++	}
++	*base = b;
++	return NULL;
++}
++
+ static void
+ gpu_arena_aperture_init(void)
+ {
+@@ -582,25 +615,8 @@
+ 	    (unsigned long)first_avail, pa >= vm_first_phys && end <= vm_last_phys, end <= first_avail);
+ 	if (mode == 0) {
+ 		why = "sweetarena=0";
+-	} else if (pa < gPhysBase || end > gPhysBase + gPhysSize) {
+-		why = "outside gPhysBase..+gPhysSize";     /* phystokv_range would panic */
+ 	} else {
+-		vm_size_t n = PAGE_SIZE;
+-
+-		base = (vm_offset_t)phystokv_range(pa, &n);
+-		for (uint64_t p = pa; p < end && why == NULL; p += PAGE_SIZE) {
+-			vm_offset_t va;
+-			uint64_t got;
+-
+-			n = PAGE_SIZE;
+-			va = (vm_offset_t)phystokv_range(p, &n);
+-			got = va == base + (p - pa) ? mmu_kvtop_wpreflight(va) : 0;
+-			if (trunc_page(got) != trunc_page(p)) {
+-				why = va == base + (p - pa) ? "page not mapped writable there" : "aperture not linear";
+-				printf("SWEET GPU: arena aperture: pa %#llx -> va %#lx -> %#llx\n",
+-				    (unsigned long long)p, (unsigned long)va, (unsigned long long)got);
+-			}
+-		}
++		why = gpu_aperture_check(pa, end, &base);
+ 	}
+ 	if (why == NULL) {
+ 		/* The first two words, through the aperture and back through the uncached window. */
+@@ -694,11 +710,35 @@
+ 		gpu_pte_pool = 0;
+ 		gpu_pte_tables = 0;
+ 	} else {
+-		gpu_pte_pool = ml_io_map((vm_offset_t)pa, GPU_PTE_TABLES * 0x1000);
++		/*
++		 * 0196: as many tables as the blob holds, up to the whole client range. More than 64 do not
++		 * go through ml_io_map (io_submap is 8 MiB for every device mapping, and it panics when
++		 * full): they use the static aperture like the arena (0194) - cacheable, so every PTE store
++		 * is cleaned to memory before the TLB invalidate (gpu_pte_clean). Only when the arena's
++		 * aperture checked out (not with sweetarena=0); otherwise 64 tables, as before.
++		 */
++		uint64_t want = size / 0x1000;
++		const char *why = "sweetfw3 holds no more than 64 tables";
++		if (want > GPU_PTE_TABLES_MAX) {
++			want = GPU_PTE_TABLES_MAX;
++		}
++		gpu_pte_pool = 0;
+ 		gpu_pte_pool_pa = pa;
+-		gpu_pte_tables = GPU_PTE_TABLES;
+-		printf("SWEET GPU: %u page tables (%u MiB mappable) at %#llx\n",
+-		    gpu_pte_tables, gpu_pte_tables * 2, (unsigned long long)pa);
++		gpu_pte_cached = false;
++		if (want > GPU_PTE_TABLES) {
++			why = gpu_arena_aperture == 0 ? "the arena has no aperture alias" :
++			    gpu_aperture_check(pa, pa + want * 0x1000, &gpu_pte_pool);
++		}
++		if (gpu_pte_pool != 0) {
++			gpu_pte_cached = true;
++			gpu_pte_tables = (uint32_t)want;
++		} else {
++			gpu_pte_pool = ml_io_map((vm_offset_t)pa, GPU_PTE_TABLES * 0x1000);
++			gpu_pte_tables = GPU_PTE_TABLES;
++		}
++		printf("SWEET GPU: %u page tables (%u MiB mappable) at %#llx, %s\n",
++		    gpu_pte_tables, gpu_pte_tables * 2, (unsigned long long)pa,
++		    gpu_pte_cached ? "aperture alias (cacheable, cleaned per store)" : why);
+ 	}
+ 	gpu_va_free[0].off = 0;
+ 	gpu_va_free[0].size = GPU_VA_BYTES;
+@@ -1778,6 +1818,15 @@
+ 	    (unsigned long long)(GPU_VA_BASE + off), (unsigned long long)size);
+ }
+ 
++/* 0196: a pool table that lives in the cacheable aperture must reach memory: the SMMU walks uncached. */
++static void
++gpu_pte_clean(vm_offset_t va, unsigned len)
++{
++	if (gpu_pte_cached && va >= gpu_pte_pool && va + len <= gpu_pte_pool + 0x1000ull * gpu_pte_tables) {
++		flush_dcache64(gpu_pte_pool_pa + (va - gpu_pte_pool), len, 1);
++	}
++}
++
+ /* The L3 serving a 2 MiB chunk, taken from the pool on first touch. */
+ static volatile uint64_t *
+ gpu_l3_for(uint64_t iova)
+@@ -1795,22 +1844,21 @@
+ 		return (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
+ 	}
+ 
+-	for (unsigned i = 0; i < gpu_pte_used; i++) {
+-		if (gpu_pte_l2i[i] == l2i) {
+-			return (volatile uint64_t *)(gpu_pte_pool + gpu_pte_off[i]);
+-		}
++	if (gpu_pte_slot[l2i] != 0) {
++		return (volatile uint64_t *)(gpu_pte_pool + 0x1000u * (gpu_pte_slot[l2i] - 1u));
+ 	}
+ 	if (gpu_pte_pool == 0 || gpu_pte_used >= gpu_pte_tables) {
+-		printf("SWEET GPU: no page table for %#llx\n", (unsigned long long)iova);
++		printf("SWEET GPU: no page table for %#llx (%u of %u in use)\n", (unsigned long long)iova,
++		    gpu_pte_used, gpu_pte_tables);
+ 		return NULL;
+ 	}
+ 	uint32_t off = 0x1000u * gpu_pte_used;
+ 	for (uint32_t i = 0; i < 0x1000; i += 4) {
+ 		*(volatile uint32_t *)(gpu_pte_pool + off + i) = 0;
+ 	}
+-	gpu_pte_l2i[gpu_pte_used] = l2i;
+-	gpu_pte_off[gpu_pte_used] = off;
++	gpu_pte_clean(gpu_pte_pool + off, 0x1000);    /* zeroes in memory before L2 points at them */
+ 	gpu_pte_used++;
++	gpu_pte_slot[l2i] = (uint16_t)gpu_pte_used;
+ 	l2[l2i] = (gpu_pte_pool_pa + off) | GPU_PTE_TABLE;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	return (volatile uint64_t *)(gpu_pte_pool + off);
+@@ -1900,6 +1948,7 @@
+ 	}
+ 	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
+ 	    (readonly ? (1ull << 7) : 0ull);
++	gpu_pte_clean((vm_offset_t)&l3[(iova >> 12) & 0x1ff], 8);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	gpu_tlb_invalidate();
+ 	return true;
+@@ -1915,6 +1964,7 @@
+ 		volatile uint64_t *l3 = gpu_l3_for(iova + o);
+ 		if (l3 != NULL) {
+ 			l3[((iova + o) >> 12) & 0x1ff] = 0;
++			gpu_pte_clean((vm_offset_t)&l3[((iova + o) >> 12) & 0x1ff], 8);
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");

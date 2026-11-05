@@ -25,6 +25,10 @@ kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
+
+--reserve-blob SIZE is a --blob without bytes: a segment with file_size 0 and vmsize SIZE, which
+the shim zero-fills (loader.c zero64 for vmsize > file_size), announced as sweetfwN like the
+others and taking its place in their order. It costs RAM below topOfKernelData, not image size.
 """
 import argparse, os, struct, sys
 
@@ -172,12 +176,17 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blob_paths=None, na
     # kernel learns their physical addresses from the command line.
     blobs = []
     for path in (blob_paths or []):
-        data = open(path, 'rb').read()
-        size = (len(data) + PAGE - 1) & ~(PAGE - 1)
+        # An int is a --reserve-blob: SIZE zero bytes the shim makes, none in the payload.
+        if isinstance(path, int):
+            data, n = b'', path
+        else:
+            data = open(path, 'rb').read()
+            n = len(data)
+        size = (n + PAGE - 1) & ~(PAGE - 1)
         va = kernel_end
         kernel_end = va + size
         pieces.append((va, size, data))
-        blobs.append((va - virt_base + PHYS_BASE, len(data)))
+        blobs.append((va - virt_base + PHYS_BASE, n))
     # Named blobs: announced as NAME=<pa>:<size>, independent of how many sweetfwN there are.
     named = []
     for spec in (named_blobs or []):
@@ -228,6 +237,8 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--blob', action='append', default=[],
                     help='extra file for the kernel, announced as sweetfwN=<pa>:<size> (repeatable)')
+    ap.add_argument('--reserve-blob', dest='blob', action='append', type=lambda v: int(v, 0), metavar='SIZE',
+                    help='a --blob of SIZE zero bytes that the shim fills in, none in the payload (repeatable)')
     ap.add_argument('--named-blob', action='append', default=[], metavar='NAME=FILE',
                     help='extra file announced as NAME=<pa>:<size> (repeatable), e.g. sweetuserland=archive')
     a = ap.parse_args()

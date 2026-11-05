@@ -103,22 +103,34 @@ BLOB_ARGS+=(--blob "$GMEM_BLOB")
 # Size in MiB: Metal needs buffers/textures far beyond the old 1 MiB, and this blob is the only
 # GPU memory the pmap never has to touch. It travels in the payload, so it costs boot-image size,
 # not a userdata flash.
-ARENA_MIB=${ARENA_MIB:-64}
-ARENA_BLOB=${ARENA_BLOB:-$HOME/gpu-fw/arena.bin}
-if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne $((ARENA_MIB * 1048576)) ]]; then
-	mkdir -p "$(dirname "$ARENA_BLOB")"
-	dd if=/dev/zero of="$ARENA_BLOB" bs=1048576 count="$ARENA_MIB" status=none
+# ARENA_RESERVE_MIB=<1..256> (PLAN K5) instead: the arena and the page-table pool as reserve-only
+# blobs (mkpayload --reserve-blob: a size, no bytes; the shim zero-fills them), so neither costs
+# image size, only RAM. The pool then has PTE_TABLES (default 511) tables, all of the client range;
+# a kernel without xnu 0196 uses the first 64 of them.
+if [[ -n "${ARENA_RESERVE_MIB:-}" ]]; then
+	PTE_TABLES=${PTE_TABLES:-511}
+	(( ARENA_RESERVE_MIB >= 1 && ARENA_RESERVE_MIB <= 256 )) || { echo "ARENA_RESERVE_MIB: 1..256 (the kernel's arena limit)" >&2; exit 1; }
+	(( PTE_TABLES >= 64 && PTE_TABLES <= 511 )) || { echo "PTE_TABLES: 64..511" >&2; exit 1; }
+	echo "arena: $ARENA_RESERVE_MIB MiB and $PTE_TABLES page tables, reserved (zero-filled by the shim)"
+	BLOB_ARGS+=(--reserve-blob $((ARENA_RESERVE_MIB * 1048576)) --reserve-blob $((PTE_TABLES * 4096)))
+else
+	ARENA_MIB=${ARENA_MIB:-64}
+	ARENA_BLOB=${ARENA_BLOB:-$HOME/gpu-fw/arena.bin}
+	if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne $((ARENA_MIB * 1048576)) ]]; then
+		mkdir -p "$(dirname "$ARENA_BLOB")"
+		dd if=/dev/zero of="$ARENA_BLOB" bs=1048576 count="$ARENA_MIB" status=none
+	fi
+	echo "arena: $ARENA_MIB MiB"
+	BLOB_ARGS+=(--blob "$ARENA_BLOB")
+	# A fourth blob: the GPU page-table pool (stage 8f). 64 L3 tables of 4 KiB, each covering
+	# a 2 MiB chunk of client address space.
+	PTE_BLOB=${PTE_BLOB:-$HOME/gpu-fw/pte.bin}
+	if [[ ! -f "$PTE_BLOB" || $(stat -c%s "$PTE_BLOB" 2>/dev/null || echo 0) -ne 262144 ]]; then
+		mkdir -p "$(dirname "$PTE_BLOB")"
+		dd if=/dev/zero of="$PTE_BLOB" bs=1024 count=256 status=none
+	fi
+	BLOB_ARGS+=(--blob "$PTE_BLOB")
 fi
-echo "arena: $ARENA_MIB MiB"
-BLOB_ARGS+=(--blob "$ARENA_BLOB")
-# A fourth blob: the GPU page-table pool (stage 8f). 64 L3 tables of 4 KiB, each covering
-# a 2 MiB chunk of client address space.
-PTE_BLOB=${PTE_BLOB:-$HOME/gpu-fw/pte.bin}
-if [[ ! -f "$PTE_BLOB" || $(stat -c%s "$PTE_BLOB" 2>/dev/null || echo 0) -ne 262144 ]]; then
-	mkdir -p "$(dirname "$PTE_BLOB")"
-	dd if=/dev/zero of="$PTE_BLOB" bs=1024 count=256 status=none
-fi
-BLOB_ARGS+=(--blob "$PTE_BLOB")
 # USERLAND_ARCHIVE: files for userspace that travel in the boot image instead of the root image
 # (tools/gles-ca/mkuserland.py, xnu 0175 kern.sweetuserland), announced as sweetuserland=<pa>:<size>.
 if [[ -n "${USERLAND_ARCHIVE:-}" ]]; then

@@ -1,0 +1,60 @@
+enchilada: GPU: no DIAG panics on a failed BO mapping; the ioctl fails instead
+
+With CoreAnimation driving the GPU (backboardd through libsweetca), a 12 MiB BO (one 1125x2436
+surface) at iova 0x87ab9000 ran past 0x88000000, the end of what the 64 L3 tables of the PTE pool
+cover, and mapGem() hit its "SWEET DIAG: mapGem page N of 3072" panic. Both DIAG panics in
+mapGem() - no iova left, and a page that cannot be entered (no page table, pa 0 or misaligned) -
+are reachable from any client's GEM_NEW / SURFACE_BO, so a resource limit killed the phone. They
+now log the same facts (size, page, iova, pa, arena pa) with IOLog, undo the pages already
+entered and the address range, and fail the call: kIOReturnNoSpace without an iova,
+kIOReturnNoMemory for a page; gemNew() and surfaceBo() already release the slot, the descriptor
+and the arena pages on that path. The loop no longer counts the failed page as mapped. These
+were the only panic() calls in SweetAdreno.cpp, and sweet_gpu.c has none. Mesa 25.0.7 does not
+check every heap allocation (fd_bo_heap_alloc -> fd_bo_ref(NULL)), so the client may still
+crash; that is recoverable, a kernel panic is not. The table limit itself is 0196.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -380,13 +380,12 @@
+ 		iova = setIova;
+ 		taken = size;
+ 	} else if (!sweet_gpu_iova_alloc(size, &iova, &taken)) {
+-		IOLog("SWEET GPU: no GPU address space for %llu bytes\n", size);
+-		panic("SWEET DIAG: no iova for %llu bytes (arena %#llx)", size, slot->pa);
++		/* The client's ioctl fails; it must not take the phone down (0195: was a DIAG panic). */
++		IOLog("SWEET GPU: no GPU address space for %llu bytes (arena %#llx)\n", size, slot->pa);
++		return kIOReturnNoSpace;
+ 	}
+-	bool ok = true;
+-	uint64_t mapped = 0;
+-	for (; mapped < size && ok; mapped += GPU_PAGE) {     /* K2(a): every 4 KiB PTE, not every 16 KiB */
+-		uint64_t pa;
++	uint64_t mapped = 0, pa = 0;
++	for (; mapped < size; mapped += GPU_PAGE) {     /* K2(a): every 4 KiB PTE, not every 16 KiB */
+ 		if (slot->pa != 0) {
+ 			/* GEM_NEW: the arena address is already known, no descriptor walk needed. */
+ 			pa = slot->pa + mapped;
+@@ -394,16 +393,17 @@
+ 			IOByteCount length = 0;
+ 			pa = (uint64_t)slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 		}
+-		ok = pa != 0 && (pa & (GPU_PAGE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
+-		if (!ok) {
+-			panic("SWEET DIAG: mapGem page %llu of %llu: iova %#llx pa %#llx arena %#llx",
+-			    mapped / GPU_PAGE, size / GPU_PAGE, iova, pa, slot->pa);
++		if (pa == 0 || (pa & (GPU_PAGE - 1)) != 0 || !sweet_gpu_vm_map(iova + mapped, pa, ro)) {
++			break;
+ 		}
+ 	}
+-	if (!ok) {
++	if (mapped < size) {
++		/* Pages [0, mapped) are in; undo them and the address range, then fail the call (was a DIAG panic). */
+ 		sweet_gpu_vm_unmap(iova, mapped);
+ 		sweet_gpu_iova_free(iova, taken);
+-		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space (page %llu)\n", size, mapped / GPU_PAGE);
++		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space: page %llu of %llu, "
++		    "iova %#llx pa %#llx (arena %#llx)\n", size, mapped / GPU_PAGE, size / GPU_PAGE,
++		    iova + mapped, pa, slot->pa);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	slot->iova = iova;

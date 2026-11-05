@@ -1,0 +1,223 @@
+enchilada: GPU: cacheable client mappings of arena BOs, maintained by the kernel
+
+CPU access to GPU buffers ran at about 50 MB/s (a 1024x1024 readback: 84.5 ms a frame, 20 ms per
+MiB). The libdrm stand-in maps every BO with IOConnectMapMemory64(conn, handle, task, &addr,
+&size, 0x401) (sweet_drm_mmap: mov w5, #0x401 = kIOMapAnywhere | kIOMapWriteCombineCache), and
+IOUserClient::mapClientMemory64() replaces the driver's cache bits with the client's
+(options & ~kIOMapUserOptionsMask | mapFlags & kIOMapUserOptionsMask). clientMemoryForType()
+returned 0, the withPhysicalAddress() descriptor's memory entry is copyback (the arena pages are
+pa_valid with no WIMG attribute: VM_WIMG_DEFAULT), and memoryReferenceMap() then re-types the
+entry to VM_WIMG_WCOMB - Normal non-cacheable, so every CPU load goes to DRAM. Now arena BOs ask
+for kIOMapCopybackCache, and mapClientMemory64() keeps a cache mode the driver names (no other
+user client in this kernel sets one). Coherency is the kernel's job, by physical address with
+flush_dcache64(pa, len, TRUE) (dc civac through the static aperture, which covers the arena;
+dcache_incoherent_io_flush64() is not used: above c_bulksize_op it does a set/way flush, wrong on
+SMP). SUBMIT cleans every BO as before, but before the relocation patch (a dirty client line
+written back afterwards would undo a patch stored through the uncached window) and cleans each
+patched command range after it (aperture stores are cached). Every BO of a submission is marked
+GPU-dirty; CPU_PREP (READ or WRITE, after its wait or a NOSYNC check) and a successful WAIT_FENCE
+clean+invalidate GPU-dirty BOs whose submissions are done, so the CPU neither hits nor merges into
+stale lines (Mesa skips CPU_PREP when its own fence word says idle, hence WAIT_FENCE too).
+CPU_FINI cleans the BO, BO_SYNC cleans+invalidates the range by pa, and GEM_CLOSE
+cleans+invalidates the BO before its pages go back to the arena. IOSurface BOs keep the client's
+mode. One boot line names the mode; sweetbocache=0 gives the client's own mode back (write-combined).
+
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -1950,6 +1950,14 @@
+ 	if (memory && (kIOReturnSuccess == err)) {
+ 		FAKE_STACK_FRAME(getMetaClass());
+ 
++		/*
++		 * sweet 0197: a cache mode the driver names in clientMemoryForType() wins over the client's
++		 * (SweetAdreno maps arena BOs copyback and maintains them; the libdrm stand-in asks for
++		 * write-combined). No other user client in this kernel sets cache bits there.
++		 */
++		if (options & kIOMapCacheMask) {
++			mapFlags = (mapFlags & ~kIOMapCacheMask) | (options & kIOMapCacheMask);
++		}
+ 		options = (options & ~kIOMapUserOptionsMask)
+ 		    | (mapFlags & kIOMapUserOptionsMask);
+ 		map = memory->createMappingInTask( task, atAddress, options );
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -83,6 +83,38 @@
+ static int gAdrenoLogAll = -1;
+ static uint32_t gLogSelector, gLogIb, gLogSubmit, gLogWait, gLogWaitDump, gLogFault;
+ 
++/*
++ * 0197: arena BOs are mapped into the client cacheable (copyback) instead of the write-combined
++ * mapping the libdrm stand-in asks for (IOConnectMapMemory64 options 0x401), with the maintenance
++ * that needs: SUBMIT cleans every BO before the CP reads (as before), CPU_PREP / WAIT_FENCE /
++ * BO_SYNC invalidate what the GPU may have written before the CPU reads, CPU_FINI cleans, and
++ * GEM_CLOSE cleans+invalidates before the pages go back to the arena. sweetbocache=0: the client's
++ * own cache mode again (write-combined: reads at ~50 MB/s), as before 0197.
++ */
++static int gBoCache = -1;
++
++static bool
++boCached(void)
++{
++	if (gBoCache < 0) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("sweetbocache", &on, sizeof(on));
++		gBoCache = on != 0;
++		IOLog("SWEET GPU: BO CPU mappings %s (sweetbocache=%u)\n",
++		    gBoCache ? "cacheable, kernel-maintained" : "as the client asks (write-combined)", on);
++	}
++	return gBoCache != 0;
++}
++
++/* Clean+invalidate an arena BO's lines by physical address (dc civac through the linear map). */
++static void
++boFlush(uint64_t pa, uint64_t len)
++{
++	if (pa != 0 && len != 0) {
++		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++	}
++}
++
+ static bool
+ adrenoLog(uint32_t *seen)
+ {
+@@ -107,6 +139,7 @@
+ 	uint32_t                  lastFence;    /* last submission that referenced the BO */
+ 	uint32_t                  lastWrite;    /* last one that wrote it */
+ 	bool                      submitted;    /* SET_IOVA is refused after the first submit */
++	bool                      gpuDirty;     /* 0197: submitted since the CPU's lines were last dropped */
+ };
+ 
+ class SweetAdreno630 : public IOService {
+@@ -352,6 +385,9 @@
+ 		 * before it closes it (Mesa: munmap, then GEM_CLOSE), so nothing still reaches them.
+ 		 */
+ 		if (g->pa != 0) {
++			if (boCached()) {
++				boFlush(g->pa, g->size);    /* no client line of it may outlive it in the cache */
++			}
+ 			sweet_gpu_free_pages(g->pa, g->size);
+ 		}
+ 	}
+@@ -559,6 +595,14 @@
+ 		} else if (g->lastFence != 0 && !sweet_gpu_fence_done((r->op & SWEET_MSM_PREP_WRITE) ? g->lastFence : g->lastWrite)) {
+ 			ret = kIOReturnBusy;
+ 		}
++		/*
++		 * 0197: what the GPU wrote is in memory now; drop the CPU's stale lines (lines a reader or a
++		 * writer would otherwise hit or merge into). The flag stays while a submission still uses it.
++		 */
++		if (ret == kIOReturnSuccess && g->gpuDirty && g->pa != 0 && boCached()) {
++			boFlush(g->pa, g->size);
++			g->gpuDirty = g->lastFence != 0 && !sweet_gpu_fence_done(g->lastFence);
++		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;
+@@ -662,6 +706,17 @@
+ 			}
+ 			at += c->nr_relocs;
+ 		}
++		/*
++		 * The client writes through a cacheable mapping (0197 makes arena BOs copyback; the map
++		 * options it passes override clientMemoryForType() otherwise), so its stores may still be
++		 * dirty in the CPU cache when the CP reads. Clean every buffer in this submission through the
++		 * linear map - flush_dcache64() does that by physical address, which is why it works for a
++		 * mapping we do not own. Before the relocation patch (0197): a dirty client line written back
++		 * after it would undo a patch stored through the uncached window.
++		 */
++		for (uint32_t i = 0; i < r->nr_bos; i++) {
++			boFlush(objs[i]->pa, objs[i]->size);
++		}
+ 		/* validated: patch, then submit */
+ 		at = 0;
+ 		for (uint32_t i = 0; i < r->nr_cmds; i++) {
+@@ -680,15 +735,12 @@
+ 		}
+ 	}
+ 	/*
+-	 * The client writes through a cacheable mapping (the map options it passes override whatever
+-	 * clientMemoryForType() asks for), so its stores may still be dirty in the CPU cache when the
+-	 * CP reads. Clean every buffer in this submission through the linear map - flush_dcache64()
+-	 * does that by physical address, which is why it works for a mapping we do not own.
++	 * 0197: the relocation stores of the window alias are uncached and the cacheable aperture's are
++	 * cached; the client's lines were cleaned before the patch (above), so clean what was patched.
+ 	 */
+-	for (uint32_t i = 0; i < r->nr_bos; i++) {
+-		struct sweet_gem *g = objs[i];
+-		if (g->pa != 0 && g->size != 0) {
+-			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
++	for (uint32_t i = 0; i < r->nr_cmds; i++) {
++		if (cmds[i].nr_relocs != 0 && objs[cmds[i].submit_idx]->pa != 0) {
++			boFlush(objs[cmds[i].submit_idx]->pa + cmds[i].submit_offset, cmds[i].size);
+ 		}
+ 	}
+ 	/*
+@@ -715,6 +767,7 @@
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			objs[i]->lastFence = fence;
+ 			objs[i]->submitted = true;
++			objs[i]->gpuDirty = true;       /* every BO: freedreno's fence BO is not always flagged WRITE */
+ 			if (bos[i].flags & SWEET_MSM_SUBMIT_BO_WRITE) {
+ 				objs[i]->lastWrite = fence;
+ 			}
+@@ -760,6 +813,18 @@
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+ 		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnNotReady);
++		/*
++		 * 0197: Mesa may read a BO without CPU_PREP once its own fence word (a BO the CP writes)
++		 * says idle, so every BO whose submissions are all done drops its CPU lines here.
++		 */
++		for (uint32_t i = 0; ret == kIOReturnSuccess && i < GEM_MAX && boCached(); i++) {
++			struct sweet_gem *g = &fGems[i];
++			if (g->md != NULL && g->gpuDirty && g->pa != 0 &&
++			    (g->lastFence == 0 || sweet_gpu_fence_done(g->lastFence))) {
++				boFlush(g->pa, g->size);
++				g->gpuDirty = false;
++			}
++		}
+ 		if (ret != kIOReturnSuccess || adrenoLog(&gLogWait)) {
+ 			IOLog("SWEET ADRENO: wait fence %u (%llu ns) -> %#x, last %u\n", r->fence,
+ 			    (unsigned long long)ns, ret, sweet_gpu_fence_last());
+@@ -862,7 +927,15 @@
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (g != NULL) {
+-		if (g->kva == NULL) {
++		if (g->pa != 0 && boCached()) {
++			/* 0197: the client's alias is cacheable: clean+invalidate the range by physical address */
++			if (r->offset > g->size || r->size > g->size - r->offset) {
++				ret = kIOReturnBadArgument;
++			} else {
++				boFlush(g->pa + r->offset, r->size ? r->size : g->size - r->offset);
++				ret = kIOReturnSuccess;
++			}
++		} else if (g->kva == NULL) {
+ 			ret = kIOReturnUnsupported;
+ 		} else if (r->offset > g->size || r->size > g->size - r->offset) {
+ 			ret = kIOReturnBadArgument;
+@@ -886,7 +959,8 @@
+ 	if (g != NULL) {
+ 		g->md->retain();
+ 		*memory = g->md;
+-		*options = 0;
++		/* 0197: arena BOs copyback (0197 makes IOUserClient keep a driver-chosen cache mode) */
++		*options = g->pa != 0 && boCached() ? kIOMapCopybackCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+@@ -974,7 +1048,13 @@
+ 	case SWEET_GPU_SEL_GEM_CPU_FINI:
+ 		NEED(struct sweet_msm_gem_cpu_fini);
+ 		IOLockLock(gAdrenoLock);
+-		ret = gem(r.cpuFini.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		{
++			struct sweet_gem *g = gem(r.cpuFini.handle);
++			ret = g != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++			if (g != NULL && g->pa != 0 && boCached()) {
++				boFlush(g->pa, g->size);    /* 0197: the CPU's stores reach memory before the GPU reads */
++			}
++		}
+ 		IOLockUnlock(gAdrenoLock);
+ 		__asm__ volatile ("dsb sy" ::: "memory");       /* CPU stores through the WC mapping reach memory */
+ 		break;
