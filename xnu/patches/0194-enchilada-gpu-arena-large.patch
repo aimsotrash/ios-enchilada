@@ -1,0 +1,186 @@
+enchilada: GPU: a kernel alias for the whole arena from the static aperture (K3)
+
+Every big-arena panic (0169: 40 MiB, 0170: 16 MiB, 0171: 40 x 1 MiB) was
+ml_io_map() -> io_map() -> kmem_alloc(io_submap, ..., KMA_PERMANENT |
+KMA_PAGEABLE | KMA_NOFAIL = 0x100021) failing with KERN_NO_SPACE (3) and
+NOFAIL turning that into __kmem_failed_panic: on arm, io_submap is 8 MiB for
+every device mapping in the system (osfmk/arm/io_map.c IO_MAP_SIZE), not
+kernel_map. 0172 stays inside it (one 1 MiB window) and leaves the rest of
+the arena without a kernel alias. That is enough for the GPU (physical
+addresses) and for the client (IOConnectMapMemory64 of a withPhysicalAddress
+descriptor goes into the task's map), but reloc patching, BO_SYNC and the
+fence dump refuse or skip anything past the window. The arena does not need a
+new mapping at all: mkpayload puts it right after the kernel, below
+topOfKernelData, and arm_vm_physmap_init() (no PPL on this board) maps
+[end_kern, topOfKernelData) RW cacheable at gVirtBase + (pa - gPhysBase) for
+good; first_avail is above it, so the VM never owns those pages. At init
+every arena page is checked with AT S1E1W (cannot fault) and one store
+through the aperture must read back through the uncached window after a
+clean; then IOKit buffers past the window get that alias instead of NULL.
+Kernel stores through it are cleaned by submit (every BO, by pa, after the
+reloc patch), and the fence dump now invalidates before it reads. The
+window, the chardev path and the K0 ladder are unchanged. One line at init
+logs gPhysBase/gPhysSize/gVirtBase/first_avail, whether the arena is
+pmap-managed and below the VM, and which path was taken. sweetarena=0 keeps
+0172's behaviour (no alias past the window).
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -31,6 +31,11 @@
+ /* osfmk/arm/pmap/pmap.h and arm/caches_internal.h: the static physical aperture and its cache clean */
+ extern uint64_t phystokv_range(uint64_t pa, vm_size_t *max_len);
+ extern void flush_dcache64(uint64_t addr, unsigned count, int phys);
++/* mach/arm/vm_param.h, arm/pmap/pmap{,_data}.h (MACH_KERNEL_PRIVATE): where the arena sits */
++extern unsigned long gVirtBase, gPhysBase, gPhysSize;
++extern vm_offset_t first_avail;
++extern uint64_t vm_first_phys, vm_last_phys;
++extern uint64_t mmu_kvtop_wpreflight(vm_offset_t va);      /* AT S1E1W: 0 unless writable */
+ /* iokit/Kernel/arm/SweetAdreno.cpp: the service a client opens */
+ extern void SweetAdrenoPublish(void);
+ void sweet_gpu_probe(void);
+@@ -476,9 +481,11 @@
+ 
+ /*
+  * The buffer arena (a payload blob), mapped in windows. ml_io_map() maps the whole size with one
+- * kmem_alloc(), and this port's kernel_map has no hole anywhere near the arena's size (the largest
+- * mapping that ever worked here is 1 MiB), so the arena is a list of windows and every buffer stays
+- * inside one of them - that keeps its kernel alias contiguous.
++ * kmem_alloc() from io_submap, which on arm is 8 MiB for every device mapping in the system
++ * (osfmk/arm/io_map.c IO_MAP_SIZE) and allocates with KMA_NOFAIL - that is what the 40 MiB,
++ * 16 MiB and 40 x 1 MiB arenas ran out of (flags 0x100021 = PERMANENT|PAGEABLE|NOFAIL, kr 3 =
++ * KERN_NO_SPACE), not kernel_map. So the arena is one uncached 1 MiB window plus, since 0194, the
++ * static aperture for the rest (gpu_arena_aperture_init).
+  */
+ #define GPU_ARENA_WINDOWS      128u
+ static vm_offset_t gpu_arena_windows[GPU_ARENA_WINDOWS];
+@@ -547,6 +554,85 @@
+ 	return gpu_arena_windows[w] + (off % gpu_arena_window_bytes);
+ }
+ 
++/*
++ * 0194: a kernel alias for the whole arena that maps nothing. mkpayload puts the blobs right
++ * after the kernel, below topOfKernelData, and arm_vm_physmap_init() (no PPL here) maps
++ * [end_kern, topOfKernelData) RW cacheable at gVirtBase + (pa - gPhysBase) for the life of the
++ * system - no io_submap, no kmem_alloc, no pmap_enter. The VM never gets those pages (they lie
++ * below first_avail), so nothing else owns them. The alias is cacheable: kernel stores reach the
++ * GPU only after a clean (submit cleans every BO by pa) and GPU results need an invalidate before
++ * a kernel load. Every page is checked with AT S1E1W (cannot fault) for a writable mapping, and
++ * a store through it must read back through the uncached window. sweetarena=0: 0172 behaviour.
++ */
++static vm_offset_t gpu_arena_aperture;      /* aperture alias of arena+0; 0: none */
++
++static void
++gpu_arena_aperture_init(void)
++{
++	uint32_t mode = 1;
++	uint64_t pa = gpu_arena_pa, end = gpu_arena_pa + gpu_arena_size;
++	vm_offset_t base = 0;
++	const char *why = NULL;
++
++	gpu_arena_aperture = 0;
++	(void)PE_parse_boot_argn("sweetarena", &mode, sizeof(mode));
++	printf("SWEET GPU: arena pa %#llx-%#llx; gPhysBase %#lx size %#lx gVirtBase %#lx "
++	    "first_avail %#lx; pmap-managed %d, below the VM %d\n",
++	    (unsigned long long)pa, (unsigned long long)end, gPhysBase, gPhysSize, gVirtBase,
++	    (unsigned long)first_avail, pa >= vm_first_phys && end <= vm_last_phys, end <= first_avail);
++	if (mode == 0) {
++		why = "sweetarena=0";
++	} else if (pa < gPhysBase || end > gPhysBase + gPhysSize) {
++		why = "outside gPhysBase..+gPhysSize";     /* phystokv_range would panic */
++	} else {
++		vm_size_t n = PAGE_SIZE;
++
++		base = (vm_offset_t)phystokv_range(pa, &n);
++		for (uint64_t p = pa; p < end && why == NULL; p += PAGE_SIZE) {
++			vm_offset_t va;
++			uint64_t got;
++
++			n = PAGE_SIZE;
++			va = (vm_offset_t)phystokv_range(p, &n);
++			got = va == base + (p - pa) ? mmu_kvtop_wpreflight(va) : 0;
++			if (trunc_page(got) != trunc_page(p)) {
++				why = va == base + (p - pa) ? "page not mapped writable there" : "aperture not linear";
++				printf("SWEET GPU: arena aperture: pa %#llx -> va %#lx -> %#llx\n",
++				    (unsigned long long)p, (unsigned long)va, (unsigned long long)got);
++			}
++		}
++	}
++	if (why == NULL) {
++		/* The first two words, through the aperture and back through the uncached window. */
++		volatile uint32_t *c = (volatile uint32_t *)base;
++		volatile uint32_t *u = (volatile uint32_t *)gpu_arena_windows[0];
++		uint32_t keep0 = u[0], keep1 = u[1], got0, got1;
++
++		c[0] = 0x01940a01u;
++		c[1] = 0x01940a02u;
++		flush_dcache64(pa, 64, 1);
++		got0 = u[0];
++		got1 = u[1];
++		u[0] = keep0;
++		u[1] = keep1;
++		__asm__ volatile("dsb sy" ::: "memory");
++		flush_dcache64(pa, 64, 1);          /* drop any line refetched in between */
++		if (got0 != 0x01940a01u || got1 != 0x01940a02u) {
++			why = "store did not reach memory";
++			printf("SWEET GPU: arena aperture: wrote 0x01940a01 0x01940a02, window read %#x %#x\n",
++			    got0, got1);
++		}
++	}
++	if (why != NULL) {
++		printf("SWEET GPU: arena: no aperture alias (%s): buffers past the %u KiB window get none\n",
++		    why, gpu_arena_mapped_bytes / 1024);
++		return;
++	}
++	gpu_arena_aperture = base;
++	printf("SWEET GPU: arena: aperture alias %#lx for all %u KiB (cacheable; sweetarena=0 turns it off)\n",
++	    (unsigned long)base, gpu_arena_size / 1024);
++}
++
+ static bool
+ gpu_bo_init(vm_offset_t blob)
+ {
+@@ -598,6 +684,7 @@
+ 		gpu_arena_mapped_bytes = gpu_arena_window_bytes;
+ 		printf("SWEET GPU: buffer arena %u KiB at %#llx, %u KiB with a kernel alias\n",
+ 		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
++		gpu_arena_aperture_init();
+ 	}
+ 
+ 	/* The page-table pool and the client address space. */
+@@ -2066,11 +2153,13 @@
+ 	lck_mtx_unlock(&gpu_arena_lock);
+ 
+ 	*pa = gpu_arena_pa + off;
+-	*kva = (void *)alias;
++	/* Outside the uncached window: the cacheable aperture alias (0194), if it checked out. */
++	*kva = (void *)(alias != 0 ? alias : gpu_arena_aperture != 0 ? gpu_arena_aperture + off : 0);
+ 	if (gpu_log(&logged) || grew) {
+ 		printf("SWEET GPU: arena: %llu bytes at arena+%#x pa %#llx%s%s, top %u KiB\n",
+ 		    (unsigned long long)sz, off, (unsigned long long)*pa, reused ? ", reused" : "",
+-		    alias != 0 ? "" : ", no kernel alias", gpu_arena_used / 1024);
++		    alias != 0 ? "" : *kva != NULL ? ", aperture alias" : ", no kernel alias",
++		    gpu_arena_used / 1024);
+ 	}
+ 	return true;
+ }
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -445,7 +445,8 @@
+ 	 * Not bzero(): bzero uses dc zva (osfmk/arm64/bzero.s), and dc zva is not permitted on
+ 	 * I/O mapped memory - the arena comes from ml_io_map, so it faults (unaligned kernel data
+ 	 * abort). sweet_gpu_alloc_pages() already zeroed these pages with 32-bit stores, and
+-	 * uncached memory needs no cache maintenance.
++	 * uncached memory needs no cache maintenance. Past the first window kva is the cacheable
++	 * static aperture instead (0194): relocation stores through it are cleaned by submit.
+ 	 */
+ 
+ 	IOLockLock(gAdrenoLock);
+@@ -775,6 +776,8 @@
+ 			if (g->md == NULL || g->pa == 0 || g->kva == NULL) {
+ 				continue;
+ 			}
++			/* Past the first window kva is the cacheable aperture (0194): drop stale lines first. */
++			flush_dcache64((addr64_t)g->pa, 48, TRUE);
+ 			volatile uint32_t *p = (volatile uint32_t *)(void *)g->kva;
+ 			IOLog("SWEET ADRENO: bo %u iova %#llx: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
+ 			    i + 1, g->iova, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
