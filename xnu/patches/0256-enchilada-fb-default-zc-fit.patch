@@ -1,0 +1,85 @@
+enchilada: display: sweetfb_fit and, with a good 0250 verdict, sweetzc on by default
+
+Every daily command line carried sweetzc=1 sweetfb_fit=1. sweetfb_fit now defaults to 1 in both
+AppleCLCD and SweetHID (the touch mapping has to agree with the picture), and sweetzc defaults to 1
+when 0250's probe says in-place scanout is possible with the scaler (splash pipe and its CTL found,
+MDP SMMU bypass, VIG pipe with QSEED3 v1.2/1.3, mixer border on) and fit is on; otherwise it stays
+off. One line says which default was taken when sweetzc is not given. Overrides: sweetzc=0 (copy
+path), sweetzc=1/2 as before, sweetfb_fit=0 (centred crop; then sweetzc defaults to 0).
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -359,13 +359,14 @@
+ 	return verdict;
+ }
+ 
+-static void
++/* 0256: true when the verdict allows in-place scanout with the scaler (sweetzc's default). */
++static bool
+ sweet_mdp_probe(uint64_t fbPhys)
+ {
+ 	vm_offset_t m = ml_io_map(SWEET_MDSS_PA, SWEET_MDSS_MAP);
+ 	if (m == 0) {
+ 		IOLog("SWEET MDP: cannot map the MDSS\n");
+-		return;
++		return false;
+ 	}
+ 	sweet_mdp.base = m;
+ 	for (uint32_t i = 0; i < sizeof(sweet_sspp) / sizeof(sweet_sspp[0]); i++) {
+@@ -456,11 +457,13 @@
+ 	const char *fitWhy = sweet_mdp.pipe < 0 ? "no pipe" : !sweet_sspp[sweet_mdp.pipe].vig ? "DMA pipe has no scaler" :
+ 	    (sweet_mdp.qseed != 0x1002 && sweet_mdp.qseed != 0x1003) ? "QSEED3 version not handled" :
+ 	    !(sweet_mdp.layer & SWEET_LM_BORDER_OUT) ? "mixer border not enabled" : "yes";
++	bool zcOk = sweet_mdp.pipe >= 0 && sweet_mdp.ctl >= 0 && sweet_mdp.smmu == 1;
+ 	IOLog("SWEET MDP: verdict: splash pipe %s on CTL%d %s, %u frames in 100 ms, MDP SMMU %s -> in-place scanout %s, with scaling (sweetfb_fit) %s\n",
+ 	    sweet_mdp.pipe >= 0 ? sweet_sspp[sweet_mdp.pipe].name : "NOT FOUND", sweet_mdp.ctl,
+ 	    sweet_mdp.lm >= 0 ? sweet_lm[sweet_mdp.lm].name : "LM?", sweet_mdp.frames,
+ 	    sweet_mdp.smmu == 1 ? "bypass" : sweet_mdp.smmu == 2 ? "translates" : sweet_mdp.smmu == 3 ? "faults" : "unreadable",
+-	    sweet_mdp.pipe >= 0 && sweet_mdp.ctl >= 0 && sweet_mdp.smmu == 1 ? "possible" : "not possible", fitWhy);
++	    zcOk ? "possible" : "not possible", fitWhy);
++	return zcOk && strcmp(fitWhy, "yes") == 0;
+ }
+ 
+ bool
+@@ -494,8 +497,9 @@
+ 	 * boot-arg sweetfb_fit=1: scale the whole presented plane onto the panel
+ 	 * (nearest neighbour, aspect kept, black bars) instead of showing its
+ 	 * centred panel-sized part 1:1. SweetHID maps touches the same way.
++	 * 0256: on by default; sweetfb_fit=0 is the crop (SweetHID has the same default).
+ 	 */
+-	int fit = 0;
++	int fit = 1;
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	fFit = fit && (fLogicalW != fWidth || fLogicalH != fHeight) && fWidth <= SWEET_FIT_MAX;
+ 	if (fFit) {
+@@ -535,11 +539,16 @@
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	int mdp = 1;
+ 	PE_parse_boot_argn("sweetmdp", &mdp, sizeof(mdp));
++	bool zcGood = false;
+ 	if (mdp && fPhys == SWEET_SPLASH_PA) {
+-		sweet_mdp_probe(fPhys);         /* 0250, read only */
++		zcGood = sweet_mdp_probe(fPhys);        /* 0250, read only */
++	}
++	/* 0256: sweetzc defaults to 1 when 0250's verdict allows it with the scaler (sweetfb_fit on) */
++	int zc = zcGood && fFit ? 1 : 0;
++	if (!PE_parse_boot_argn("sweetzc", &zc, sizeof(zc))) {
++		IOLog("SWEET FB: sweetzc not given: %s\n", zc ? "in-place scanout on (0250 verdict good, sweetfb_fit on; "
++		    "sweetzc=0 turns it off)" : "in-place scanout off (no MDP probe, its verdict, or sweetfb_fit=0; sweetzc=1 asks)");
+ 	}
+-	int zc = 0;
+-	PE_parse_boot_argn("sweetzc", &zc, sizeof(zc));
+ 	if (zc > 0) {
+ 		(void)zcArm(zc);                /* 0251 */
+ 	}
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -446,7 +446,7 @@
+ 	fLogicalH = native ? panelH : 2436;
+ 	fOffX = (fLogicalW - panelW) / 2;
+ 	fOffY = (fLogicalH - panelH) / 2;
+-	int fit = 0;
++	int fit = 1;	/* 0256: on by default, as in SweetFramebuffer.cpp */
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	fFit = fit && (fLogicalW != panelW || fLogicalH != panelH);
+ 	if (fFit) {

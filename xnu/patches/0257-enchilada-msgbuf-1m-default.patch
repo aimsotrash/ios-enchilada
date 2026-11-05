@@ -1,0 +1,39 @@
+enchilada: 1 MiB kernel message buffer by default
+
+Daily command lines carried msgbuf=1048576. On SWEET the boot-time msgbuf setup (oslog_init_msgbuf,
+development kernels) now uses MAX_MSG_BSIZE (1 MiB, the most log_setsize takes) when msgbuf is not
+given; msgbuf=N still sets the size and msgbuf=0 keeps the static CONFIG_MSG_BSIZE buffer.
+
+--- a/bsd/kern/subr_log.c
++++ b/bsd/kern/subr_log.c
+@@ -93,6 +93,9 @@
+ #include <sys/queue.h>
+ #include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>     /* SWEET */
++#endif
+ #include <mach/mach_port.h>
+ #include <mach/mach_vm.h>
+ #include <mach/vm_map.h>
+@@ -855,8 +858,19 @@
+ oslog_init_msgbuf(void)
+ {
+ 	size_t msgbuf_size = 0;
++	bool given = PE_parse_boot_argn("msgbuf", &msgbuf_size, sizeof(msgbuf_size));
+ 
+-	if (PE_parse_boot_argn("msgbuf", &msgbuf_size, sizeof(msgbuf_size))) {
++#if defined(SWEET)
++	/*
++	 * SWEET (0257): the largest buffer by default (what msgbuf=1048576 gave); msgbuf=N still
++	 * sets it, msgbuf=0 keeps the static CONFIG_MSG_BSIZE one.
++	 */
++	if (!given) {
++		msgbuf_size = MAX_MSG_BSIZE;
++		given = true;
++	}
++#endif
++	if (given) {
+ 		(void) log_setsize(msgbuf_size);
+ 	}
+ }

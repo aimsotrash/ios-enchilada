@@ -1,0 +1,86 @@
+sweet: AKS: answer key wrap (10) / unwrap (11) so keychain writes work (bluetoothd reason 130)
+
+bluetoothd (boot 30) exits 1 ~2.5 s after start: unified log shows
+"Bluetooth error - restarting { build=release, reason=130, context="" }", 130 = OI_STATUS_ACCESS_DENIED
+(bluetoothd status-name switch 0x1001c601c -> 0x1001c8298). It comes from LeSecurityManager: the
+keychain write helper (0x100257820 -> _BTKCSetData 0x100255334, SecItemAdd with
+kSecAttrAccessibleAlwaysThisDeviceOnlyPrivate = class 11) fails, 0x1005956cc returns 0x82, and
+0x1005993e0 -> restart (0x100487df8 -> 0x100090734 -> _exit(1)). securityd logs the cause right
+before each restart: "ks_crypt: e00002c7 failed to 'oe' item (class 11, bag: 0)" (-25291): its
+aks_wrap_key (securityd 0x10000b024, IOConnectCallMethod selector 10, scalars {handle, class},
+struct in key, struct out wrapped, scalar out class) hits the 0038 stub default, kIOReturnUnsupported.
+aks_unwrap_key (0x10000678c) is selector 11 with the same scalars and no scalar out.
+
+No SEP: wrapped = 8-byte tag || key; unwrap checks and strips the tag. Every keychain item on the
+system is affected (not only bluetoothd); no item could have been written before, so nothing old
+needs to unwrap.
+
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-05 10:01:35.020176755 -0800
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp	2026-11-05 10:01:48.784259784 -0800
+@@ -170,6 +170,55 @@
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++/*
++ * Key wrap (10) / unwrap (11), used by securityd ks_crypt for every keychain
++ * item ("oe"/"od"): scalars in = { keybag handle, key class }, struct in = key
++ * (wrap) or wrapped key (unwrap), struct out = the other one; wrap also
++ * returns the class it used as scalar out 0. There is no SEP here, so the
++ * "wrapped" key is the key behind an 8-byte tag (same +8 size as AES key
++ * wrap, which the callers' buffers are sized for).
++ * ponytail: per-item keys are stored in clear (no passcode, no SEP anyway);
++ * AES-KW under a per-device secret if this keychain must protect real data.
++ */
++static const uint8_t sweet_aks_wrap_tag[8] = { 'S', 'W', 'E', 'E', 'T', 'W', 'K', '1' };
++
++static IOReturn
++sweet_aks_wrap(bool wrap, IOExternalMethodArguments *args, uint32_t in_len)
++{
++	uint8_t in[8 + 256], out[8 + 256];
++	uint32_t n;
++
++	if (args->scalarInputCount < 2 || in_len > 256 || (!wrap && in_len < 8)) {
++		return kIOReturnBadArgument;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		args->structureInputDescriptor->readBytes(0, in, in_len);
++	} else if (args->structureInput != NULL) {
++		memcpy(in, args->structureInput, in_len);
++	} else {
++		return kIOReturnBadArgument;
++	}
++	if (wrap) {
++		memcpy(out, sweet_aks_wrap_tag, 8);
++		memcpy(out + 8, in, in_len);
++		n = in_len + 8;
++	} else {
++		if (memcmp(in, sweet_aks_wrap_tag, 8) != 0) {
++			return kIOReturnBadArgument;
++		}
++		n = in_len - 8;
++		memcpy(out, in + 8, n);
++	}
++	IOReturn ret = sweet_aks_struct_out(args, out, n);
++	if (ret == kIOReturnSuccess && wrap && args->scalarOutputCount >= 1) {
++		args->scalarOutput[0] = args->scalarInput[1];
++		args->scalarOutputCount = 1;
++	} else {
++		args->scalarOutputCount = 0;
++	}
++	return ret;
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -227,6 +276,10 @@
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++	case kAKSUnwrapKey:
++		ret = sweet_aks_wrap(selector == kAKSWrapKey, args, in_struct);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;

@@ -1,0 +1,45 @@
+enchilada: modem bring-up fixes from the 0262 review
+
+META_PA moves to SCR_PA + 0x10000: with 16 KiB pages the persistent mapping of the SCM argument
+page also covered the metadata block that stage 5 hands to the modem. mss_stop() clears mss_bad so
+its AXI-halt and QMP waits really wait; a boot FSM timeout re-runs the reset deassert as Linux's
+q6v5proc_reset does; ufs_write_blocks() refuses any LUN other than 0 (belt and braces to the lock).
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -431,7 +431,7 @@
+ #define MPSS_SIZE       0x7800000u
+ #define SCR_PA          0xa1000000ull   /* plain RAM in sdm845.dtsi's mdata alloc-ranges */
+ #define SCR_SIZE        0x80000u        /* = one big window; only the first 16 KiB are used */
+-#define META_PA         (SCR_PA + 0x1000)
++#define META_PA         (SCR_PA + 0x10000)  /* 0263: own 16 KiB page, not under mss_arg_va's mapping */
+ #define META_MAX        0x3000u
+ #define MSS_BIGWIN      0x80000u        /* 512 KiB WC windows (kernel_map placed 1 MiB, not more) */
+ 
+@@ -1137,6 +1137,7 @@
+ mss_stop(const char *why)
+ {
+ 	printf("SWEET MSS: stop (%s)\n", why);
++	mss_bad = false;        /* 0263: the stop path's own waits must really wait */
+ 	mss_big_drop();
+ 	if (ms.running && ms.out_off) {
+ 		uint32_t stop = ms.out_off + 20 + 16;               /* "master-kernel" value */
+@@ -1395,6 +1396,7 @@
+ 		w32(QDSP6SS_PA + 0x404, 1);                                     /* BOOT_CMD */
+ 		if (!poll32(RMB_PA + RMB_MSS_STATUS, 1, 1, 10, 10000, &v)) {
+ 			why = "boot fsm";
++			mss_reset_deassert();   /* 0263: as Linux q6v5proc_reset: boot FSM back in reset */
+ 		}
+ 	}
+ 	if (!why) {
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -281,7 +281,7 @@
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	if (su.lun != 0 || !su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);

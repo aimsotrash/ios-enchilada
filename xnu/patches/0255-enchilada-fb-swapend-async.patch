@@ -1,0 +1,450 @@
+enchilada: display: SwapEnd does not wait for the frame; a write lock on the surface leaving the panel does
+
+Boot 29 (sweetzc=1 sweetfb_fit=1, CPU renderer): 8-14 swaps/s while swiping, each SwapEnd blocked
+until a frame took its CTL flush (avg 8.9 ms, max 17 ms), because CoreAnimation draws the next
+frame into the other of its two pool surfaces, which the pipe scans until then. The wait now sits
+where the danger is: IOSurfaceLock for writing on a pool surface (SweetSurface trapLock, after the
+0220 GPU wait) waits, at most 50 ms, for the frame that takes a pending flip away from that surface,
+and SwapEnd returns right after writing the flush. The flip is finished (surface it replaced let go,
+SMMU fault check, 50 ms limit) by the next flip, the write lock or the vsync tick; one flip is in
+flight at a time. This is only safe while CoreAnimation write-locks what it draws, so it is learnt:
+SwapEnd keeps waiting until 8 in-place swaps in a row named a surface write-locked since it was last
+shown, and once relied upon, a surface presented without such a lock (other than a re-show of the
+one on the panel) turns it off for good (GL composition draws without a lock: it never turns on).
+Failures restore ABL's registers as before and the tick copies the latest frame. No new memory:
+CoreAnimation makes two canvas surfaces and has no notion of them being busy, so a third pool slot
+would go unused (and cont_splash_region has no room for one beside ABL's frame). The 10 s line now
+shows swaps/s, frames in place (and how many SwapEnd did not wait for), the waits for a frame (at a
+write lock; avg/max) and the pool slots in use. sweetzc_async=0 keeps the 0251-0254 behaviour.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,7 +76,11 @@
+ static uint32_t sweet_fit_row[SWEET_FIT_MAX];  /* one scaled row, then one write to the panel */
+ /* Frame statistics, logged every 10 s while frames arrive ("SWEET FB: last 10 s ..."). */
+ static uint64_t sweet_fb_stat_swaps, sweet_fb_stat_copies, sweet_fb_stat_copy_abs, sweet_fb_stat_copy_max;
+-static uint64_t sweet_fb_stat_zc, sweet_fb_stat_zc_abs, sweet_fb_stat_zc_max;  /* 0251: frames scanned in place, latch wait */
++static uint64_t sweet_fb_stat_zc;               /* 0251: frames scanned in place */
++static uint64_t sweet_fb_stat_zcasync;          /* 0255: ... of which SwapEnd returned without waiting for the frame */
++/* 0255: waits for a frame to take a flush (zcLatch sleeping at all), of which at a write lock; their time */
++static uint64_t sweet_fb_stat_wait, sweet_fb_stat_lockwait, sweet_fb_stat_wait_abs, sweet_fb_stat_wait_max;
++static uint32_t sweet_scanout_slots_busy(void);
+ static uint64_t sweet_fb_stat_zcno;             /* 0253: swaps zcFlip did not scan in place */
+ static const char *sweet_fb_stat_zcwhy;         /* 0253: and the last reason */
+ /*
+@@ -156,12 +160,27 @@
+ 	const char   *fZcPath;        /* 0253: what zcFlip did with the last swap, for the swap trace */
+ 	uint32_t      fZcId;          /* 0253: the surface it looked at */
+ 	bool          fZcPool;        /* 0253: ... and whether that one lives in the scanout pool */
++	/*
++	 * 0255, SwapEnd without waiting for the frame: fZcPend is the surface the pipe was last
++	 * pointed at while no frame has taken that flush yet; fZcHeld (still on the panel until
++	 * then) is let go by the vsync tick, the next flip or a write lock on it once one has.
++	 * fZcAsync: 0 learning, 1 on, -1 off (sweetzc_async=0, or a draw the lock did not see).
++	 */
++	SweetSurface *fZcPend;
++	uint64_t      fZcPendT;       /* when its flush was written */
++	int           fZcAsync;
++	uint32_t      fZcStreak;      /* in-place swaps in a row whose surface was write-locked since last shown */
++	volatile bool fZcRedraw;      /* an async flip failed: the vsync tick copies the latest frame */
+ 	bool          zcArm(int mode);
+ 	bool          zcProgram(void);
+ 	bool          zcLatch(void);
+ 	bool          zcFlip(const uint8_t *rec);
+ 	void          zcStop(const char *why, bool forever, bool wait);
+ 	bool          zcTaken(void);
++	bool          zcFaulted(void);
++	const char   *zcSettle(bool wait);
++	bool          zcAsyncOk(SweetSurface *s, bool locked);
++	void          zcFail(const char *why, bool wait);
+ 	void          zcSay(const char *what, uint32_t id);
+ 	void          pauseConsole(void);
+ 
+@@ -616,11 +635,25 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	/* 0254: a restore issued without waiting (display off, sleep): release the surface once taken */
+-	if (fb->fMdpLock != NULL && sweet_mdp_away && !fb->fZcOn && IOLockTryLock(fb->fMdpLock)) {
+-		fb->zcStop("", false, false);
++	/*
++	 * 0254: a restore issued without waiting (display off, sleep): release the surface once taken.
++	 * 0255: likewise the surface an async flip replaced, once a frame has taken that flip.
++	 */
++	if (fb->fMdpLock != NULL && sweet_mdp_away && IOLockTryLock(fb->fMdpLock)) {
++		if (!fb->fZcOn) {
++			fb->zcStop("", false, false);
++		} else {
++			const char *fail = fb->zcSettle(false);
++			if (fail != NULL) {
++				fb->zcFail(fail, false);        /* never wait for a frame here */
++			}
++		}
+ 		IOLockUnlock(fb->fMdpLock);
+ 	}
++	if (fb->fZcRedraw) {
++		fb->fZcRedraw = false;
++		fb->fDirty = true;              /* 0255: an async flip failed: ABL's framebuffer gets the latest frame */
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -648,22 +681,26 @@
+ 	}
+ 	/* Every 600 vsync ticks (10 s): frames iOS submitted vs. frames copied to the panel. */
+ 	if ((count % 600) == 0 && (sweet_fb_stat_swaps != 0 || sweet_fb_stat_copies != 0)) {
+-		uint64_t avg_ns = 0, max_ns = 0, zavg_ns = 0, zmax_ns = 0;
++		uint64_t avg_ns = 0, max_ns = 0, wavg_ns = 0, wmax_ns = 0;
+ 		if (sweet_fb_stat_copies != 0) {
+ 			absolutetime_to_nanoseconds(sweet_fb_stat_copy_abs / sweet_fb_stat_copies, &avg_ns);
+ 		}
+ 		absolutetime_to_nanoseconds(sweet_fb_stat_copy_max, &max_ns);
+-		if (sweet_fb_stat_zc != 0) {
+-			absolutetime_to_nanoseconds(sweet_fb_stat_zc_abs / sweet_fb_stat_zc, &zavg_ns);
++		if (sweet_fb_stat_wait != 0) {
++			absolutetime_to_nanoseconds(sweet_fb_stat_wait_abs / sweet_fb_stat_wait, &wavg_ns);
+ 		}
+-		absolutetime_to_nanoseconds(sweet_fb_stat_zc_max, &zmax_ns);
+-		IOLog("SWEET FB: last 10 s: %llu swaps (%llu.%llu/s), %llu panel copies, copy avg %llu us max %llu us, "
+-		    "%llu in place (wait for the frame avg %llu us max %llu us), %llu not in place (last: %s)\n",
+-		    sweet_fb_stat_swaps, sweet_fb_stat_swaps / 10, sweet_fb_stat_swaps % 10, sweet_fb_stat_copies,
+-		    avg_ns / 1000, max_ns / 1000, sweet_fb_stat_zc, zavg_ns / 1000, zmax_ns / 1000,
++		absolutetime_to_nanoseconds(sweet_fb_stat_wait_max, &wmax_ns);
++		/* 0255: waits = zcLatch had to sleep (SwapEnd, a write lock, a restore); slots = scanout pool slots taken */
++		IOLog("SWEET FB: last 10 s: %llu swaps (%llu.%llu/s), %llu in place (%llu without waiting in SwapEnd), "
++		    "%llu waits for a frame (%llu at a write lock; avg %llu us max %llu us), pool slots in use %u/2, "
++		    "%llu panel copies (avg %llu us max %llu us), %llu not in place (last: %s)\n",
++		    sweet_fb_stat_swaps, sweet_fb_stat_swaps / 10, sweet_fb_stat_swaps % 10, sweet_fb_stat_zc,
++		    sweet_fb_stat_zcasync, sweet_fb_stat_wait, sweet_fb_stat_lockwait, wavg_ns / 1000, wmax_ns / 1000,
++		    sweet_scanout_slots_busy(), sweet_fb_stat_copies, avg_ns / 1000, max_ns / 1000,
+ 		    sweet_fb_stat_zcno, sweet_fb_stat_zcwhy != NULL ? sweet_fb_stat_zcwhy : "-");
+ 		sweet_fb_stat_swaps = sweet_fb_stat_copies = sweet_fb_stat_copy_abs = sweet_fb_stat_copy_max = 0;
+-		sweet_fb_stat_zc = sweet_fb_stat_zc_abs = sweet_fb_stat_zc_max = sweet_fb_stat_zcno = 0;
++		sweet_fb_stat_zc = sweet_fb_stat_zcasync = sweet_fb_stat_zcno = 0;
++		sweet_fb_stat_wait = sweet_fb_stat_lockwait = sweet_fb_stat_wait_abs = sweet_fb_stat_wait_max = 0;
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -957,6 +994,40 @@
+ 	}
+ }
+ 
++static uint32_t
++sweet_scanout_slots_busy(void)
++{
++	return (sweet_scanout_busy[0] != 0) + (sweet_scanout_busy[1] != 0);
++}
++
++static AppleCLCD *sweet_fb_zc;          /* 0255: the armed framebuffer, for sweet_scanout_lock */
++
++/*
++ * 0255: IOSurfaceLock for writing on a pool surface (SweetSurface.cpp trapLock, after the GPU
++ * wait). Notes the draw for zcAsyncOk, and while the surface is still on the panel with a flip
++ * away from it pending, waits (at most 50 ms) for the frame that takes that flip: CoreAnimation
++ * never draws into a surface the pipe still scans, without SwapEnd having to wait for it.
++ */
++void
++sweet_scanout_lock(SweetSurface *s)
++{
++	AppleCLCD *fb = sweet_fb_zc;
++	if (fb == NULL || s->scanoutPA == 0) {
++		return;
++	}
++	IOLockLock(fb->fMdpLock);
++	s->zcLocked = true;
++	if (fb->fZcOn && fb->fZcPend != NULL && s == fb->fZcHeld) {
++		uint64_t waits = sweet_fb_stat_wait;
++		const char *fail = fb->zcSettle(true);
++		sweet_fb_stat_lockwait += sweet_fb_stat_wait - waits;
++		if (fail != NULL) {
++			fb->zcFail(fail, true);         /* wait for the restore too: it is still on the panel */
++		}
++	}
++	IOLockUnlock(fb->fMdpLock);
++}
++
+ /* ABL's value of every register 0251 may write; address and stride last. */
+ static struct {
+ 	uint32_t n, ctl, flush;
+@@ -1077,17 +1148,23 @@
+ 		IOLog("SWEET FB: no root domain notices; restart relies on the halt hook alone\n");
+ 	}
+ 	fZc = mode;
++	int async = 1;                  /* 0255: sweetzc_async=0: SwapEnd always waits for the frame (0251-0254) */
++	PE_parse_boot_argn("sweetzc_async", &async, sizeof(async));
++	fZcAsync = async ? 0 : -1;
++	sweet_fb_zc = this;
+ 	sweet_scanout_pa[0] = fPhys + start;
+ 	sweet_scanout_pa[1] = fPhys + start + slot;
+ 	sweet_scanout_w = fLogicalW;
+ 	sweet_scanout_h = fLogicalH;
+ 	sweet_scanout_size = slot;      /* last: opens the pool */
+ 	IOLog("SWEET FB: in-place scanout armed (sweetzc=%d): SSPP %s via CTL%d %s, %s %ux%u->%dx%d at %d,%d; "
+-	    "pool 0x%llx 0x%llx (%u KB each) for %ux%u BGRA surfaces; MDP SMMU %s; %u ABL registers saved\n",
++	    "pool 0x%llx 0x%llx (%u KB each) for %ux%u BGRA surfaces; MDP SMMU %s; %u ABL registers saved; SwapEnd %s\n",
+ 	    mode, sweet_sspp[pipe].name, sweet_mdp.ctl, sweet_lm[sweet_mdp.lm].name, fFit ? "scaler" : "crop",
+ 	    fLogicalW, fLogicalH, fFit ? fFitW : (int32_t)fWidth, fFit ? fFitH : (int32_t)fHeight,
+ 	    fFit ? fFitX : fOffX, fFit ? fFitY : fOffY, sweet_scanout_pa[0], sweet_scanout_pa[1], slot / 1024,
+-	    fLogicalW, fLogicalH, sweet_mdp.smmu == 1 ? "bypass" : "TRANSLATES (forced)", sweet_mdp_boot.n);
++	    fLogicalW, fLogicalH, sweet_mdp.smmu == 1 ? "bypass" : "TRANSLATES (forced)", sweet_mdp_boot.n,
++	    async ? "waits for the frame until CoreAnimation is seen to write-lock what it presents" :
++	    "always waits for the frame (sweetzc_async=0)");
+ 	return true;
+ }
+ 
+@@ -1163,19 +1240,31 @@
+ {
+ 	vm_offset_t ctl = sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl);
+ 	uint32_t v = 0;
++	uint64_t t0 = mach_absolute_time();
++	bool taken = false;
+ 	for (uint32_t ms = 0; ms <= SWEET_ZC_LATCH_MS; ms++) {
+ 		v = sweet_rd(ctl, SWEET_CTL_FLUSH);
+ 		if ((v & fZcFlush) == 0) {
+-			return true;
++			if (ms == 0) {
++				return true;    /* 0255: taken already: not a wait */
++			}
++			taken = true;
++			break;
+ 		}
+ 		if (sweet_fb_paused) {
+-			return false;   /* 0254: shutdown or sleep began: the MDP may stop, do not wait for it */
++			break;          /* 0254: shutdown or sleep began: the MDP may stop, do not wait for it */
+ 		}
+ 		IOSleep(1);
+ 	}
+-	IOLog("SWEET FB: CTL%d flush still 0x%08x after %u ms (waiting for 0x%08x to clear)\n",
+-	    sweet_mdp.ctl, v, SWEET_ZC_LATCH_MS, fZcFlush);
+-	return false;
++	uint64_t dt = mach_absolute_time() - t0;        /* 0255: every wait counts in the 10 s line */
++	sweet_fb_stat_wait++;
++	sweet_fb_stat_wait_abs += dt;
++	sweet_fb_stat_wait_max = dt > sweet_fb_stat_wait_max ? dt : sweet_fb_stat_wait_max;
++	if (!taken && !sweet_fb_paused) {
++		IOLog("SWEET FB: CTL%d flush still 0x%08x after %u ms (waiting for 0x%08x to clear)\n",
++		    sweet_mdp.ctl, v, SWEET_ZC_LATCH_MS, fZcFlush);
++	}
++	return taken;
+ }
+ 
+ /* One line per kind of decision (the first time each comes up). */
+@@ -1201,6 +1290,90 @@
+ 	return (sweet_rd(sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl), SWEET_CTL_FLUSH) & fZcFlush) == 0;
+ }
+ 
++/* 0255 (from 0251's zcFlip): has an SMMU fault register changed since before the first flip? */
++bool
++AppleCLCD::zcFaulted(void)
++{
++	return (sweet_mdp.smmuGr0 && (sweet_rd(sweet_mdp.smmuGr0, 0x48) & ~fZcFsr[0])) ||
++	       (sweet_mdp.smmuCb[0] && (sweet_rd(sweet_mdp.smmuCb[0], 0x58) & ~fZcFsr[1])) ||
++	       (sweet_mdp.smmuCb[1] && (sweet_rd(sweet_mdp.smmuCb[1], 0x58) & ~fZcFsr[2]));
++}
++
++/*
++ * 0255: finish an async flip. Once a frame has taken the flush to fZcPend, fZcHeld (the surface
++ * it replaced) is off the panel and let go of. wait: up to 50 ms for that frame (a flip, a write
++ * lock); without (the vsync tick) one look. NULL: done, or nothing pending, or (no wait) still
++ * within 50 ms of the flush; else why the flip failed, as 0251's checks after its wait.
++ * fMdpLock held.
++ */
++const char *
++AppleCLCD::zcSettle(bool wait)
++{
++	if (fZcPend == NULL) {
++		return NULL;
++	}
++	if (!(wait ? zcLatch() : zcTaken())) {
++		uint64_t limit;
++		nanoseconds_to_absolutetime((uint64_t)SWEET_ZC_LATCH_MS * NSEC_PER_MSEC, &limit);
++		if (!wait && mach_absolute_time() - fZcPendT <= limit) {
++			return NULL;
++		}
++		return sweet_fb_paused ? "shutdown or sleep began during the flip" : "the flush was not taken by a frame within 50 ms";
++	}
++	if (zcFaulted()) {
++		return "an SMMU fault register changed after the flip";
++	}
++	SweetSurface *old = fZcHeld;
++	fZcHeld = fZcPend;
++	fZcPend = NULL;
++	OSSafeReleaseNULL(old);
++	return NULL;
++}
++
++/*
++ * 0255: may this SwapEnd return before a frame has taken its flip? CoreAnimation then draws the
++ * next frame at once, normally into the surface still on the panel; that is only safe because a
++ * write lock on it waits for the frame (sweet_scanout_lock). So: only once CoreAnimation has been
++ * seen to write-lock each surface before presenting it, 8 swaps in a row; and a surface presented
++ * without such a lock while that is relied upon (other than a re-show of the one on the panel)
++ * is a draw the lock did not see: SwapEnd waits again, for good. fMdpLock held.
++ */
++#define SWEET_ZC_ASYNC_AFTER    8
++
++bool
++AppleCLCD::zcAsyncOk(SweetSurface *s, bool locked)
++{
++	if (fZcAsync < 0) {
++		return false;
++	}
++	if (!locked) {
++		if (fZcAsync > 0 && s != fZcHeld) {
++			fZcAsync = -1;
++			IOLog("SWEET FB: SwapEnd waits for the frame again, for good: surface %u was presented without a write lock "
++			    "since it was last shown\n", s->id);
++		}
++		fZcStreak = 0;
++		return false;
++	}
++	if (fZcAsync == 0 && ++fZcStreak >= SWEET_ZC_ASYNC_AFTER) {
++		fZcAsync = 1;
++		IOLog("SWEET FB: SwapEnd no longer waits for the frame: CoreAnimation write-locked each of the last %u surfaces "
++		    "before presenting it; a write lock on the surface still on the panel waits instead (sweetzc_async=0: always wait)\n",
++		    SWEET_ZC_ASYNC_AFTER);
++	}
++	return fZcAsync > 0;
++}
++
++/* 0255: an async flip failed (vsync tick, write lock): as 0251's failed flip, the tick copies the frame. fMdpLock held. */
++void
++AppleCLCD::zcFail(const char *why, bool wait)
++{
++	zcStop(why, true, wait);
++	sweet_fb_stat_zcno++;
++	sweet_fb_stat_zcwhy = why;
++	fZcRedraw = true;
++}
++
+ /*
+  * Back to ABL's framebuffer; forever: the copy path from now on. fMdpLock held.
+  * wait: up to 50 ms for a frame to take the restore (SwapEnd only). 0254: without wait (display
+@@ -1219,8 +1392,9 @@
+ 		if (wait ? zcLatch() : zcTaken()) {
+ 			sweet_mdp_away = false;
+ 			OSSafeReleaseNULL(fZcHeld);
++			OSSafeReleaseNULL(fZcPend);     /* 0255: an async flip never taken */
+ 		} else if (wait) {
+-			forever = true;         /* fZcHeld may still be scanned: it stays held */
++			forever = true;         /* fZcHeld (and fZcPend) may still be scanned: they stay held */
+ 		}
+ 	}
+ 	if (forever && fZc) {
+@@ -1233,7 +1407,9 @@
+ /*
+  * SwapEnd: scan a lone whole-canvas pool surface in place and return once
+  * the MDP has taken it (so CoreAnimation never draws into the buffer on the
+- * panel). A frame that does not qualify while a surface is scanned is
++ * panel); 0255: or at once, while zcAsyncOk finds CoreAnimation write-locking
++ * what it draws (a write lock on the buffer leaving the panel waits for that
++ * frame instead). A frame that does not qualify while a surface is scanned is
+  * copied here and ABL's framebuffer shown again. false: the vsync timer
+  * copies the frame as before.
+  */
+@@ -1306,7 +1482,11 @@
+ 	vm_offset_t p = sweet_mdp.base + sweet_sspp[sweet_mdp.pipe].off;
+ 	uint32_t pa = (uint32_t)(s->scanoutPA + s->offset), stride = fZcStride1 | s->bytesPerRow;
+ 	bool first = !fZcOn;
+-	const char *fail = NULL;
++	bool locked = s->zcLocked;      /* 0255: drawn under a write lock since it was last shown? */
++	s->zcLocked = false;
++	/* 0255: one flip in flight: the one before must be taken (normally long since: no wait) */
++	const char *fail = first ? NULL : zcSettle(true);
++	bool async = fail == NULL && !first && zcAsyncOk(s, locked);
+ 	sweet_mdp_away = true;          /* 0253: from the first write on, a restore has work to do */
+ 	if (first && !zcProgram()) {
+ 		fail = "a geometry register did not read back";
+@@ -1326,14 +1506,12 @@
+ 	if (fail == NULL) {
+ 		sweet_wr(sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl), SWEET_CTL_FLUSH, fZcFlush);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		if (!zcLatch()) {
++		if (!async && !zcLatch()) {     /* 0255: async: zcSettle checks it later */
+ 			fail = "the flush was not taken by a frame within 50 ms";
+ 		}
+ 	}
+ 	uint64_t dt = mach_absolute_time() - t0;
+-	if (fail == NULL && ((sweet_mdp.smmuGr0 && (sweet_rd(sweet_mdp.smmuGr0, 0x48) & ~fZcFsr[0])) ||
+-	    (sweet_mdp.smmuCb[0] && (sweet_rd(sweet_mdp.smmuCb[0], 0x58) & ~fZcFsr[1])) ||
+-	    (sweet_mdp.smmuCb[1] && (sweet_rd(sweet_mdp.smmuCb[1], 0x58) & ~fZcFsr[2])))) {
++	if (fail == NULL && !async && zcFaulted()) {
+ 		fail = "an SMMU fault register changed after the flip";
+ 	}
+ 	if (fail != NULL) {
+@@ -1348,13 +1526,18 @@
+ 		s->release();
+ 		return !first;
+ 	}
+-	fZcPath = "in place";
++	fZcPath = async ? "in place (SwapEnd did not wait)" : "in place";
+ 	fZcOn = true;
+-	SweetSurface *old = fZcHeld;
+-	fZcHeld = s;            /* keeps sweet_surface_copy's reference until a later frame is latched */
++	SweetSurface *old = NULL;
++	if (async) {
++		fZcPend = s;    /* 0255: fZcHeld stays held until a frame takes this flip (zcSettle) */
++		fZcPendT = t0;
++		sweet_fb_stat_zcasync++;
++	} else {
++		old = fZcHeld;
++		fZcHeld = s;    /* keeps sweet_surface_copy's reference until a later frame is latched */
++	}
+ 	sweet_fb_stat_zc++;
+-	sweet_fb_stat_zc_abs += dt;
+-	sweet_fb_stat_zc_max = dt > sweet_fb_stat_zc_max ? dt : sweet_fb_stat_zc_max;
+ 	static uint32_t told;
+ 	if (first && told++ < 8) {
+ 		uint64_t ns = 0;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -46,6 +46,8 @@
+ 	uint32_t                  gpuFence;     /* last submission that used it */
+ 	/* 0251: pixels in the scanout pool (SweetFramebuffer.cpp), physical address; 0: elsewhere */
+ 	uint64_t                  scanoutPA;
++	/* 0255: write-locked since the display last showed it (sweet_scanout_lock; SweetFramebuffer.cpp fMdpLock) */
++	bool                      zcLocked;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE
+ 	{
+@@ -54,6 +56,7 @@
+ 		gpuDirty = false;
+ 		gpuFence = 0;
+ 		scanoutPA = 0;
++		zcLocked = false;
+ 		return OSObject::init();
+ 	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -76,6 +79,11 @@
+  */
+ uint64_t sweet_scanout_take(SweetSurface *s);
+ void sweet_scanout_give(uint64_t pa);
++/*
++ * 0255: IOSurfaceLock for writing on a pool surface: returns once the display no longer scans it
++ * (at most 50 ms), so SwapEnd need not wait for the frame that takes its flip.
++ */
++void sweet_scanout_lock(SweetSurface *s);
+ 
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1067,7 +1067,7 @@
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+@@ -1075,6 +1075,9 @@
+ 		return kIOReturnNotFound;
+ 	}
+ 	sweet_surface_gpu_settle(s);    /* 0220: a lock waits for the GPU's use of the surface, as on iOS */
++	if (s->scanoutPA != 0 && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		sweet_scanout_lock(s);  /* 0255: ... and a write lock for the display's (no lock held here) */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
