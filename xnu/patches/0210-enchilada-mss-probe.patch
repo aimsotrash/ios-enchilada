@@ -1,0 +1,427 @@
+enchilada: MSS: read-only modem/SMEM probe behind mss=1 (Wi-Fi bring-up, round 1)
+
+Wi-Fi on this phone needs the modem: wlanmdsp.mbn runs on the MSS DSP, and the WLFW QMI service
+only appears once the MPSS is up and talking GLINK/QRTR over SMEM. Before anything is written,
+bsd/dev/sweet_mss.c records what ABL leaves behind. With boot-arg mss=1 it prints the GCC MSS
+branch CBCRs (cfg_ahb, mfab_axis, axis2, snoc_axi, q6_memnoc_axi) and the 0x52004 vote bits (prng,
+gpll0_mss_div); compares the reserved regions of enchilada2.dtb (removed, smem, ipa_fw, wlan_msa
+0x8df00000, mpss 0x8e000000, mba 0x96600000, and mainline's rmtfs choice) with the kernel's RAM range
+without touching them; reads the SMEM header at 0x86000000 (SBL version word), the $TOC partition
+table in its last 4 KiB and the headers of the global and apps<->mpss partitions; and looks up items
+137 (socinfo), 421 (MSS crash reason), 428/435 (SMP2P out/in, decoded when present) and 478-480
+(GLINK descriptor/FIFOs). One line sums it up: "SWEET MSS: probe: smem v12, items + - ... (137 421
+428 435 478 479 480); mss clocks N/5 on; regions clear; N windows".
+Nothing is written. Every access goes through mss_rd(), which only allows SMEM and those six GCC
+registers, through one 64 KiB VM_PROT_READ window from kernel_map (io_map unmappable, unmapped before
+the next): a stray store faults in the kernel instead of reaching the bus, and io_submap is not
+used. SMEM partitions of other host pairs (MPU-protected) are never read, and partition walks stay
+below each partition's free mark. QDSP6SS, RMB, the TCSR halt registers, AOSS restart and the PDC
+sync register are NOT read: RMB/QDSP6SS sit in the MSS power domain, which nothing here can prove is
+powered. Without mss (or mss=0) the function returns before any print or mapping.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_mss.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_mss_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_gpu_probe();
+ 	sweet_usb_probe();
++	sweet_mss_probe();         /* boot-arg mss=1, read-only */
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_mss.c
+@@ -0,0 +1,375 @@
++/*
++ * Read-only modem (MSS) / SMEM probe for the OnePlus 6 (SDM845 "enchilada").
++ * Boot-arg mss=1; absent or 0 = nothing runs. PLAN-ENCHILADA.md §10 S1 / §9 step 2.
++ *
++ * What it touches, and nothing else (mss_rd() refuses any other address):
++ *   - SMEM (DDR, 0x86000000 + 2 MiB): the header, the partition table in its last 4 KiB, and only
++ *     the partitions that name the apps host (0) or the global host (0xfffe). SMEM is behind an
++ *     MPU (DT qcom,mpu-enabled); partitions of other host pairs are never read.
++ *   - GCC: the MSS branch CBCRs (0x8a000..0x8a154) and the branch vote register 0x52004, all
++ *     defined in Linux gcc-sdm845.c. GCC itself is always clocked (0x5200c/0x52000 are read
++ *     on every boot by touch and the GPU ladder).
++ * Not read, because nothing here can prove the block is powered and clocked: QDSP6SS
++ * (0x4080000), RMB (0x4180000, inside the MSS power domain, which is collapsed until a host
++ * boots the modem), the TCSR halt registers, AOSS restart, the PDC sync register.
++ * The reserved regions (mba, mpss, wlan msa, ...) are only compared with the kernel's RAM range.
++ *
++ * Every mapping is a <= 64 KiB read-only (VM_PROT_READ) window from kernel_map, unmapped before
++ * the next one: a stray store would fault in the kernel, never reach the bus, and io_submap (8 MiB,
++ * permanent) is not used at all. Each block is announced before it is read, so a hang names it.
++ *
++ * Addresses from dtb/boot_a_unpacked/enchilada2.dtb:
++ *   qcom,smem@86000000      reg = <0x86000000 0x200000 ...>, qcom,mpu-enabled
++ *   qcom,mss@4080000        qcom,pil-q6v55-mss, qcom,pil-self-auth (MBA/RMB, not PAS)
++ *   qcom,smp2p-modem        apss_shared 0x1799000c bit 14, SPI 451; items 428 (out) / 435 (in)
++ *   glink-smem-native-xprt-modem  bit 12 (mask 0x1000), SPI 449; items 478 / 479 / 480
++ *   reserved-memory         below (mss_regions[])
++ * SMEM layouts follow Linux drivers/soc/qcom/smem.c, smp2p.c and qcom_glink_smem.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/vm_prot.h>
++#include <pexpert/pexpert.h>
++
++/* osfmk/arm/machine_routines.h (MACH_KERNEL_PRIVATE): unmappable = from kernel_map, freeable */
++extern vm_offset_t io_map(uint64_t pa, vm_size_t size, unsigned int flags, vm_prot_t prot,
++    bool unmappable);
++extern void ml_io_unmap(vm_offset_t va, vm_size_t size);
++extern unsigned long gPhysBase, gPhysSize;
++void sweet_mss_probe(void);
++
++#define MSS_WIMG_IO     0x7u            /* VM_WIMG_IO, osfmk/arm/memory_types.h */
++#define MSS_WIN         0x10000u        /* 64 KiB */
++
++#define SMEM_PA         0x86000000ull
++#define SMEM_SIZE       0x200000u
++#define GCC_PA          0x00100000ull
++
++#define SMEM_SBL_VER_IDX        7       /* header version[7] >> 16 */
++#define SMEM_VER_HEAP           11
++#define SMEM_VER_PART           12
++#define SMEM_TOC_MAGIC          0x434f5424u     /* "$TOC" */
++#define SMEM_PRT_MAGIC          0x54525024u     /* "$PRT" */
++#define SMEM_INFO_MAGIC         0x49494953u     /* "SIII" */
++#define SMEM_CANARY             0xa5a5u
++#define SMEM_HOST_APPS          0
++#define SMEM_HOST_MODEM         1
++#define SMEM_HOST_GLOBAL        0xfffe
++#define SMP2P_MAGIC             0x504d5324u     /* "$SMP" */
++
++static vm_offset_t mss_win_va;
++static uint64_t mss_win_pa;
++static unsigned mss_maps;
++
++static bool
++mss_allowed(uint64_t pa)
++{
++	return (pa >= SMEM_PA && pa + 4 <= SMEM_PA + SMEM_SIZE) ||
++	       (pa >= GCC_PA + 0x8a000 && pa <= GCC_PA + 0x8a154) ||
++	       pa == GCC_PA + 0x52004;
++}
++
++/* One aligned 32-bit load through the current read-only window; false = not allowed/unmapped. */
++static bool
++mss_rd(uint64_t pa, uint32_t *v)
++{
++	uint64_t base = pa & ~(uint64_t)(MSS_WIN - 1);
++
++	*v = 0;
++	if ((pa & 3) || !mss_allowed(pa)) {
++		printf("SWEET MSS: refused read of %#llx\n", pa);
++		return false;
++	}
++	if (mss_win_va == 0 || base != mss_win_pa) {
++		if (mss_win_va) {
++			ml_io_unmap(mss_win_va, MSS_WIN);
++		}
++		mss_win_va = io_map(base, MSS_WIN, MSS_WIMG_IO, VM_PROT_READ, true);
++		mss_win_pa = base;
++		mss_maps++;
++		if (mss_win_va == 0) {
++			printf("SWEET MSS: cannot map %#llx\n", base);
++			return false;
++		}
++	}
++	*v = *(volatile uint32_t *)(mss_win_va + (vm_offset_t)(pa - base));
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return true;
++}
++
++static uint32_t
++smem32(uint32_t off)
++{
++	uint32_t v;
++
++	(void)mss_rd(SMEM_PA + off, &v);
++	return v;
++}
++
++/* --- GCC: are the MSS bus branches already on after ABL? --- */
++static const struct { const char *name; uint32_t off; } mss_cbcr[] = {
++	{ "cfg_ahb", 0x8a000 }, { "mfab_axis", 0x8a004 }, { "axis2", 0x8a008 },
++	{ "snoc_axi", 0x8a150 }, { "q6_memnoc_axi", 0x8a154 },
++};
++
++static unsigned
++mss_probe_gcc(void)
++{
++	unsigned on = 0;
++	uint32_t v;
++
++	printf("SWEET MSS: reading gcc mss branches\n");
++	for (unsigned i = 0; i < sizeof(mss_cbcr) / sizeof(mss_cbcr[0]); i++) {
++		(void)mss_rd(GCC_PA + mss_cbcr[i].off, &v);
++		printf("SWEET MSS: gcc %-13s +%#x = 0x%08x (%s)\n", mss_cbcr[i].name, mss_cbcr[i].off, v,
++		    (v & (1u << 31)) ? "off" : "on");
++		on += !(v & (1u << 31));
++	}
++	(void)mss_rd(GCC_PA + 0x52004, &v);
++	printf("SWEET MSS: gcc vote +0x52004 = 0x%08x (prng_ahb bit13 %u, gpll0_mss_div bit17 %u)\n",
++	    v, (v >> 13) & 1, (v >> 17) & 1);
++	return on;
++}
++
++/* --- reserved memory: never accessed, only checked against the kernel's RAM --- */
++static const struct { const char *name; uint64_t pa, size; } mss_regions[] = {
++	{ "removed", 0x85fc0000ull, 0x4b40000 },  /* holds smem and cmd-db; must stay reserved */
++	{ "smem", SMEM_PA, SMEM_SIZE },
++	{ "ipa_fw", 0x8c400000ull, 0x10000 },
++	{ "wlan_msa", 0x8df00000ull, 0x100000 },
++	{ "mpss", 0x8e000000ull, 0x7800000 },
++	{ "mba", 0x96600000ull, 0x200000 },
++	{ "rmtfs?", 0xf5b00000ull, 0x202000 },     /* mainline's choice; the vendor DT allocates it */
++};
++
++static unsigned
++mss_probe_regions(void)
++{
++	uint64_t lo = gPhysBase, hi = (uint64_t)gPhysBase + gPhysSize;
++	unsigned bad = 0;
++
++	for (unsigned i = 0; i < sizeof(mss_regions) / sizeof(mss_regions[0]); i++) {
++		uint64_t a = mss_regions[i].pa, b = a + mss_regions[i].size;
++		bool hit = a < hi && b > lo;
++
++		printf("SWEET MSS: region %-8s %#011llx-%#011llx %s\n", mss_regions[i].name, a, b,
++		    hit ? "OVERLAPS kernel RAM" : "outside kernel RAM");
++		bad += hit;
++	}
++	printf("SWEET MSS: kernel RAM %#llx-%#llx\n", lo, hi);
++	return bad;
++}
++
++/* --- SMEM --- */
++struct mss_part {
++	bool found;
++	uint32_t off, size;     /* from the ptable entry */
++};
++
++/* Walk a partition's uncached list for item; returns the item's offset in SMEM (0 = absent). */
++static uint32_t
++smem_part_find(const struct mss_part *p, uint16_t item, uint32_t *size)
++{
++	uint32_t free_unc = smem32(p->off + 12);
++	uint32_t e = p->off + 32;
++
++	*size = 0;
++	if (free_unc > p->size) {
++		return 0;
++	}
++	for (unsigned n = 0; e + 16 <= p->off + free_unc && n < 1024; n++) {
++		uint32_t w0 = smem32(e), sz = smem32(e + 4), pad = smem32(e + 8);
++
++		if ((w0 & 0xffff) != SMEM_CANARY) {
++			printf("SWEET MSS: partition %#x: bad canary at +%#x\n", p->off, e - p->off);
++			return 0;
++		}
++		/* every read stays inside this partition (the MPU guards the others) */
++		if (sz > p->size || e + 16 + (pad >> 16) + sz > p->off + free_unc) {
++			printf("SWEET MSS: partition %#x: entry at +%#x runs past the free mark\n", p->off,
++			    e - p->off);
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return e + 16 + (pad >> 16);
++		}
++		e += 16 + (pad >> 16) + sz;
++	}
++	return 0;
++}
++
++/* Legacy global heap (version 11): toc[item] = { allocated, offset, size, aux_base } at 0xd0. */
++static uint32_t
++smem_heap_find(uint16_t item, uint32_t *size)
++{
++	uint32_t t = 0xd0 + 16u * item;
++
++	*size = 0;
++	if (item >= 512 || !smem32(t)) {
++		return 0;
++	}
++	*size = smem32(t + 8);
++	return smem32(t + 4);
++}
++
++static uint32_t
++smem_find(int ver, const struct mss_part *p, uint16_t item, uint32_t *size)
++{
++	if (ver == SMEM_VER_HEAP) {
++		return smem_heap_find(item, size);
++	}
++	*size = 0;
++	return p->found ? smem_part_find(p, item, size) : 0;
++}
++
++static void
++smem_part_header(const char *what, struct mss_part *p)
++{
++	if (!p->found) {
++		printf("SWEET MSS: %s partition: none in the ptable\n", what);
++		return;
++	}
++	uint32_t magic = smem32(p->off), hosts = smem32(p->off + 4), size = smem32(p->off + 8);
++	uint32_t unc = smem32(p->off + 12), cac = smem32(p->off + 16);
++
++	printf("SWEET MSS: %s partition +%#x: magic %#x hosts %#x/%#x size %#x free_uncached %#x "
++	    "free_cached %#x%s\n", what, p->off, magic, hosts & 0xffff, hosts >> 16, size, unc, cac,
++	    cac < size ? " (cached entries present, not walked)" : "");
++	if (magic != SMEM_PRT_MAGIC || size != p->size) {
++		printf("SWEET MSS: %s partition header invalid, not walked\n", what);
++		p->found = false;
++	}
++}
++
++static void
++smem_item(int ver, const struct mss_part *p, uint16_t item, const char *name, char *sum, size_t n)
++{
++	uint32_t size, off = smem_find(ver, p, item, &size);
++
++	if (off == 0 || off + size > SMEM_SIZE) {
++		printf("SWEET MSS: item %u (%s): absent\n", item, name);
++		strlcat(sum, " -", n);
++		return;
++	}
++	printf("SWEET MSS: item %u (%s): +%#x, %u bytes\n", item, name, off, size);
++	strlcat(sum, " +", n);
++	if ((item == 435 || item == 428) && size >= 24) {
++		/* smp2p_smem_item: magic, version|features<<8, local|remote pid, total|valid, flags */
++		uint32_t v = smem32(off + 4), pids = smem32(off + 8), ent = smem32(off + 12);
++		unsigned valid = ent >> 16;
++
++		printf("SWEET MSS:   smp2p magic %#x version %u features %#x pid %u->%u entries %u/%u "
++		    "flags %#x\n", smem32(off), v & 0xff, v >> 8, pids & 0xffff, pids >> 16, valid,
++		    ent & 0xffff, smem32(off + 16));
++		for (unsigned i = 0; i < valid && i < 16 && 20 + 20 * (i + 1) <= size; i++) {
++			uint32_t e = off + 20 + 20 * i;
++			char nm[17];
++
++			for (unsigned k = 0; k < 16; k += 4) {
++				uint32_t w = smem32(e + k);
++				for (unsigned b = 0; b < 4; b++) {
++					char c = (char)(w >> (8 * b));
++					nm[k + b] = (c >= 0x20 && c < 0x7f) ? c : (c ? '?' : '\0');
++				}
++			}
++			nm[16] = '\0';
++			printf("SWEET MSS:   smp2p entry %u \"%s\" = %#x\n", i, nm, smem32(e + 16));
++		}
++	} else if (item == 478 && size >= 16) {
++		printf("SWEET MSS:   glink desc apps tx tail %#x head %#x, rx tail %#x head %#x\n",
++		    smem32(off), smem32(off + 4), smem32(off + 8), smem32(off + 12));
++	} else if (item == 137 && size >= 8) {
++		uint32_t fmt = smem32(off);
++		printf("SWEET MSS:   socinfo format %u.%u soc id %u\n", fmt >> 16, fmt & 0xffff,
++		    smem32(off + 4));
++	}
++}
++
++static const char *
++mss_probe_smem(char *sum, size_t n)
++{
++	struct mss_part glob = { false, 0, 0 }, apm = { false, 0, 0 };
++
++	printf("SWEET MSS: reading smem header at %#llx\n", SMEM_PA);
++	uint32_t raw = smem32(0x40 + 4 * SMEM_SBL_VER_IDX);
++	int ver = (int)(raw >> 16);
++	printf("SWEET MSS: smem sbl version word %#x (major %d), heap initialized %u free %#x avail %#x\n",
++	    raw, ver, smem32(0xc0), smem32(0xc4), smem32(0xc8));
++
++	if (ver == SMEM_VER_PART) {
++		uint32_t pt = SMEM_SIZE - 0x1000;
++
++		printf("SWEET MSS: reading smem ptable at +%#x\n", pt);
++		uint32_t magic = smem32(pt), pver = smem32(pt + 4), num = smem32(pt + 8);
++		printf("SWEET MSS: ptable magic %#x version %u entries %u\n", magic, pver, num);
++		if (magic != SMEM_TOC_MAGIC || pver != 1 || num > (0x1000 - 32) / 48) {
++			return "ptable invalid";
++		}
++		for (uint32_t i = 0; i < num; i++) {
++			uint32_t e = pt + 32 + 48 * i;
++			uint32_t off = smem32(e), size = smem32(e + 4), flags = smem32(e + 8);
++			uint32_t hosts = smem32(e + 12), cl = smem32(e + 16);
++			unsigned h0 = hosts & 0xffff, h1 = hosts >> 16;
++
++			if (size == 0 || off == 0) {
++				continue;
++			}
++			printf("SWEET MSS: part %u: +%#x size %#x hosts %#x/%#x flags %#x cacheline %#x\n",
++			    i, off, size, h0, h1, flags, cl);
++			if ((uint64_t)off + size > SMEM_SIZE) {
++				continue;
++			}
++			if (h0 == SMEM_HOST_GLOBAL && h1 == SMEM_HOST_GLOBAL) {
++				glob = (struct mss_part){ true, off, size };
++			} else if ((h0 == SMEM_HOST_APPS && h1 == SMEM_HOST_MODEM) ||
++			    (h1 == SMEM_HOST_APPS && h0 == SMEM_HOST_MODEM)) {
++				apm = (struct mss_part){ true, off, size };
++			}
++		}
++		uint32_t info = pt + 32 + 48 * num;
++		if (smem32(info) == SMEM_INFO_MAGIC) {
++			printf("SWEET MSS: smem info size %#x base %#x items %u\n", smem32(info + 4),
++			    smem32(info + 8), smem32(info + 16) & 0xffff);
++		}
++		smem_part_header("global", &glob);
++		smem_part_header("apps-mpss", &apm);
++	} else if (ver != SMEM_VER_HEAP) {
++		return "header invalid";
++	}
++
++	snprintf(sum, n, "smem v%d, items", ver);
++	smem_item(ver, &glob, 137, "socinfo", sum, n);
++	smem_item(ver, &glob, 421, "mss crash reason", sum, n);
++	smem_item(ver, &apm, 428, "smp2p apps->mpss", sum, n);
++	smem_item(ver, &apm, 435, "smp2p mpss->apps", sum, n);
++	smem_item(ver, &apm, 478, "glink desc", sum, n);
++	smem_item(ver, &apm, 479, "glink apps fifo", sum, n);
++	smem_item(ver, &apm, 480, "glink mpss fifo", sum, n);
++	strlcat(sum, " (137 421 428 435 478 479 480)", n);
++	return NULL;
++}
++
++void
++sweet_mss_probe(void)
++{
++	int mode = 0;
++	char sum[96] = "";
++
++	if (!PE_parse_boot_argn("mss", &mode, sizeof(mode)) || mode == 0) {
++		return;
++	}
++	printf("SWEET MSS: read-only probe (mss=%d); qdsp6ss/rmb/tcsr halt not read (power not provable)\n",
++	    mode);
++	unsigned clk_on = mss_probe_gcc();
++	unsigned overlap = mss_probe_regions();
++	const char *err = mss_probe_smem(sum, sizeof(sum));
++	if (mss_win_va) {
++		ml_io_unmap(mss_win_va, MSS_WIN);
++		mss_win_va = 0;
++	}
++	printf("SWEET MSS: probe: %s; mss clocks %u/5 on; regions %s; %u windows\n",
++	    err ? err : sum, clk_on, overlap ? "OVERLAP" : "clear", mss_maps);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
