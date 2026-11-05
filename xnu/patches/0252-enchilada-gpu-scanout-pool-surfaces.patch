@@ -1,0 +1,26 @@
+enchilada: GPU: scanout-pool surfaces are drawn by the GPU in place
+
+0220 only lets SURFACE_BO use cacheable IOBufferMemoryDescriptor surfaces in place. A 0251 pool
+surface is the same kind of memory for the GPU and the kernel (wired, copyback, kernel alias from
+kernelAddress, cleaned by surfFlush), only a withPhysicalAddress descriptor in the splash
+carve-out, so it is taken too; otherwise GL composition would fall back to its copy for exactly
+the surfaces the display scans in place. Drop this patch to bisect GL problems from 0251.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -995,10 +995,13 @@
+ 	 * CoreAnimation draws the display into) gets it by kernel address (surfFlush) and is mapped as
+ 	 * it is. Client memory (a wrapped task range) and planar ones are still refused, and with
+ 	 * glzc0=1 every cacheable one: the client copies. Uncached ones (the panel) need nothing.
+-	 * One line for each kind, the first time.
++	 * One line for each kind, the first time. 0252: a 0251 scanout-pool surface is the same kind
++	 * of memory (wired, copyback, kernel alias by kernelAddress), only physically in the splash
++	 * carve-out, so it is used in place too.
+ 	 */
+ 	bool zc = s->mapCache != kIOMapWriteCombineCache && surfZc() && !s->wrapped &&
+-	    OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL && s->planeCount == 0 && s->elementHeight == 1;
++	    (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL || s->scanoutPA != 0) &&
++	    s->planeCount == 0 && s->elementHeight == 1;
+ 	{
+ 		static bool told[4];
+ 		int kind = s->mapCache == kIOMapWriteCombineCache ? 0 : zc ? 1 : !surfZc() ? 2 : 3;

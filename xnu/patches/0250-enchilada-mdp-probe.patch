@@ -1,0 +1,278 @@
+enchilada: display: read-only probe of ABL's MDP pipeline and the MDP's SMMU streams
+
+The port never programs the display: ABL leaves the command-mode panel refreshed from its splash
+framebuffer and AppleCLCD copies (and with sweetfb_fit scales) every frame into it, ~9.6 ms a
+frame. Scanning IOSurfaces in place needs facts no log has yet, so at AppleCLCD start (SDM845
+OnePlus only: splash at 0x9d400000; sweetmdp=0 skips it) the kernel reads, and writes nothing:
+all eight source pipes (SRC0_ADDR, stride, sizes, format, op mode; the one fetching the splash is
+marked, with its QSEED3 version when it is a VIG pipe), every CTL/layer-mixer staging (which CTL
+and LM carry that pipe, command or video mode, flush), the LM border colour, the four PINGPONGs
+(tear check, autorefresh, TE counted over 100 ms) and INTF1 (timing engine, frames in 100 ms),
+the dispcc MDP clock RCG, and how apps_smmu routes the MDP streams 0x880/0xc80 (SMRs, S2CR,
+context bank SCTLR/FSR, sGFSR). Offsets are Linux dpu_4_0_sdm845.h's catalog plus 0x1000 (the
+MDSS base). A last line gives the verdict 0251 acts on.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,8 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -170,6 +172,240 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * 0250: what ABL left the display running on. READ ONLY: nothing below
++ * writes a register. SDM845 MDSS at 0x0ae00000; the offsets are from that
++ * base (Linux dpu_4_0_sdm845.h numbers its blocks from the MDP at +0x1000,
++ * so every catalog base appears here +0x1000). One boot answers: which
++ * source pipe fetches the splash framebuffer (and so whether it has the
++ * QSEED3 scaler), which CTL and layer mixer stage it, how the panel is kept
++ * refreshed (PINGPONG tear check / autorefresh for this command-mode panel,
++ * INTF1's timing engine for video mode), the MDP clock and how the apps
++ * SMMU treats the MDP's streams (sdm845.dtsi mdss iommus 0x880, 0xc80).
++ * Boot-arg sweetmdp=0 skips it (and with it 0251's in-place scanout).
++ */
++#define SWEET_MDSS_PA           0x0ae00000u
++#define SWEET_MDSS_MAP          0x74000u        /* through PINGPONG_3 */
++#define SWEET_SPLASH_PA         0x9d400000u     /* cont_splash_region of the 6 and 6T: an SDM845 phone */
++#define SWEET_CTL(i)            (0x2000u + 0x200u * (i))
++#define SWEET_CTL_TOP           0x14u
++#define SWEET_CTL_FLUSH         0x18u
++#define SWEET_CTL_FLUSH_CTL     (1u << 17)
++#define SWEET_PP(i)             (0x71000u + 0x800u * (i))
++#define SWEET_INTF1             0x6b800u
++#define SSPP_SRC_SIZE           0x00u
++#define SSPP_SRC_IMG_SIZE       0x04u
++#define SSPP_SRC_XY             0x08u
++#define SSPP_OUT_SIZE           0x0cu
++#define SSPP_OUT_XY             0x10u
++#define SSPP_SRC0_ADDR          0x14u
++#define SSPP_SRC_YSTRIDE0       0x24u
++#define SSPP_SRC_FORMAT         0x30u
++#define SSPP_SRC_UNPACK         0x34u
++#define SSPP_SRC_OP_MODE        0x38u
++#define SSPP_QSEED3             0xa00u          /* VIG only: HW_VERSION +0, OP_MODE +4 */
++#define SWEET_LM_BORDER0        0x08u
++#define SWEET_LM_BORDER1        0x10u
++#define SWEET_LM_BORDER_OUT     (1u << 24)      /* CTL_LAYER: mixer border colour where no pipe is */
++
++/* Source pipes: offset, CTL_FLUSH bit, where CTL_LAYER stages them (Linux dpu_hw_ctl.c ctl_blend_config). */
++static const struct {
++	const char *name;
++	uint32_t    off, flush;
++	uint8_t     reg, shift, bits, ext;  /* reg 0: CTL_LAYER (+1 bit in CTL_LAYER_EXT at ext), 2: CTL_LAYER_EXT2 */
++	bool        vig;
++} sweet_sspp[] = {
++	{ "VIG0", 0x05000, 1u << 0, 0, 0, 3, 0, true },
++	{ "VIG1", 0x07000, 1u << 1, 0, 3, 3, 2, true },
++	{ "VIG2", 0x09000, 1u << 2, 0, 6, 3, 4, true },
++	{ "VIG3", 0x0b000, 1u << 18, 0, 26, 3, 6, true },
++	{ "DMA0", 0x25000, 1u << 11, 0, 18, 3, 16, false },
++	{ "DMA1", 0x27000, 1u << 12, 0, 21, 3, 18, false },
++	{ "DMA2", 0x29000, 1u << 24, 2, 0, 4, 0, false },
++	{ "DMA3", 0x2b000, 1u << 25, 2, 4, 4, 0, false },
++};
++/* Layer mixers: offset, index (CTL_LAYER(n)/EXT/EXT2 slot), CTL_FLUSH bit, PINGPONG fed. */
++static const struct {
++	const char *name;
++	uint32_t    off, idx, flush, pp;
++} sweet_lm[] = {
++	{ "LM0", 0x45000, 0, 1u << 6, 0 },
++	{ "LM1", 0x46000, 1, 1u << 7, 1 },
++	{ "LM2", 0x47000, 2, 1u << 8, 2 },
++	{ "LM5", 0x4a000, 5, 1u << 20, 3 },
++};
++
++static struct {
++	vm_offset_t base;               /* MDSS mapping, 0: not probed */
++	int         pipe, ctl, lm;      /* indices into the tables above, -1: not found */
++	uint32_t    qseed;              /* QSEED3 HW_VERSION of a VIG boot pipe, else 0 */
++	uint32_t    layer;              /* CTL_LAYER(lm) of the boot pipe's CTL */
++	uint32_t    frames;             /* panel frames counted in 100 ms (PINGPONG or INTF1) */
++	int         smmu;               /* worst MDP stream: 1 bypass, 2 translate, 3 fault, -1 unreadable */
++	vm_offset_t smmuGr0;            /* apps SMMU global space */
++	vm_offset_t smmuCb[2];          /* context bank of stream 0x880 / 0xc80 when it translates */
++} sweet_mdp = { 0, -1, -1, -1, 0, 0, 0, -1, 0, { 0, 0 } };
++
++static inline uint32_t
++sweet_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++#define SWEET_SMMU_PA           0x15000000u     /* apps_smmu */
++
++/*
++ * How apps_smmu routes stream sid: every SMR that matches it under its mask,
++ * the S2CR it selects and, for a translating one, the context bank. Returns
++ * 1 bypass (S2CR bypass, or a bank with SCTLR.M = 0: addresses pass through,
++ * Linux's sdm845 bypass quirk and our 0193), 2 translate, 3 fault.
++ */
++static int
++sweet_mdp_smmu_sid(uint32_t sid, vm_offset_t *cbOut)
++{
++	vm_offset_t g = sweet_mdp.smmuGr0;
++	uint32_t idr0 = sweet_rd(g, 0x20), idr1 = sweet_rd(g, 0x24), scr0 = sweet_rd(g, 0x0);
++	uint32_t pgshift = (idr1 >> 31) ? 16 : 12, numpage = 1u << (((idr1 >> 28) & 7) + 1);
++	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	int verdict = 0;
++
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = sweet_rd(g, 0x800 + 4 * i);
++		if (!(smr >> 31) || ((smr ^ sid) & ~(smr >> 16) & 0x7fff) != 0) {
++			continue;
++		}
++		uint32_t s2cr = sweet_rd(g, 0xc00 + 4 * i), type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		int v = type == 1 ? 1 : type == 0 ? 2 : 3;
++		uint32_t cbar = 0, sctlr = 0, fsr = 0;
++		if (type == 0 && cb < ncb && pgshift == 12) {
++			cbar = sweet_rd(g, 0x1000 + 4 * cb);
++			uint64_t pa = SWEET_SMMU_PA + ((uint64_t)(numpage + cb) << 12);
++			vm_offset_t c = ml_io_map((vm_offset_t)pa, 0x1000);
++			if (c != 0) {
++				sctlr = sweet_rd(c, 0x0);
++				fsr = sweet_rd(c, 0x58);
++				v = (sctlr & 1) ? 2 : 1;
++				*cbOut = c;
++			}
++		}
++		IOLog("SWEET MDP: SMMU sid 0x%x: SMR%u 0x%08x S2CR 0x%08x (%s, cb %u) CBAR 0x%08x SCTLR 0x%08x FSR 0x%08x\n",
++		    sid, i, smr, s2cr, type == 1 ? "bypass" : type == 0 ? "translate" : "fault", cb, cbar, sctlr, fsr);
++		verdict = v > verdict ? v : verdict;
++	}
++	if (verdict == 0) {
++		verdict = ((scr0 >> 10) & 1) ? 3 : 1;
++		IOLog("SWEET MDP: SMMU sid 0x%x: no SMR; sCR0 0x%08x sends unmatched streams to %s\n", sid, scr0,
++		    verdict == 3 ? "a fault" : "bypass");
++	}
++	return verdict;
++}
++
++static void
++sweet_mdp_probe(uint64_t fbPhys)
++{
++	vm_offset_t m = ml_io_map(SWEET_MDSS_PA, SWEET_MDSS_MAP);
++	if (m == 0) {
++		IOLog("SWEET MDP: cannot map the MDSS\n");
++		return;
++	}
++	sweet_mdp.base = m;
++	for (uint32_t i = 0; i < sizeof(sweet_sspp) / sizeof(sweet_sspp[0]); i++) {
++		vm_offset_t p = m + sweet_sspp[i].off;
++		uint32_t src = sweet_rd(p, SSPP_SRC0_ADDR);
++		bool boot = src != 0 && src == (uint32_t)fbPhys;
++		IOLog("SWEET MDP: %s src0 0x%08x stride 0x%08x size 0x%08x img 0x%08x xy 0x%08x out 0x%08x outxy 0x%08x "
++		    "fmt 0x%08x unpack 0x%08x op 0x%08x%s\n", sweet_sspp[i].name, src, sweet_rd(p, SSPP_SRC_YSTRIDE0),
++		    sweet_rd(p, SSPP_SRC_SIZE), sweet_rd(p, SSPP_SRC_IMG_SIZE), sweet_rd(p, SSPP_SRC_XY),
++		    sweet_rd(p, SSPP_OUT_SIZE), sweet_rd(p, SSPP_OUT_XY), sweet_rd(p, SSPP_SRC_FORMAT),
++		    sweet_rd(p, SSPP_SRC_UNPACK), sweet_rd(p, SSPP_SRC_OP_MODE), boot ? "  <- splash framebuffer" : "");
++		if (boot && sweet_mdp.pipe < 0) {
++			sweet_mdp.pipe = (int)i;
++			if (sweet_sspp[i].vig) {
++				sweet_mdp.qseed = sweet_rd(p, SSPP_QSEED3);
++				IOLog("SWEET MDP: %s QSEED3 version 0x%08x op 0x%08x, pixel ext c0 0x%08x 0x%08x 0x%08x\n",
++				    sweet_sspp[i].name, sweet_mdp.qseed, sweet_rd(p, SSPP_QSEED3 + 4),
++				    sweet_rd(p, 0x100), sweet_rd(p, 0x104), sweet_rd(p, 0x108));
++			}
++		}
++	}
++	for (uint32_t c = 0; c < 5; c++) {
++		vm_offset_t ctl = m + SWEET_CTL(c);
++		uint32_t top = sweet_rd(ctl, SWEET_CTL_TOP);
++		for (uint32_t l = 0; l < sizeof(sweet_lm) / sizeof(sweet_lm[0]); l++) {
++			uint32_t idx = sweet_lm[l].idx;
++			uint32_t layer = sweet_rd(ctl, idx == 5 ? 0x24 : 4 * idx);
++			uint32_t ext = sweet_rd(ctl, 0x40 + 4 * idx), ext2 = sweet_rd(ctl, 0x70 + 4 * idx);
++			if (layer == 0 && ext == 0 && ext2 == 0) {
++				continue;
++			}
++			bool ours = false;
++			if (sweet_mdp.pipe >= 0) {
++				const auto &sp = sweet_sspp[sweet_mdp.pipe];
++				uint32_t mask = (1u << sp.bits) - 1;
++				ours = sp.reg == 0 ? (((layer >> sp.shift) & mask) != 0 || ((ext >> sp.ext) & 1) != 0) :
++				    ((ext2 >> sp.shift) & mask) != 0;
++			}
++			IOLog("SWEET MDP: CTL%u %s layer 0x%08x ext 0x%08x ext2 0x%08x top 0x%08x (%s mode, intf %u) flush 0x%08x%s\n",
++			    c, sweet_lm[l].name, layer, ext, ext2, top, (top >> 17) & 1 ? "command" : "video", (top >> 4) & 0xf,
++			    sweet_rd(ctl, SWEET_CTL_FLUSH), ours ? "  <- stages the splash pipe" : "");
++			if (ours && sweet_mdp.ctl < 0) {
++				sweet_mdp.ctl = (int)c;
++				sweet_mdp.lm = (int)l;
++				sweet_mdp.layer = layer;
++			}
++		}
++	}
++	if (sweet_mdp.lm >= 0) {
++		vm_offset_t lm = m + sweet_lm[sweet_mdp.lm].off;
++		IOLog("SWEET MDP: %s op 0x%08x out 0x%08x border 0x%08x 0x%08x\n", sweet_lm[sweet_mdp.lm].name,
++		    sweet_rd(lm, 0x0), sweet_rd(lm, 0x4), sweet_rd(lm, SWEET_LM_BORDER0), sweet_rd(lm, SWEET_LM_BORDER1));
++	}
++	/* PINGPONG INT_COUNT_VAL [31:16] counts TE read pointers; INTF1 FRAME_COUNT video frames. */
++	uint32_t pp0[4], intf0 = sweet_rd(m + SWEET_INTF1, 0xac);
++	for (uint32_t i = 0; i < 4; i++) {
++		pp0[i] = sweet_rd(m + SWEET_PP(i), 0x14) >> 16;
++	}
++	IOSleep(100);
++	for (uint32_t i = 0; i < 4; i++) {
++		vm_offset_t pp = m + SWEET_PP(i);
++		uint32_t n = ((sweet_rd(pp, 0x14) >> 16) - pp0[i]) & 0xffff, ar = sweet_rd(pp, 0x30);
++		IOLog("SWEET MDP: PP%u tear check %u vsync 0x%08x height 0x%08x init 0x%08x start 0x%08x autorefresh 0x%08x "
++		    "(%s, every %u TE) wr line %u, %u TE in 100 ms\n", i, sweet_rd(pp, 0x0) & 1, sweet_rd(pp, 0x4),
++		    sweet_rd(pp, 0x8), sweet_rd(pp, 0x10), sweet_rd(pp, 0x1c), ar, (ar >> 31) ? "on" : "off", ar & 0xffff,
++		    sweet_rd(pp, 0x2c) & 0xffff, n);
++		if (sweet_mdp.lm >= 0 && sweet_lm[sweet_mdp.lm].pp == i) {
++			sweet_mdp.frames = n;
++		}
++	}
++	uint32_t vf = sweet_rd(m + SWEET_INTF1, 0xac) - intf0;
++	IOLog("SWEET MDP: INTF1 timing engine %u config 0x%08x frame count en %u, %u frames in 100 ms\n",
++	    sweet_rd(m + SWEET_INTF1, 0x0) & 1, sweet_rd(m + SWEET_INTF1, 0x4), sweet_rd(m + SWEET_INTF1, 0xa8) & 1, vf);
++	sweet_mdp.frames = vf > sweet_mdp.frames ? vf : sweet_mdp.frames;
++	vm_offset_t dcc = ml_io_map(0x0af02000u, 0x1000);       /* disp_cc_mdss_mdp_clk_src RCG at dispcc +0x2088 */
++	if (dcc != 0) {
++		IOLog("SWEET MDP: dispcc mdp RCG cmd 0x%08x cfg 0x%08x (src %u, div %u) m 0x%08x n 0x%08x\n",
++		    sweet_rd(dcc, 0x88), sweet_rd(dcc, 0x8c), (sweet_rd(dcc, 0x8c) >> 8) & 7, sweet_rd(dcc, 0x8c) & 0x1f,
++		    sweet_rd(dcc, 0x90), sweet_rd(dcc, 0x94));
++	}
++	sweet_mdp.smmuGr0 = ml_io_map(SWEET_SMMU_PA, 0x2000);
++	if (sweet_mdp.smmuGr0 != 0) {
++		int a = sweet_mdp_smmu_sid(0x880, &sweet_mdp.smmuCb[0]);
++		int b = sweet_mdp_smmu_sid(0xc80, &sweet_mdp.smmuCb[1]);
++		sweet_mdp.smmu = a > b ? a : b;
++		IOLog("SWEET MDP: SMMU sGFSR 0x%08x\n", sweet_rd(sweet_mdp.smmuGr0, 0x48));
++	}
++	const char *fitWhy = sweet_mdp.pipe < 0 ? "no pipe" : !sweet_sspp[sweet_mdp.pipe].vig ? "DMA pipe has no scaler" :
++	    (sweet_mdp.qseed != 0x1002 && sweet_mdp.qseed != 0x1003) ? "QSEED3 version not handled" :
++	    !(sweet_mdp.layer & SWEET_LM_BORDER_OUT) ? "mixer border not enabled" : "yes";
++	IOLog("SWEET MDP: verdict: splash pipe %s on CTL%d %s, %u frames in 100 ms, MDP SMMU %s -> in-place scanout %s, with scaling (sweetfb_fit) %s\n",
++	    sweet_mdp.pipe >= 0 ? sweet_sspp[sweet_mdp.pipe].name : "NOT FOUND", sweet_mdp.ctl,
++	    sweet_mdp.lm >= 0 ? sweet_lm[sweet_mdp.lm].name : "LM?", sweet_mdp.frames,
++	    sweet_mdp.smmu == 1 ? "bypass" : sweet_mdp.smmu == 2 ? "translates" : sweet_mdp.smmu == 3 ? "faults" : "unreadable",
++	    sweet_mdp.pipe >= 0 && sweet_mdp.ctl >= 0 && sweet_mdp.smmu == 1 ? "possible" : "not possible", fitWhy);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -240,6 +476,11 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	int mdp = 1;
++	PE_parse_boot_argn("sweetmdp", &mdp, sizeof(mdp));
++	if (mdp && fPhys == SWEET_SPLASH_PA) {
++		sweet_mdp_probe(fPhys);         /* 0250, read only */
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
