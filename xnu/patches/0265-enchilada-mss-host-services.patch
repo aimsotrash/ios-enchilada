@@ -1,0 +1,976 @@
+enchilada: MSS stage 7 (mss=7): pd-mapper, TFTP and read-only rmtfs for the modem
+
+mss=7 = mss=6 plus the three linux-msm host services, announced to the modem's name service once
+stage 6 is up (and again after each HELLO, as ns.c announce_servers): servreg-locator 0x40 v0x101
+(pd-mapper.c GET_DOMAIN_LIST from modem_a's modemr.jsn and modemuw.jsn: tms/servreg, kernel/
+elf_loader and wlan/fw -> msm/modem/root_pd or wlan_pd, instance 180; PFR only logged); TFTP
+0x1000 v1 (tqftpserv.c: per-session ports, OACK, blksize/timeoutms/tsize/rsize/wsize/seek, the
+rsize windows of handle_reader; /readonly/... read from modem_a through mss_tftp[], 141 files made
+by tools/mss-fw-table.py --tftp from the same image as mss_fw[]; /readwrite/... kept in RAM for
+the boot); rmtfs 0x0e v1 (rmtfs.c open/close/iovec/alloc/dev_error) serving modemst1, modemst2,
+fsc and fsg (UFS LUN 5) from a RAM copy made in stage 2, before the modem gets anything; writes
+are logged and dropped, no partition is ever written. The shared buffer is mainline
+sdm845-oneplus-common.dtsi rmtfs_mem (0xf5b01000, 2 MiB, guard pages either side): assigned to
+{HLOS, MSS_MSA} with the 0262 SCM assign when stage 7 starts, as qcom_rmtfs_mem does, written only
+through short-lived Device mappings, reclaimed by the stop path once the Q6 is in reset. Any
+failure ends in the stop path; mss<=6 behave as before.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -38,6 +38,8 @@
+  * 0264:
+  *   6  GLINK over SMEM (items 478/479/480, doorbell bit 12), IPCRTR channel, QRTR hello; every
+  *      NEW_SERVER of the modem logged; the modem's IPA clock query answered; 120 s watch
++ * 0265:
++ *   7  + pd-mapper, TFTP (modem_a, read-only) and rmtfs (EFS from a RAM copy, writes dropped)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -434,6 +436,8 @@
+ #define MBA_SIZE        0x200000u
+ #define MPSS_PA         0x8e000000ull
+ #define MPSS_SIZE       0x7800000u
++#define RMTFS_PA        0xf5b01000ull   /* 0265: sdm845-oneplus-common.dtsi rmtfs_mem, guards around */
++#define RMTFS_SIZE      0x200000u
+ #define SCR_PA          0xa1000000ull   /* plain RAM in sdm845.dtsi's mdata alloc-ranges */
+ #define SCR_SIZE        0x80000u        /* = one big window; only the first 16 KiB are used */
+ #define META_PA         (SCR_PA + 0x10000)  /* 0263: own 16 KiB page, not under mss_arg_va's mapping */
+@@ -518,10 +522,10 @@
+ 	bool q6_started;        /* BOOT_CMD written: MPSS stays with the modem (Linux) */
+ 	bool running;           /* SMP2P ready seen: ask for a stop first */
+ 	uint32_t clk_set;       /* mss_clks[] we enabled */
+-	uint32_t mba_perm, mpss_perm, meta_perm;
++	uint32_t mba_perm, mpss_perm, meta_perm, rmtfs_perm;
+ 	uint32_t qmp_off;
+ 	uint32_t out_off;       /* SMEM offset of our item 428 payload */
+-} ms = { .mba_perm = PERM_HLOS, .mpss_perm = PERM_HLOS, .meta_perm = PERM_HLOS };
++} ms = { .mba_perm = PERM_HLOS, .mpss_perm = PERM_HLOS, .meta_perm = PERM_HLOS, .rmtfs_perm = PERM_HLOS };
+ 
+ static uint8_t mss_buf[MSS_BIGWIN];     /* UFS bounce for one chunk, cacheable */
+ static uint8_t mss_mdt[0x4000];
+@@ -1186,6 +1190,9 @@
+ 	if (ms.meta_perm != PERM_HLOS && !mss_assign("metadata (reclaim)", META_PA, META_MAX, &ms.meta_perm, PERM_HLOS)) {
+ 		printf("SWEET MSS: metadata NOT reclaimed; it stays unmapped\n");
+ 	}
++	if (ms.rmtfs_perm != PERM_HLOS && !mss_assign("rmtfs (reclaim)", RMTFS_PA, RMTFS_SIZE, &ms.rmtfs_perm, PERM_HLOS)) {
++		printf("SWEET MSS: rmtfs NOT reclaimed; it stays unmapped\n");      /* 0265 */
++	}
+ 	if (ms.mpss_perm != PERM_HLOS) {
+ 		if (ms.q6_started) {
+ 			printf("SWEET MSS: mpss left with the modem (perm %#x), as Linux leaves it; never mapped again\n",
+@@ -1296,6 +1303,8 @@
+ 	return NULL;
+ }
+ 
++static bool mss_efs_load(void);
++
+ static bool
+ mss_stage2(void)
+ {
+@@ -1316,6 +1325,9 @@
+ 	for (unsigned i = 2; !why && i < sizeof(mss_fw) / sizeof(mss_fw[0]); i++) {
+ 		why = mss_load(&mss_fw[i], 0, NULL, 0) ? NULL : mss_fw[i].name;
+ 	}
++	if (!why && mss_mode >= 7 && !mss_efs_load()) {
++		why = "efs copy for rmtfs";     /* 0265 */
++	}
+ 	if (!why && !smp2p_create_out()) {
+ 		why = "smp2p item 428";
+ 	}
+@@ -1801,9 +1813,856 @@
+ 	}
+ }
+ 
++/* ======================================================================================== */
++/*
++ * 0265: stage 7 (mss=7): the host services the modem looks up once QRTR is up, as the linux-msm
++ * daemons do, announced to the modem's name service after its HELLO (ns.c announce_servers):
++ *   servreg-loc 0x40 v0x101 (pd-mapper.c): modemr.jsn + modemuw.jsn of modem_a, instance 180
++ *   TFTP 0x1000 v1 (tqftpserv.c): /readonly/... from modem_a (UFS LUN 4) through mss_tftp[];
++ *       /readwrite/... in RAM for this boot only
++ *   rmtfs 0x0e v1 (rmtfs.c): modemst1/modemst2/fsc/fsg (UFS LUN 5) from a RAM copy made in
++ *       stage 2; every write is logged and dropped, nothing is ever written to a partition. The
++ *       shared buffer is mainline sdm845-oneplus-common.dtsi rmtfs_mem (0xf5b01000, 2 MiB,
++ *       between guard pages), given to {HLOS, MSS} with the 0262 SCM assign as
++ *       qcom_rmtfs_mem does, reclaimed by the stop path once the Q6 is in reset. HLOS writes it
++ *       only through short-lived Device mappings (no speculative access to the guard pages).
++ */
++#define PORT_PDM                0x4001u
++#define PORT_TFTP               0x4002u
++#define PORT_RMTFS              0x4003u
++#define PORT_SESS               0x4100u /* TFTP sessions: 0x4100-0x41ff */
++#define LOG_MAX                 300u    /* per-request service lines, then only the summary */
++
++static bool svc_on;
++static unsigned svc_lines;
++
++/* modem_a.img (MPSS.AT.4.0.c2.15-00007-SDM845), tools/mss-fw-table.py --tftp: path below
++ * image/, byte offset in the partition, size. Same image as mss_fw[] (stage 2 checks its crc). */
++static const struct mss_tf { const char *path; uint32_t off, size; } mss_tftp[] = {
++	{ "adspr.jsn", 0x11000, 0x193 },
++	{ "adspua.jsn", 0x15000, 0x22b },
++	{ "bdwlan.102", 0x7125000, 0x4ad0 },
++	{ "bdwlan.104", 0x712d000, 0x4ad0 },
++	{ "bdwlan.105", 0x7135000, 0x4ad0 },
++	{ "bdwlan.106", 0x713d000, 0x4ad0 },
++	{ "bdwlan.107", 0x7145000, 0x4ad0 },
++	{ "bdwlan.108", 0x714d000, 0x4ad0 },
++	{ "bdwlan.109", 0x7145000, 0x4ad0 },
++	{ "bdwlan.b04", 0x715d000, 0x4ad0 },
++	{ "bdwlan.b07", 0x7165000, 0x4ad0 },
++	{ "bdwlan.b09", 0x716d000, 0x4ad0 },
++	{ "bdwlan.b0a", 0x7175000, 0x4ad0 },
++	{ "bdwlan.b0b", 0x717d000, 0x4ad0 },
++	{ "bdwlan.b0d", 0x7185000, 0x4ad0 },
++	{ "bdwlan.b0e", 0x718d000, 0x4ad0 },
++	{ "bdwlan.b0f", 0x7195000, 0x4ad0 },
++	{ "bdwlan.b14", 0x719d000, 0x4ad0 },
++	{ "bdwlan.b15", 0x71a5000, 0x4ad0 },
++	{ "bdwlan.b30", 0x7165000, 0x4ad0 },
++	{ "bdwlan.b31", 0x7185000, 0x4ad0 },
++	{ "bdwlan.b32", 0x718d000, 0x4ad0 },
++	{ "bdwlan.b33", 0x716d000, 0x4ad0 },
++	{ "bdwlan.b34", 0x71cd000, 0x4ad0 },
++	{ "bdwlan.b35", 0x71d5000, 0x4ad0 },
++	{ "bdwlan.b36", 0x71dd000, 0x4ad0 },
++	{ "bdwlan.b37", 0x71d5000, 0x4ad0 },
++	{ "bdwlan.b38", 0x71ed000, 0x4ad0 },
++	{ "bdwlan.b3d", 0x71f5000, 0x4ad0 },
++	{ "bdwlan.b3f", 0x71fd000, 0x4ad0 },
++	{ "bdwlan.bin", 0x7205000, 0x4ad0 },
++	{ "bdwlan.cxo", 0x720d000, 0x4ad0 },
++	{ "bdwlan.qor", 0x7215000, 0x4ad0 },
++	{ "bdwlan.t0a", 0x721d000, 0x4ad0 },
++	{ "bdwlan.t0b", 0x7225000, 0x4ad0 },
++	{ "bdwlan.t1a", 0x722d000, 0x4ad0 },
++	{ "bdwlan.t1b", 0x7235000, 0x4ad0 },
++	{ "cdspr.jsn", 0x19000, 0x193 },
++	{ "data.msc", 0x6dc1000, 0x772a1 },
++	{ "gptauuid.xml", 0x6d35000, 0xc1f },
++	{ "modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig", 0x636d000, 0x20 },
++	{ "modem_pr/mcfg/configs/mcfg_hw/mbn_hw.txt", 0x0, 0x0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/airtel/volte/mcfg_sw.mbn", 0x6389000, 0x12ef0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/airtel/volte/mcfg_sw.sig", 0x6389000, 0x12ef0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/idea/commerci/mcfg_sw.mbn", 0x63b9000, 0x12510 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/idea/commerci/mcfg_sw.sig", 0x63b9000, 0x12510 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/reliance/commerci/mcfg_sw.mbn", 0x63e9000, 0x13af8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/reliance/commerci/mcfg_sw.sig", 0x63e9000, 0x13af8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/vodafone/volte/india/mcfg_sw.mbn", 0x641d000, 0x12a88 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/apac/vodafone/volte/india/mcfg_sw.sig", 0x641d000, 0x12a88 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/commerci/volte_op/mcfg_sw.mbn", 0x6455000, 0xf384 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/commerci/volte_op/mcfg_sw.sig", 0x6455000, 0xf384 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/conf_vol/mcfg_sw.mbn", 0x647d000, 0xbd14 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/conf_vol/mcfg_sw.sig", 0x647d000, 0xbd14 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/nsiot_vo/mcfg_sw.mbn", 0x6499000, 0xb904 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/nsiot_vo/mcfg_sw.sig", 0x6499000, 0xb904 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/tgl_comb/mcfg_sw.mbn", 0x64b5000, 0x65b8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmcc/lab/tgl_comb/mcfg_sw.sig", 0x64b5000, 0x65b8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmhk/commerci/hk/mcfg_sw.mbn", 0x64d1000, 0x10250 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cmhk/commerci/hk/mcfg_sw.sig", 0x64d1000, 0x10250 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/hvolte_o/mcfg_sw.mbn", 0x6505000, 0x133d0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/commerci/hvolte_o/mcfg_sw.sig", 0x6505000, 0x133d0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/cta/mcfg_sw.mbn", 0x6535000, 0xa594 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/cta/mcfg_sw.sig", 0x6535000, 0xa594 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/volte_co/mcfg_sw.mbn", 0x6551000, 0xdc38 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/ct/lab/volte_co/mcfg_sw.sig", 0x6551000, 0xdc38 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/volte/mcfg_sw.mbn", 0x657d000, 0xdb64 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/china/cu/commerci/volte/mcfg_sw.sig", 0x657d000, 0xdb64 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/common/row/commerci/mcfg_sw.mbn", 0x6d0d000, 0xb1f4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/common/row/commerci/mcfg_sw.sig", 0x6d0d000, 0xb1f4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/bouygues/commerci/france/mcfg_sw.mbn", 0x65ad000, 0x199e0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/bouygues/commerci/france/mcfg_sw.sig", 0x65ad000, 0x199e0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/nl/mcfg_sw.mbn", 0x65f1000, 0x11bf0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/commerci/nl/mcfg_sw.sig", 0x65f1000, 0x11bf0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/dt/volte/commerci/mcfg_sw.mbn", 0x6621000, 0x1185c },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/ee/commerci/mcfg_sw.mbn", 0x663d000, 0x1a5a4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/ee/commerci/mcfg_sw.sig", 0x663d000, 0x1a5a4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/fi/mcfg_sw.mbn", 0x6681000, 0x19eec },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/elisa/commerci/fi/mcfg_sw.sig", 0x6681000, 0x19eec },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/denmark/mcfg_sw.mbn", 0x66c5000, 0x19dd8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/denmark/mcfg_sw.sig", 0x66c5000, 0x19dd8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/se/mcfg_sw.mbn", 0x6701000, 0x19a64 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/uk/mcfg_sw.mbn", 0x6721000, 0x19f18 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/h3g/commerci/uk/mcfg_sw.sig", 0x6721000, 0x19f18 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/orange/commerci/france/mcfg_sw.mbn", 0x6765000, 0x19978 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/tdc/commerci/denmark/mcfg_sw.mbn", 0x678d000, 0x18588 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/de/mcfg_sw.mbn", 0x67d9000, 0x18d9c },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/uk/mcfg_sw.mbn", 0x67f9000, 0x1a348 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telefoni/commerci/uk/mcfg_sw.sig", 0x67f9000, 0x1a348 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/denmark/mcfg_sw.mbn", 0x683d000, 0x19d44 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/denmark/mcfg_sw.sig", 0x683d000, 0x19d44 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/norway/mcfg_sw.mbn", 0x6879000, 0x18764 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/sweden/mcfg_sw.mbn", 0x6899000, 0x1a99c },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telenor/commerci/sweden/mcfg_sw.sig", 0x6899000, 0x1a99c },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/denmark/mcfg_sw.mbn", 0x68dd000, 0x1a8c8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/denmark/mcfg_sw.sig", 0x68dd000, 0x1a8c8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/finland/mcfg_sw.mbn", 0x6919000, 0x1a2c8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/finland/mcfg_sw.sig", 0x6919000, 0x1a2c8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/norway/mcfg_sw.mbn", 0x6955000, 0x1ab88 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/norway/mcfg_sw.sig", 0x6955000, 0x1ab88 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/sweden/mcfg_sw.mbn", 0x6991000, 0x1a994 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/telia/commerci/sweden/mcfg_sw.sig", 0x6991000, 0x1a994 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/tim/commerci/italy/mcfg_sw.mbn", 0x67b5000, 0x16ce8 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/italy/mcfg_sw.mbn", 0x69d5000, 0x173b4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/netherla/mcfg_sw.mbn", 0x69f1000, 0x19b04 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/netherla/mcfg_sw.sig", 0x69f1000, 0x19b04 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/spain/mcfg_sw.mbn", 0x6a2d000, 0x17438 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/eu/vodafone/volte/uk/mcfg_sw.mbn", 0x6a49000, 0x18a34 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/att/firstnet/mcfg_sw.mbn", 0x6a71000, 0x10ddc },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/att/firstnet/mcfg_sw.sig", 0x6a71000, 0x10ddc },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/att/volte/mcfg_sw.mbn", 0x6a9d000, 0x10da4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/att/volte/mcfg_sw.sig", 0x6a9d000, 0x10da4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/tmo/commerci/mcfg_sw.mbn", 0x6acd000, 0x11400 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/tmo/commerci/mcfg_sw.sig", 0x6acd000, 0x11400 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/cdmaless/mcfg_sw.mbn", 0x6afd000, 0x1ab20 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/na/verizon/cdmaless/mcfg_sw.sig", 0x6afd000, 0x1ab20 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/lab/volte_pt/mcfg_sw.mbn", 0x6b41000, 0xe5f0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/lab/volte_pt/mcfg_sw.sig", 0x6b41000, 0xe5f0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/lab/volte_te/mcfg_sw.mbn", 0x6b65000, 0x11568 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/lab/volte_te/mcfg_sw.sig", 0x6b65000, 0x11568 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/oversea/commerci/mcfg_sw.mbn", 0x6bc1000, 0x133b4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/oversea/commerci/mcfg_sw.sig", 0x6bc1000, 0x133b4 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/oversea/commerci/mtnl_bsn/mcfg_sw.mbn", 0x6b99000, 0x13108 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/oem/oversea/commerci/mtnl_bsn/mcfg_sw.sig", 0x6b99000, 0x13108 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/ais/commerci/thailand/mcfg_sw.mbn", 0x6bf9000, 0x190a0 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/chunghwa/commerci/tw/mcfg_sw.mbn", 0x6c21000, 0x19958 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/chunghwa/commerci/tw/mcfg_sw.sig", 0x6c21000, 0x19958 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/fareasto/commerci/mcfg_sw.mbn", 0x6c61000, 0x19b60 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/fareasto/commerci/mcfg_sw.sig", 0x6c61000, 0x19b60 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/tm/commerci/mcfg_sw.mbn", 0x6ca1000, 0x18388 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/tm/commerci/mcfg_sw.sig", 0x6ca1000, 0x18388 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/ytl/commerci/mcfg_sw.mbn", 0x6ce1000, 0xc104 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/generic/sea/ytl/commerci/mcfg_sw.sig", 0x6ce1000, 0xc104 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/mbn_sw.dig", 0x6d25000, 0x20 },
++	{ "modem_pr/mcfg/configs/mcfg_sw/mbn_sw.txt", 0x6d29000, 0xa3a },
++	{ "modemr.jsn", 0x6359000, 0x195 },
++	{ "modemuw.jsn", 0x7121000, 0x2c9 },
++	{ "qdsp6m.qdb", 0x5e35000, 0x522abc },
++	{ "slpir.jsn", 0x6d2d000, 0x193 },
++	{ "slpius.jsn", 0x6d31000, 0x195 },
++	{ "wlanmdsp.mbn", 0x6e39000, 0x2e52e4 },
++};
++
++/* --- QMI: header u8 type, u16 txn, u16 msg, u16 len; TLVs u8 type, u16 len --- */
++static struct { uint8_t b[512]; uint32_t n; } qm;
++
++static const uint8_t *
++qmi_tlv(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tl)
++{
++	uint32_t end = MIN(len, 7u + ((uint32_t)d[5] | (uint32_t)d[6] << 8));
++
++	for (uint32_t o = 7; o + 3 <= end;) {
++		uint16_t l = (uint16_t)(d[o + 1] | d[o + 2] << 8);
++		if (o + 3 + l > end) {
++			break;
++		}
++		if (d[o] == type) {
++			*tl = l;
++			return d + o + 3;
++		}
++		o += 3 + l;
++	}
++	*tl = 0;
++	return NULL;
++}
++
++static void
++qmi_str(const uint8_t *d, uint32_t len, uint8_t type, char *out, size_t max)
++{
++	uint16_t l;
++	const uint8_t *v = qmi_tlv(d, len, type, &l);
++
++	l = v ? (uint16_t)MIN((size_t)l, max - 1) : 0;
++	if (l) {
++		memcpy(out, v, l);
++	}
++	out[l] = '\0';
++}
++
++static bool
++qmi_u32(const uint8_t *d, uint32_t len, uint8_t type, uint32_t *v)
++{
++	uint16_t l;
++	const uint8_t *p = qmi_tlv(d, len, type, &l);
++
++	if (!p || l < 4) {
++		return false;
++	}
++	memcpy(v, p, 4);
++	return true;
++}
++
++static void
++qm_add(uint8_t type, const void *v, uint16_t len)
++{
++	if (qm.n + 3 + len > sizeof(qm.b)) {
++		return;
++	}
++	qm.b[qm.n] = type;
++	qm.b[qm.n + 1] = (uint8_t)len;
++	qm.b[qm.n + 2] = (uint8_t)(len >> 8);
++	memcpy(qm.b + qm.n + 3, v, len);
++	qm.n += 3 + len;
++}
++
++/* a response with its result TLV (0x02: result, error; QMI_ERR_INTERNAL when it failed) */
++static void
++qm_begin(const uint8_t *req, bool ok)
++{
++	uint16_t r[2] = { ok ? 0 : 1, ok ? 0 : 1 };
++
++	qm.b[0] = 2;
++	memcpy(qm.b + 1, req + 1, 4);           /* txn, msg id */
++	qm.n = 7;
++	qm_add(2, r, 4);
++}
++
++static void
++qm_send(uint32_t sport, uint32_t node, uint32_t port)
++{
++	qm.b[5] = (uint8_t)(qm.n - 7);
++	qm.b[6] = (uint8_t)((qm.n - 7) >> 8);
++	qrtr_send(Q_DATA, sport, node, port, qm.b, qm.n);
++}
++
++/* --- pd-mapper: get_domain_list (0x21) for the modem's own json files --- */
++static const struct { const char *svc, *domain; } pdm_map[] = {
++	{ "tms/servreg", "msm/modem/root_pd" },                 /* modemr.jsn */
++	{ "kernel/elf_loader", "msm/modem/wlan_pd" },           /* modemuw.jsn */
++	{ "tms/servreg", "msm/modem/wlan_pd" },
++	{ "wlan/fw", "msm/modem/wlan_pd" },
++};
++#define PDM_INSTANCE            180u    /* qmi_instance_id of both files */
++static unsigned pdm_reqs;
++
++static void
++pdm_rx(uint32_t node, uint32_t port, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	char name[65], why[65];
++	uint8_t list[1 + 4 * (1 + 64 + 9)];
++	uint32_t n = 1, inst = PDM_INSTANCE, zero = 0;
++	uint16_t cnt = 0, rev = 1;
++
++	if (msg == 0x24) {                      /* PFR: pd-mapper only logs it */
++		qmi_str(d, len, 1, name, sizeof(name));
++		qmi_str(d, len, 2, why, sizeof(why));
++		printf("SWEET PDM: t=+%u ms PFR \"%s\": \"%s\"\n", mss_now(), name, why);
++		return;
++	}
++	if (msg != 0x21) {
++		printf("SWEET PDM: t=+%u ms message %#x ignored\n", mss_now(), msg);
++		return;
++	}
++	qmi_str(d, len, 1, name, sizeof(name));
++	for (unsigned i = 0; i < sizeof(pdm_map) / sizeof(pdm_map[0]); i++) {
++		if (strcmp(pdm_map[i].svc, name) == 0) {
++			uint8_t dl = (uint8_t)strlen(pdm_map[i].domain);
++			list[n++] = dl;
++			memcpy(list + n, pdm_map[i].domain, dl);
++			n += dl;
++			memcpy(list + n, &inst, 4);
++			n += 4;
++			list[n++] = 0;                  /* service_data_valid */
++			memcpy(list + n, &zero, 4);
++			n += 4;
++			cnt++;
++		}
++	}
++	list[0] = (uint8_t)cnt;
++	qm_begin(d, true);
++	qm_add(0x10, &cnt, 2);                  /* total_domains */
++	qm_add(0x11, &rev, 2);                  /* db_revision */
++	if (cnt) {
++		qm_add(0x12, list, (uint16_t)n);
++	}
++	qm_send(PORT_PDM, node, port);
++	pdm_reqs++;
++	printf("SWEET PDM: t=+%u ms \"%s\" -> %u domain(s)\n", mss_now(), name, cnt);
++}
++
++/* --- TFTP (tqftpserv: options blksize timeoutms tsize rsize wsize seek) --- */
++#define TF_RW_FILES             8
++#define TF_RW_MAX               0x40000u
++#define TF_ERR_ENOENT           1
++#define TF_ERR_EBADOP           4
++
++static struct { char path[96]; uint8_t *data; uint32_t size; } tf_rw[TF_RW_FILES];
++static struct tftp_s {
++	bool used, write;
++	uint32_t port, node, rport, last;       /* last: ms of the last packet, for eviction */
++	const struct mss_tf *f;
++	int rw;                                 /* tf_rw[] slot, -1 = none */
++	uint32_t size, blk, rsize, wsize, seek, sent, expect;
++	char path[96];
++} tf_s[16];
++static uint32_t tf_next_port;
++static unsigned tf_reqs, tf_missing, tf_writes, tf_errors;
++static uint8_t tf_buf[4 + 16384];
++
++/* translate.c translate_open: the four read-only prefixes, all relative to image/ */
++static const struct mss_tf *
++tftp_lookup(const char *path)
++{
++	static const char *pre[] = { "/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/",
++		                     "/readonly/vendor/firmware/" };
++	const char *rest = NULL;
++
++	for (unsigned i = 0; i < 3 && !rest; i++) {
++		if (strncmp(path, pre[i], strlen(pre[i])) == 0) {
++			rest = path + strlen(pre[i]);
++		}
++	}
++	if (!rest && strncmp(path, "/readonly/firmware/modem_pr", 27) == 0) {
++		rest = path + 19;
++	}
++	for (unsigned i = 0; rest && i < sizeof(mss_tftp) / sizeof(mss_tftp[0]); i++) {
++		if (strcasecmp(mss_tftp[i].path, rest) == 0) {
++			return &mss_tftp[i];
++		}
++	}
++	return NULL;
++}
++
++static int
++tftp_rw_slot(const char *path, bool create)
++{
++	for (int i = 0; i < TF_RW_FILES; i++) {
++		if (tf_rw[i].data && strcmp(tf_rw[i].path, path) == 0) {
++			return i;
++		}
++	}
++	for (int i = 0; create && i < TF_RW_FILES; i++) {
++		if (!tf_rw[i].data && (tf_rw[i].data = kalloc_data(TF_RW_MAX, Z_WAITOK | Z_ZERO)) != NULL) {
++			strlcpy(tf_rw[i].path, path, sizeof(tf_rw[i].path));
++			tf_rw[i].size = 0;
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void
++tftp_send(struct tftp_s *s, const void *p, uint32_t len)
++{
++	qrtr_send(Q_DATA, s->port, s->node, s->rport, p, len);
++}
++
++static void
++tftp_error(struct tftp_s *s, uint16_t code, const char *msg)
++{
++	uint8_t b[48] = { 0, 5, (uint8_t)(code >> 8), (uint8_t)code };
++	uint32_t l = (uint32_t)strlcpy((char *)b + 4, msg, sizeof(b) - 4);
++
++	tftp_send(s, b, 4 + MIN(l, (uint32_t)sizeof(b) - 5) + 1);
++}
++
++static void
++tftp_close(struct tftp_s *s, const char *how)
++{
++	if (svc_lines++ < LOG_MAX) {
++		printf("SWEET TFTP: %s %s seek %u%s -> %u bytes%s%s\n", s->write ? "write" : "read", s->path,
++		    s->seek, s->rw >= 0 ? " (RAM)" : "", s->sent, how ? ", " : "", how ? how : "");
++	}
++	bzero(s, sizeof(*s));
++}
++
++/* tftp_send_data: block `block` from offset; resp != 0 = only that many bytes (rsize) */
++static bool
++tftp_data(struct tftp_s *s, uint32_t block, uint32_t offset, uint32_t resp)
++{
++	uint32_t n = offset >= s->size ? 0 : MIN(s->blk, s->size - offset);
++	int err = 0;
++
++	tf_buf[0] = 0;
++	tf_buf[1] = 3;
++	tf_buf[2] = (uint8_t)(block >> 8);
++	tf_buf[3] = (uint8_t)block;
++	if (n && s->rw >= 0) {
++		memcpy(tf_buf + 4, tf_rw[s->rw].data + offset, n);
++	} else if (n && (err = sweet_ufs_read_part(MSS_LUN, MSS_PART, s->f->off + offset, tf_buf + 4, n)) != 0) {
++		tf_errors++;
++		printf("SWEET TFTP: %s: read of %u at %u failed: %d\n", s->path, n, offset, err);
++		tftp_error(s, 0, "Read error");
++		return false;
++	}
++	if (resp && resp > n) {
++		return false;                   /* tqftpserv: rejecting */
++	}
++	tftp_send(s, tf_buf, 4 + (resp ? resp : n));
++	s->sent += resp ? resp : n;
++	return true;
++}
++
++static uint32_t
++tftp_num(const char *p)
++{
++	uint32_t v = 0;
++
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (uint32_t)(*p++ - '0');
++	}
++	return v;
++}
++
++static char *
++tftp_opt(char *p, char *end, const char *name, uint32_t v)
++{
++	char num[12];
++	size_t a = strlen(name) + 1, b;
++
++	snprintf(num, sizeof(num), "%u", v);
++	b = strlen(num) + 1;
++	if (p + a + b > end) {
++		return p;
++	}
++	memcpy(p, name, a);
++	memcpy(p + a, num, b);
++	return p + a + b;
++}
++
++static void
++tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	char buf[512], oack[160], *end = buf + len, *o = oack;
++	struct tftp_s *s = &tf_s[0];
++	bool opts, tsize = false, seek = false;
++	uint32_t timeoutms = 1000;
++
++	if (len < 4 || len >= sizeof(buf)) {
++		return;
++	}
++	memcpy(buf, d, len);
++	buf[len] = '\0';
++	char *file = buf + 2, *mode = file + strlen(file) + 1, *p = mode + strlen(mode) + 1;
++	if (mode >= end) {
++		return;
++	}
++	opts = p < end;
++	for (unsigned i = 0; i < sizeof(tf_s) / sizeof(tf_s[0]); i++) {     /* free, else the oldest */
++		if (!tf_s[i].used || (s->used && tf_s[i].last < s->last)) {
++			s = &tf_s[i];
++		}
++	}
++	if (s->used) {
++		tftp_close(s, "evicted");
++	}
++	s->used = true;
++	s->write = d[1] == 2;
++	s->node = node;
++	s->rport = port;
++	s->last = mss_now();
++	s->blk = 512;
++	s->wsize = 1;
++	s->rw = -1;
++	strlcpy(s->path, file, sizeof(s->path));
++	for (bool busy = true; busy;) {         /* a port no live session has */
++		s->port = PORT_SESS + (tf_next_port++ & 0xff);
++		busy = false;
++		for (unsigned i = 0; i < sizeof(tf_s) / sizeof(tf_s[0]); i++) {
++			busy |= &tf_s[i] != s && tf_s[i].used && tf_s[i].port == s->port;
++		}
++	}
++	while (p < end) {
++		char *name = p, *val = p + strlen(p) + 1;
++		if (val >= end) {
++			break;
++		}
++		uint32_t v = tftp_num(val);
++		if (strcmp(name, "blksize") == 0) {
++			s->blk = MAX(8u, MIN(v, 16384u));
++		} else if (strcmp(name, "timeoutms") == 0) {
++			timeoutms = v;
++		} else if (strcmp(name, "tsize") == 0) {
++			tsize = true;
++		} else if (strcmp(name, "rsize") == 0) {
++			s->rsize = v;
++		} else if (strcmp(name, "wsize") == 0) {
++			s->wsize = MAX(1u, MIN(v, 64u));
++		} else if (strcmp(name, "seek") == 0) {
++			s->seek = v;
++			seek = true;
++		}
++		p = val + strlen(val) + 1;
++	}
++	tf_reqs++;
++	if (strncmp(file, "/readwrite/", 11) == 0) {
++		s->rw = tftp_rw_slot(file, s->write);
++	}
++	if (s->write) {
++		tf_writes++;
++		s->expect = 1;
++	} else if (s->rw >= 0) {
++		s->size = tf_rw[s->rw].size;
++	} else if ((s->f = tftp_lookup(file)) != NULL) {
++		s->size = s->f->size;
++	} else {
++		tf_missing++;
++		tftp_error(s, TF_ERR_ENOENT, "file not found");
++		tftp_close(s, "not found");
++		return;
++	}
++	if (!opts) {
++		if (s->write) {
++			uint8_t ack[4] = { 0, 4, 0, 0 };
++			tftp_send(s, ack, 4);
++		} else if (tftp_data(s, 1, 0, 0) && s->size < s->blk) {
++			tftp_close(s, NULL);
++		}
++		return;
++	}
++	*o++ = 0;
++	*o++ = 6;                               /* OACK */
++	o = tftp_opt(o, oack + sizeof(oack), "blksize", s->blk);
++	o = tftp_opt(o, oack + sizeof(oack), "timeoutms", timeoutms);
++	if (tsize) {
++		o = tftp_opt(o, oack + sizeof(oack), "tsize", s->size);
++	}
++	o = tftp_opt(o, oack + sizeof(oack), "wsize", s->wsize);
++	if (s->rsize) {
++		o = tftp_opt(o, oack + sizeof(oack), "rsize", s->rsize);
++	}
++	if (seek) {
++		o = tftp_opt(o, oack + sizeof(oack), "seek", s->seek);
++	}
++	tftp_send(s, oack, (uint32_t)(o - oack));
++}
++
++/* handle_reader / handle_writer for one session port; false = no such session */
++static bool
++tftp_session(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
++{
++	struct tftp_s *s = NULL;
++
++	for (unsigned i = 0; i < sizeof(tf_s) / sizeof(tf_s[0]) && !s; i++) {
++		s = (tf_s[i].used && tf_s[i].port == dport) ? &tf_s[i] : NULL;
++	}
++	if (!s || s->node != snode || s->rport != sport || len < 4) {
++		return s != NULL;
++	}
++	uint16_t op = (uint16_t)(d[0] << 8 | d[1]), blk = (uint16_t)(d[2] << 8 | d[3]);
++	s->last = mss_now();
++	if (op == 5) {                          /* 9 = "End of Transfer": a tsize stat */
++		tftp_close(s, blk == 9 ? "end of transfer" : "modem error");
++		return true;
++	}
++	if (s->write) {
++		uint32_t payload = len - 4, at = s->seek + (uint32_t)(blk - 1) * s->blk;
++		if (op != 3 || blk != (uint16_t)s->expect) {
++			tftp_error(s, TF_ERR_EBADOP, op != 3 ? "Expected DATA opcode" : "Block number out of sequence");
++			tftp_close(s, "bad block");
++			return true;
++		}
++		s->expect++;
++		if (s->rw >= 0 && at <= TF_RW_MAX && payload <= TF_RW_MAX - at) {
++			memcpy(tf_rw[s->rw].data + at, d + 4, payload);
++			tf_rw[s->rw].size = MAX(tf_rw[s->rw].size, at + payload);
++			s->sent += payload;
++		}
++		if (blk % s->wsize == 0 || payload < s->blk) {
++			uint8_t ack[4] = { 0, 4, d[2], d[3] };
++			tftp_send(s, ack, 4);
++		}
++		if (payload < s->blk) {
++			tftp_close(s, s->rw >= 0 ? NULL : "dropped: no RAM slot");
++		}
++		return true;
++	}
++	if (op != 4) {
++		tftp_error(s, TF_ERR_EBADOP, "Expected ACK opcode");
++		tftp_close(s, "bad opcode");
++		return true;
++	}
++	if (s->rsize == 0) {                    /* the whole file: blocks until a short one */
++		uint32_t total = s->size > s->seek ? s->size - s->seek : 0, last = total / s->blk + 1;
++		if (blk >= last) {
++			tftp_close(s, NULL);
++			return true;
++		}
++		for (uint32_t i = blk + 1u; i <= blk + s->wsize && i <= last; i++) {
++			if (!tftp_data(s, i, s->seek + (i - 1) * s->blk, 0)) {
++				break;
++			}
++		}
++		return true;
++	}
++	if ((uint32_t)blk * s->blk > s->rsize) {
++		tftp_close(s, NULL);
++		return true;
++	}
++	for (uint32_t b = blk; b < blk + s->wsize; b++) {
++		uint32_t resp = (b + 1) * s->blk > s->rsize ? s->rsize % s->blk : 0;
++		if (!tftp_data(s, b + 1, s->seek + b * s->blk, resp) || (b + 1) * s->blk > s->rsize) {
++			break;
++		}
++	}
++	return true;
++}
++
++/* --- rmtfs --- */
++#define EFS_LUN                 5u      /* /dev/block/sdf: modemst1 sdf2, modemst2 sdf3, fsg sdf4, fsc sdf5 */
++static const struct { const char *path, *part; uint32_t size; } efs[] = {
++	{ "/boot/modem_fs1", "modemst1", 0x200000 },
++	{ "/boot/modem_fs2", "modemst2", 0x200000 },
++	{ "/boot/modem_fsc", "fsc", 0x20000 },
++	{ "/boot/modem_fsg", "fsg", 0x200000 },
++};
++static uint8_t *efs_ram[sizeof(efs) / sizeof(efs[0])];
++static unsigned rm_reads, rm_writes, rm_errors;
++
++/* stage 2 (mss>=7): the RAM copy, before anything is handed to the modem */
++static bool
++mss_efs_load(void)
++{
++	for (unsigned i = 0; i < sizeof(efs) / sizeof(efs[0]); i++) {
++		int err = ENOMEM;
++		uint32_t crc;
++		if ((efs_ram[i] = kalloc_data(efs[i].size, Z_WAITOK | Z_ZERO)) == NULL ||
++		    (err = sweet_ufs_read_part(EFS_LUN, efs[i].part, 0, efs_ram[i], efs[i].size)) != 0) {
++			printf("SWEET RMTFS: %s (LUN %u): %u bytes not read: %d\n", efs[i].part, EFS_LUN, efs[i].size, err);
++			return false;
++		}
++		crc = crc32(0, efs_ram[i], efs[i].size);
++		printf("SWEET RMTFS: %s (LUN %u) %u bytes copied to RAM, crc32 %#010x; never written back\n",
++		    efs[i].part, EFS_LUN, efs[i].size, crc);
++	}
++	return true;
++}
++
++static void
++mss_efs_free(void)
++{
++	for (unsigned i = 0; i < sizeof(efs) / sizeof(efs[0]); i++) {
++		if (efs_ram[i]) {
++			kfree_data(efs_ram[i], efs[i].size);
++		}
++	}
++	for (unsigned i = 0; i < TF_RW_FILES; i++) {
++		if (tf_rw[i].data) {
++			kfree_data(tf_rw[i].data, TF_RW_MAX);
++		}
++	}
++}
++
++/* sectors into the shared buffer, through Device mappings of at most 256 KiB, then unmapped */
++static bool
++rmtfs_put(uint64_t pa, const uint8_t *src, uint32_t n)
++{
++	if ((pa & 3) || (n & 3) || pa < RMTFS_PA || n > RMTFS_SIZE || pa - RMTFS_PA > RMTFS_SIZE - n ||
++	    ms.rmtfs_perm != (PERM_HLOS | PERM_MSS)) {
++		return false;
++	}
++	while (n) {
++		uint32_t k = MIN(n, 0x40000u);
++		uint64_t base = pa & ~0x3fffull, top = (pa + k + 0x3fff) & ~0x3fffull;
++		vm_offset_t va = io_map(base, (vm_size_t)(top - base), MSS_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++		if (!va) {
++			return false;
++		}
++		volatile uint32_t *dst = (volatile uint32_t *)(va + (vm_offset_t)(pa - base));
++		for (uint32_t i = 0; i < k / 4; i++) {
++			uint32_t w;
++			memcpy(&w, src + 4 * i, 4);
++			dst[i] = w;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(va, (vm_size_t)(top - base));
++		pa += k;
++		src += k;
++		n -= k;
++	}
++	return true;
++}
++
++static void
++rmtfs_rx(uint32_t node, uint32_t port, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	char path[64];
++	uint32_t caller = 0, size = 0;
++	uint16_t l = 0;
++	bool ok = true, write = false;
++	unsigned i = 0;
++
++	switch (msg) {
++	case 1:                                 /* OPEN: path -> caller id */
++		qmi_str(d, len, 1, path, sizeof(path));
++		for (i = 0; i < sizeof(efs) / sizeof(efs[0]) && strcmp(path, efs[i].path); i++) {
++		}
++		ok = i < sizeof(efs) / sizeof(efs[0]);
++		printf("SWEET RMTFS: t=+%u ms open %s -> %s\n", mss_now(), path, ok ? efs[i].part : "FAILED");
++		qm_begin(d, ok);
++		if (ok) {
++			caller = i + 1;
++			qm_add(0x10, &caller, 4);
++		}
++		break;
++	case 2:                                 /* CLOSE */
++		qm_begin(d, true);
++		break;
++	case 3: {                               /* RW_IOVEC: caller, direction, {sector, phys, count}[] */
++		const uint8_t *dir = qmi_tlv(d, len, 2, &l), *iov;
++		write = dir && l >= 1 && dir[0];
++		iov = qmi_tlv(d, len, 3, &l);
++		ok = qmi_u32(d, len, 1, &caller) && caller >= 1 && caller <= sizeof(efs) / sizeof(efs[0]) &&
++		    dir && iov && l >= 1 && l >= 1 + 12u * iov[0];
++		for (i = 0; ok && i < iov[0]; i++) {
++			uint32_t e[3];
++			memcpy(e, iov + 1 + 12 * i, 12);
++			uint64_t off = (uint64_t)e[0] * 512, bytes = (uint64_t)e[2] * 512;
++			const char *part = efs[caller - 1].part;
++			if (off + bytes > efs[caller - 1].size || bytes > RMTFS_SIZE) {
++				ok = false;
++			} else if (write) {
++				rm_writes++;    /* dropped: never written anywhere */
++				if (svc_lines++ < LOG_MAX) {
++					printf("SWEET RMTFS: %s write %llu at %llu DROPPED\n", part, bytes, off);
++				}
++			} else {
++				ok = rmtfs_put(e[1], efs_ram[caller - 1] + off, (uint32_t)bytes);
++				rm_reads++;
++				if (svc_lines++ < LOG_MAX) {
++					printf("SWEET RMTFS: %s read %llu at %llu -> %#x%s\n", part, bytes, off, e[1],
++					    ok ? "" : " FAILED");
++				}
++			}
++		}
++		if (!ok) {
++			rm_errors++;
++			printf("SWEET RMTFS: t=+%u ms iovec caller %u %s refused\n", mss_now(), caller,
++			    write ? "write" : "read");
++		}
++		qm_begin(d, ok);
++		break;
++	}
++	case 4: {                               /* ALLOC_BUFF: caller, size -> the buffer address */
++		uint64_t a = RMTFS_PA;
++		ok = qmi_u32(d, len, 2, &size) && size <= RMTFS_SIZE && ms.rmtfs_perm == (PERM_HLOS | PERM_MSS);
++		printf("SWEET RMTFS: t=+%u ms alloc %#x bytes -> %s %#llx\n", mss_now(), size, ok ? "ok" : "REFUSED", a);
++		qm_begin(d, ok);
++		if (ok) {
++			qm_add(0x10, &a, 8);
++		}
++		break;
++	}
++	case 5: {                               /* GET_DEV_ERROR */
++		uint8_t st = 0;
++		qm_begin(d, true);
++		qm_add(0x10, &st, 1);
++		break;
++	}
++	default:
++		printf("SWEET RMTFS: t=+%u ms message %#x ignored\n", mss_now(), msg);
++		return;
++	}
++	qm_send(PORT_RMTFS, node, port);
++}
++
++/* DATA for one of our ports; false = not ours */
++static bool
++svc_rx(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
++{
++	if (!svc_on) {
++		return false;
++	}
++	if (dport == PORT_TFTP) {
++		if (len >= 2 && d[0] == 0 && (d[1] == 1 || d[1] == 2)) {
++			tftp_request(snode, sport, d, len);
++		}
++		return true;
++	}
++	if (dport >= PORT_SESS && dport <= PORT_SESS + 0xff) {
++		(void)tftp_session(snode, sport, dport, d, len);       /* late packets of a closed one: dropped */
++		return true;
++	}
++	if ((dport != PORT_PDM && dport != PORT_RMTFS) || len < 7 || d[0] != 0) {
++		return false;
++	}
++	uint16_t msg = (uint16_t)(d[3] | d[4] << 8);
++	if (dport == PORT_PDM) {
++		pdm_rx(snode, sport, msg, d, len);
++	} else {
++		rmtfs_rx(snode, sport, msg, d, len);
++	}
++	return true;
++}
++
++static void
++svc_announce(void)
++{
++	qrtr_ctrl(Q_NEW_SERVER, 0x40, 0x101, QRTR_NODE_APPS, PORT_PDM);     /* servreg-loc v0x101 */
++	qrtr_ctrl(Q_NEW_SERVER, 0x1000, 1, QRTR_NODE_APPS, PORT_TFTP);      /* tftp v1 */
++	qrtr_ctrl(Q_NEW_SERVER, 0x0e, 1, QRTR_NODE_APPS, PORT_RMTFS);       /* rmtfs v1 */
++	printf("SWEET QRTR: t=+%u ms announced servreg-loc 0x40 port %#x, tftp 0x1000 port %#x, rmtfs 0xe port %#x "
++	    "to node %u\n", mss_now(), PORT_PDM, PORT_TFTP, PORT_RMTFS, qr.node);
++}
++
++/* stage 7: the rmtfs buffer to {HLOS, MSS}, then the three servers */
++static bool
++svc_start(void)
++{
++	if (!mss_assign("rmtfs", RMTFS_PA, RMTFS_SIZE, &ms.rmtfs_perm, PERM_HLOS | PERM_MSS)) {
++		printf("SWEET MSS: stage 7: FAILED: rmtfs buffer assign\n");
++		return false;
++	}
++	svc_on = true;
++	svc_announce();
++	printf("SWEET MSS: stage 7: ok: rmtfs %#llx+%#x shared with the modem, services announced\n",
++	    RMTFS_PA, RMTFS_SIZE);
++	return true;
++}
++
++static void
++svc_summary(void)
++{
++	printf("SWEET MSS: services: pd-mapper %u requests; tftp %u requests (%u not found, %u writes, %u read errors); "
++	    "rmtfs %u reads, %u writes dropped, %u refused\n", pdm_reqs, tf_reqs, tf_missing, tf_writes, tf_errors,
++	    rm_reads, rm_writes, rm_errors);
++}
++
+ static void
+ qrtr_data(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
+ {
++	if (svc_rx(snode, sport, dport, d, len)) {
++		return;
++	}
+ 	if (qr.other++ < 20) {
+ 		printf("SWEET QRTR: t=+%u ms DATA to port %#x from %u:%#x, %u bytes (no service here)\n",
+ 		    mss_now(), dport, snode, sport, len);
+@@ -2114,6 +2973,9 @@
+ 		qrtr_ctrl(Q_HELLO, 0, 0, 0, 0);
+ 		qr.hello_sent = true;
+ 		printf("SWEET QRTR: t=+%u ms HELLO sent to node %#x\n", t, qr.node);
++		if (svc_on && qr.hello_rx) {
++			svc_announce();         /* ns.c ctrl_cmd_hello: announce_servers */
++		}
+ 	}
+ 	if (t >= 2000 && !gl.open_sent && gl.rx) {
+ 		printf("SWEET GLINK: t=+%u ms the modem has not opened IPCRTR: opening it\n", t);
+@@ -2193,12 +3055,19 @@
+ 			up = true;
+ 			mss_reached = 6;
+ 			printf("SWEET MSS: stage 6: ok: IPCRTR up, qrtr HELLO from node %u, after %u ms\n", qr.node, t);
++			if (mss_mode >= 7) {
++				why = svc_start() ? NULL : "rmtfs buffer assign";
++				mss_reached = why ? 6 : 7;
++			}
+ 		} else if (!up && t >= 10000) {
+ 			why = "no IPCRTR or HELLO within 10 s";
+ 		}
+ 		delay(1000);
+ 	}
+ 	glink_summary();
++	if (svc_on) {
++		svc_summary();
++	}
+ 	if (!up) {
+ 		printf("SWEET MSS: stage 6: FAILED: %s\n", why ? why : "?");
+ 	} else if (why) {
+@@ -2365,7 +3234,8 @@
+ 		mss_win_va = 0;
+ 	}
+ 	printf("SWEET MSS: done: mss=%d, last good stage %d%s\n", mode, reached,
+-	    reached == (mode > 6 ? 6 : mode) ? "" : " (stopped early)");
++	    reached == (mode > 7 ? 7 : mode) ? "" : " (stopped early)");
++	mss_efs_free();
+ 	(void)thread_terminate(current_thread());
+ }
+ 

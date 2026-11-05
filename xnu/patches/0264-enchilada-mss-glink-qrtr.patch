@@ -1,0 +1,917 @@
+enchilada: MSS stage 6 (mss=6): GLINK over SMEM, QRTR on IPCRTR, the IPA clock query (Wi-Fi round 3)
+
+The mss=5 modem reached ready and went fatal ~40 s later with no host services at all. mss=6 runs
+stage 5 unchanged and then, instead of its 60 s watch, starts the GLINK smem edge as Linux v6.12
+qcom_glink_smem.c / qcom_glink_native.c do (item 478 descriptor, 479 our 16 KiB TX FIFO, 480 the
+modem's, doorbell APCS IPC bit 12, INTENT_REUSE, 8 KiB TX chunks, 16-byte FIFO reserve), accepts
+only the IPCRTR channel (OPEN_ACK + OPEN as qcom_glink_create_remote; other channels are logged and
+left unacked, as Linux does without a driver), runs QRTR v1 on it (apps node 1, HELLO answered as
+ns.c, RESUME_TX for confirm_rx) and logs every NEW_SERVER the modem announces. It also answers the
+modem's IPA clock query on the SMP2P "ipa" entry with "valid, AP IPA off" (ipa_smp2p_notify;
+topaz 0113 found modem_cfg starves without it). Ported from topaz 0118/0119 with Linux's FIFO
+reserve and chunking, bounded parsing of every length the modem gives, and Device-memory word
+access only. "stage 6: ok" needs IPCRTR up and the modem's HELLO within 10 s; the watch runs
+120 s and ends, like every failure, in the 0262 stop path. SMEM stores: items 478/479 (allocated
+with the 0262 allocator, now shared with item 428) and then only our TX FIFO, the descriptor's tx
+head / rx tail words and our "ipa" value. mss<=5 behave exactly as before.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -35,12 +35,17 @@
+  *   5  metadata authenticated, MPSS segments loaded and authenticated, SMP2P ready, 60 s watch
+  * mss=N stops after stage N with the stop path (mss_stop), which also runs on any failure: Q6 AXI
+  * halted through TCSR, MSS reset, our clocks and votes dropped, memory returned to HLOS.
++ * 0264:
++ *   6  GLINK over SMEM (items 478/479/480, doorbell bit 12), IPCRTR channel, QRTR hello; every
++ *      NEW_SERVER of the modem logged; the modem's IPA clock query answered; 120 s watch
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <mach/vm_prot.h>
++#include <mach/mach_time.h>
+ #include <kern/clock.h>
++#include <kern/kalloc.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
+@@ -523,6 +528,7 @@
+ static vm_offset_t mss_big_va, mss_arg_va;
+ static uint64_t mss_big_pa;
+ static bool mss_bad;                    /* a refused access: stop at the next check */
++static int mss_mode, mss_reached;       /* 0264: the boot-arg; the last stage above 5 reached */
+ 
+ /* --- registers: fixed pages, mapped once; stores only to the registers named below --- */
+ static const uint64_t mss_pages[] = {
+@@ -1037,12 +1043,12 @@
+ 	w32(APCS_IPC, 1u << 14);
+ }
+ 
+-/* qcom_smem_alloc_private under hwspinlock 3, then qcom_smp2p_alloc_outbound_item + 2 entries. */
+-static bool
+-smp2p_create_out(void)
++/* qcom_smem_alloc_private in the apps-mpss partition under hwspinlock 3; the payload, 0 = refused. */
++static uint32_t
++smem_alloc(uint16_t id, uint32_t bytes)
+ {
+ 	const struct mss_part *p = &mss_apm;
+-	uint32_t size = (SMP2P_BYTES + 7) & ~7u, need = 16 + size, item = 0;
++	uint32_t size = (bytes + 7) & ~7u, need = 16 + size, item = 0;
+ 	bool locked = false;
+ 
+ 	for (unsigned i = 0; i < 1000 && !locked; i++) {
+@@ -1054,16 +1060,16 @@
+ 	}
+ 	if (!locked) {
+ 		printf("SWEET MSS: smem hwlock 3 held by %u\n", r32(TCSR_MUTEX3));
+-		return false;
++		return 0;
+ 	}
+ 	uint32_t unc = smem32(p->off + 12), cac = smem32(p->off + 16), have = 0;
+ 	/* smem_part_find walks (and checks) every entry below the free mark; ~0 = a broken list */
+-	if (smem_part_find(p, SMP2P_OUT_ITEM, &have) == 0 && have != ~0u && unc >= 32 &&
++	if (smem_part_find(p, id, &have) == 0 && have != ~0u && unc >= 32 &&
+ 	    unc + need <= cac && cac <= p->size) {
+ 		uint32_t e = p->off + unc;
+-		smem_w32(e, 0xa5a5u | (uint32_t)SMP2P_OUT_ITEM << 16);
++		smem_w32(e, 0xa5a5u | (uint32_t)id << 16);
+ 		smem_w32(e + 4, size);
+-		smem_w32(e + 8, size - SMP2P_BYTES);           /* padding_data, padding_hdr 0 */
++		smem_w32(e + 8, size - bytes);                  /* padding_data, padding_hdr 0 */
+ 		smem_w32(e + 12, 0);
+ 		for (uint32_t o = 0; o < size; o += 4) {
+ 			smem_w32(e + 16 + o, 0);
+@@ -1072,10 +1078,19 @@
+ 		item = e + 16;
+ 	} else {
+ 		printf("SWEET MSS: smem: item %u present or no room (uncached %#x cached %#x)\n",
+-		    SMP2P_OUT_ITEM, unc, cac);
++		    id, unc, cac);
+ 	}
+ 	w32(TCSR_MUTEX3, 0);
+-	if (!item || mss_bad) {
++	return mss_bad ? 0 : item;
++}
++
++/* qcom_smp2p_alloc_outbound_item + 2 entries. */
++static bool
++smp2p_create_out(void)
++{
++	uint32_t item = smem_alloc(SMP2P_OUT_ITEM, SMP2P_BYTES);
++
++	if (!item) {
+ 		return false;
+ 	}
+ 	static const char names[2][16] = { "master-kernel", "ipa" };
+@@ -1430,6 +1445,774 @@
+ 	return true;
+ }
+ 
++/* ======================================================================================== */
++/*
++ * 0264: stage 6 (mss=6), after stage 5's ready. Linux v6.12 qcom_glink_smem.c and
++ * qcom_glink_native.c (the smem edge, INTENT_REUSE), net/qrtr/qrtr.c + ns.c (v1 headers, as
++ * enchilada2.dtb qcom,xprt-version = <1>; apps node 1), drivers/net/ipa/ipa_smp2p.c; ported from
++ * topaz 0118/0119. Everything is polled from this thread every millisecond, no interrupts.
++ * SMEM stores: items 478 (32 bytes) and 479 (16 KiB) allocated as item 428 is, unless the modem
++ * made them; after that only our TX FIFO and the descriptor's tx-head / rx-tail words (apm_wr
++ * refuses every other offset), and the "ipa" value of our item 428. Doorbell: APCS IPC bit 12.
++ * The apps-mpss partition is mapped once as Device memory (no speculative reads into the MPU-
++ * guarded neighbours): aligned 32-bit accesses only.
++ */
++#define GLINK_DESC_ITEM         478
++#define GLINK_TX_ITEM           479
++#define GLINK_RX_ITEM           480
++#define GLINK_LCID              1
++#define GLINK_INTENTS           8
++#define GLINK_INTENT_SIZE       0x4400u /* our RX intents: a 16 KiB TFTP block plus headers */
++#define GLINK_CHUNK             0x2000u /* __qcom_glink_send: at most SZ_8K per TX_DATA chunk */
++#define QRTR_NODE_APPS          1u
++#define QRTR_NODE_BCAST         0xffffffffu
++#define QRTR_PORT_CTRL          0xfffffffeu
++#define MSS_WATCH6_MS           120000u
++
++enum { G_VERSION, G_VERSION_ACK, G_OPEN, G_CLOSE, G_OPEN_ACK, G_INTENT, G_RX_DONE, G_INTENT_REQ,
++       G_INTENT_REQ_ACK, G_TX_DATA, G_CLOSE_ACK = 11, G_TX_DATA_CONT, G_READ_NOTIF,
++       G_RX_DONE_REUSE, G_SIGNALS };
++enum { Q_DATA = 1, Q_HELLO, Q_BYE, Q_NEW_SERVER, Q_DEL_SERVER, Q_DEL_CLIENT, Q_RESUME_TX,
++       Q_NEW_LOOKUP = 10 };
++
++static uint64_t mss_t0;
++static vm_offset_t apm_va;
++static uint64_t apm_pa;
++static vm_size_t apm_len;
++
++static struct {
++	uint32_t desc, tx, tx_len, rx, rx_len;  /* SMEM offsets and FIFO sizes */
++	uint32_t tx_head, rx_tail, features, rcid, next_iid, asm_len;
++	bool remote_open, open_sent, open_acked, intents_sent, intent_req, asm_drop;
++	const char *bad;                        /* protocol error: the watch ends */
++	struct { uint32_t id, size; bool used; } ri[64];        /* the modem's RX intents */
++	unsigned nri, rx_msgs, tx_msgs, qdrops;
++} gl;
++static uint8_t gl_asm[GLINK_INTENT_SIZE];   /* one message from the modem */
++static uint8_t gl_msg[16 + GLINK_CHUNK];    /* one message to the modem */
++
++static struct {
++	uint32_t node;                          /* the modem's, from its HELLO */
++	bool hello_rx, hello_sent;
++	unsigned nsrv, resumes, del_clients, other;
++	struct { uint32_t svc, inst, node, port; } srv[64];
++} qr = { .node = QRTR_NODE_BCAST };
++static uint8_t qr_buf[32 + 4 + 0x4000 + 64]; /* header + the largest payload (a TFTP block) */
++
++static unsigned
++mss_now(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - mss_t0, &ns);
++	return (unsigned)(ns / 1000000);
++}
++
++/* --- the apps-mpss partition --- */
++static bool
++apm_ok(uint32_t off)
++{
++	return apm_va && !(off & 3) && off >= mss_apm.off && off + 4 <= mss_apm.off + mss_apm.size;
++}
++
++static uint32_t
++apm_rd(uint32_t off)
++{
++	uint32_t v;
++
++	if (!apm_ok(off)) {
++		printf("SWEET GLINK: refused read of smem +%#x\n", off);
++		mss_bad = true;
++		return 0;
++	}
++	v = *(volatile uint32_t *)(apm_va + (vm_offset_t)(SMEM_PA + off - apm_pa));
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++apm_wr(uint32_t off, uint32_t v)
++{
++	bool ours = gl.desc && (off == gl.desc + 4 || off == gl.desc + 8 ||
++	    (off >= gl.tx && off + 4 <= gl.tx + gl.tx_len));
++
++	if (!apm_ok(off) || !ours) {
++		printf("SWEET GLINK: refused store to smem +%#x\n", off);
++		mss_bad = true;
++		return;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(apm_va + (vm_offset_t)(SMEM_PA + off - apm_pa)) = v;
++}
++
++/* the item if it exists, else ours (qcom_smem_alloc, then qcom_smem_get as Linux); 0 = none */
++static uint32_t
++smem_get_or_alloc(uint16_t id, uint32_t bytes, uint32_t *size, bool *made)
++{
++	uint32_t off = smem_part_find(&mss_apm, id, size);
++
++	*made = false;
++	if (off == 0 && *size != ~0u) {
++		if ((off = smem_alloc(id, bytes)) != 0) {
++			*size = bytes;
++			*made = true;
++		} else {
++			off = smem_part_find(&mss_apm, id, size);       /* the modem was faster */
++		}
++	}
++	return *size == ~0u ? 0 : off;
++}
++
++/* --- GLINK FIFOs: positions are 8-aligned (both sides align every message), sizes too --- */
++static void
++glink_kick(void)
++{
++	w32(APCS_IPC, 1u << 12);
++}
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t h = apm_rd(gl.desc + 12), t = gl.rx_tail;
++
++	if (h >= gl.rx_len || (h & 7)) {
++		gl.bad = "rx head out of range";
++		return 0;
++	}
++	return h >= t ? h - t : gl.rx_len - t + h;
++}
++
++static void
++rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t pos = gl.rx_tail + off;
++	uint8_t *d = dst;
++
++	if (pos >= gl.rx_len) {
++		pos -= gl.rx_len;
++	}
++	while (n) {
++		uint32_t w = apm_rd(gl.rx + pos), k = MIN(n, 4u);
++		memcpy(d, &w, k);
++		d += k;
++		n -= k;
++		if ((pos += 4) == gl.rx_len) {
++			pos = 0;
++		}
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	gl.rx_tail = (gl.rx_tail + ((n + 7) & ~7u)) % gl.rx_len;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	apm_wr(gl.desc + 8, gl.rx_tail);
++}
++
++/* glink_smem_tx_write: header and data, padded to 8; waits up to 1 s for room (Linux: 10 s) */
++static bool
++glink_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t n = (hlen + dlen + 7) & ~7u, head = gl.tx_head;
++
++	if (gl.bad || hlen + dlen > sizeof(gl_msg)) {
++		gl.bad = gl.bad ? gl.bad : "tx message too big";
++		return false;
++	}
++	for (unsigned t = 0;; t += 100) {
++		uint32_t tail = apm_rd(gl.desc), avail;
++		if (tail >= gl.tx_len || (tail & 7)) {
++			gl.bad = "tx tail out of range";
++			return false;
++		}
++		avail = tail <= head ? gl.tx_len - head + tail : tail - head;
++		avail = avail < 16 ? 0 : avail - 16;    /* FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE */
++		if (avail >= n) {
++			break;
++		}
++		if (t >= 1000000 || mss_bad) {
++			gl.bad = "tx fifo full for 1 s";
++			return false;
++		}
++		glink_kick();
++		delay(100);
++	}
++	bzero(gl_msg, n);
++	memcpy(gl_msg, hdr, hlen);
++	if (dlen) {
++		memcpy(gl_msg + hlen, data, dlen);
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w;
++		memcpy(&w, gl_msg + i, 4);
++		apm_wr(gl.tx + head, w);
++		if ((head += 4) == gl.tx_len) {
++			head = 0;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gl.tx_head = head;
++	apm_wr(gl.desc + 4, head);
++	glink_kick();
++	gl.tx_msgs++;
++	return !mss_bad;
++}
++
++static void
++glink_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { cmd | (uint32_t)p1 << 16, p2 };
++
++	(void)glink_tx(m, 8, NULL, 0);
++}
++
++static void
++glink_open(void)
++{
++	uint32_t m[4] = { G_OPEN | GLINK_LCID << 16, sizeof("IPCRTR"), 0, 0 };
++
++	memcpy(&m[2], "IPCRTR", sizeof("IPCRTR"));
++	(void)glink_tx(m, 16, NULL, 0);
++	gl.open_sent = true;
++}
++
++static void
++glink_intents(uint32_t count)
++{
++	uint32_t m[2 + 2 * GLINK_INTENTS] = { G_INTENT | GLINK_LCID << 16, count };
++
++	for (uint32_t i = 0; i < count && i < GLINK_INTENTS; i++) {
++		m[2 + 2 * i] = GLINK_INTENT_SIZE;
++		m[3 + 2 * i] = gl.next_iid++;
++	}
++	(void)glink_tx(m, 8 + 8 * MIN(count, (uint32_t)GLINK_INTENTS), NULL, 0);
++}
++
++static bool
++glink_up(void)
++{
++	return gl.remote_open && gl.open_acked && !gl.bad;
++}
++
++/* __qcom_glink_send into the smallest free intent of the modem; false = none fits yet */
++static bool
++glink_try_send(const uint8_t *p, uint32_t len)
++{
++	unsigned best = gl.nri;
++
++	for (unsigned i = 0; i < gl.nri; i++) {
++		if (!gl.ri[i].used && gl.ri[i].size >= len && (best == gl.nri || gl.ri[i].size < gl.ri[best].size)) {
++			best = i;
++		}
++	}
++	if (best == gl.nri) {
++		if (!gl.intent_req) {
++			glink_cmd(G_INTENT_REQ, GLINK_LCID, len);
++			gl.intent_req = true;
++		}
++		return false;
++	}
++	gl.ri[best].used = true;
++	for (uint32_t off = 0; off < len && !gl.bad;) {
++		uint32_t k = MIN(len - off, GLINK_CHUNK);
++		uint32_t h[4] = { (off ? G_TX_DATA_CONT : G_TX_DATA) | GLINK_LCID << 16, gl.ri[best].id, k,
++			          len - off - k };
++		(void)glink_tx(h, 16, p + off, k);
++		off += k;
++	}
++	return true;
++}
++
++/* packets wait here, in order, until the modem has an intent for them */
++#define GLQ_LEN 32
++static struct { uint8_t *p; uint32_t len; } glq[GLQ_LEN];
++static unsigned glq_head, glq_tail;
++
++static void
++glq_pump(void)
++{
++	while (glq_head != glq_tail && glink_up() &&
++	    glink_try_send(glq[glq_head % GLQ_LEN].p, glq[glq_head % GLQ_LEN].len)) {
++		kfree_data(glq[glq_head % GLQ_LEN].p, glq[glq_head % GLQ_LEN].len);
++		glq_head++;
++	}
++}
++
++static void
++glink_send(const uint8_t *p, uint32_t len)
++{
++	uint8_t *c;
++
++	if (glq_head == glq_tail && glink_up() && glink_try_send(p, len)) {
++		return;
++	}
++	if (glq_tail - glq_head >= GLQ_LEN || (c = kalloc_data(len, Z_WAITOK)) == NULL) {
++		gl.qdrops++;
++		return;
++	}
++	memcpy(c, p, len);
++	glq[glq_tail % GLQ_LEN].p = c;
++	glq[glq_tail % GLQ_LEN].len = len;
++	glq_tail++;
++}
++
++/* --- QRTR (v1 header: version, type, src node/port, confirm_rx, size, dst node/port) --- */
++static void
++qrtr_send(uint32_t type, uint32_t sport, uint32_t dnode, uint32_t dport, const void *pl, uint32_t len)
++{
++	uint32_t h[8] = { 1, type, QRTR_NODE_APPS, sport, 0, len, dnode, dport };
++	uint32_t n = 32 + ((len + 3) & ~3u);
++
++	if (n > sizeof(qr_buf)) {
++		printf("SWEET QRTR: %u-byte packet to %u:%#x refused (too big)\n", len, dnode, dport);
++		return;
++	}
++	bzero(qr_buf, n);
++	memcpy(qr_buf, h, 32);
++	memcpy(qr_buf + 32, pl, len);
++	glink_send(qr_buf, n);
++}
++
++static void
++qrtr_ctrl(uint32_t cmd, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	uint32_t pl[5] = { cmd, a, b, c, d };
++
++	qrtr_send(cmd, QRTR_PORT_CTRL, qr.node, QRTR_PORT_CTRL, pl, sizeof(pl));
++}
++
++static const char *
++qrtr_svc_name(uint32_t svc)
++{
++	switch (svc) {
++	case 0x01: return " (wds)";
++	case 0x02: return " (dms)";
++	case 0x03: return " (nas)";
++	case 0x0b: return " (uim)";
++	case 0x0e: return " (rmtfs)";
++	case 0x1a: return " (wda)";
++	case 0x2b: return " (ssctl)";
++	case 0x31: return " (ipa)";
++	case 0x40: return " (servreg-loc)";
++	case 0x42: return " (servreg-notif)";
++	case 0x45: return " (WLFW)";
++	default:   return "";
++	}
++}
++
++static void
++qrtr_data(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
++{
++	if (qr.other++ < 20) {
++		printf("SWEET QRTR: t=+%u ms DATA to port %#x from %u:%#x, %u bytes (no service here)\n",
++		    mss_now(), dport, snode, sport, len);
++	}
++	(void)d;
++}
++
++static void
++qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t h[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }, c[5] = { 0, 0, 0, 0, 0 };
++
++	if (len >= 32) {
++		memcpy(h, p, 32);
++	}
++	if (len < 32 || h[0] != 1 || h[5] > len - 32) {
++		if (qr.other++ < 20) {
++			printf("SWEET QRTR: t=+%u ms dropped a %u-byte packet (not a v1 header, first byte %u)\n",
++			    mss_now(), len, len ? p[0] : 0);
++		}
++		return;
++	}
++	uint32_t type = h[1], snode = h[2], sport = h[3], size = h[5], dport = h[7];
++	if (type == Q_DATA) {
++		if (h[4]) {             /* confirm_rx: qrtr_send_resume_tx, the full 20-byte packet */
++			uint32_t r[5] = { Q_RESUME_TX, QRTR_NODE_APPS, dport, 0, 0 };
++			qrtr_send(Q_RESUME_TX, dport, snode, sport, r, sizeof(r));
++		}
++		qrtr_data(snode, sport, dport, p + 32, size);
++		return;
++	}
++	memcpy(c, p + 32, MIN(size, (uint32_t)sizeof(c)));
++	switch (type) {
++	case Q_HELLO:
++		printf("SWEET QRTR: t=+%u ms HELLO from node %u\n", mss_now(), snode);
++		qr.node = snode;
++		qr.hello_rx = true;
++		qr.hello_sent = false;  /* ns.c ctrl_cmd_hello: answer it */
++		break;
++	case Q_NEW_SERVER:
++		if (c[1] == 0 && c[2] == 0) {
++			break;          /* end of a lookup list */
++		}
++		printf("SWEET QRTR: NEW_SERVER service %#x instance %#x node %u port %#x%s\n", c[1], c[2],
++		    c[3], c[4], qrtr_svc_name(c[1]));
++		if (qr.nsrv < sizeof(qr.srv) / sizeof(qr.srv[0])) {
++			qr.srv[qr.nsrv].svc = c[1];
++			qr.srv[qr.nsrv].inst = c[2];
++			qr.srv[qr.nsrv].node = c[3];
++			qr.srv[qr.nsrv].port = c[4];
++			qr.nsrv++;
++		}
++		break;
++	case Q_DEL_SERVER:
++		printf("SWEET QRTR: t=+%u ms DEL_SERVER service %#x instance %#x node %u port %#x\n", mss_now(),
++		    c[1], c[2], c[3], c[4]);
++		break;
++	case Q_BYE:
++		printf("SWEET QRTR: t=+%u ms BYE from node %u\n", mss_now(), snode);
++		break;
++	case Q_DEL_CLIENT:
++		qr.del_clients++;
++		break;
++	case Q_RESUME_TX:
++		qr.resumes++;
++		break;
++	default:
++		if (qr.other++ < 20) {
++			printf("SWEET QRTR: t=+%u ms control type %u from %u:%#x (%#x %#x %#x %#x)\n", mss_now(),
++			    type, snode, sport, c[1], c[2], c[3], c[4]);
++		}
++		break;
++	}
++}
++
++/* --- GLINK RX: one message, false = nothing (complete) to do --- */
++static bool
++glink_rx_one(void)
++{
++	uint32_t avail = rx_avail(), m[4], n = 8;
++
++	if (gl.bad || avail < 8) {
++		return false;
++	}
++	rx_peek(0, m, 8);
++	uint16_t cmd = (uint16_t)m[0], p1 = (uint16_t)(m[0] >> 16);
++	uint32_t p2 = m[1];
++
++	switch (cmd) {
++	case G_VERSION:
++		printf("SWEET GLINK: t=+%u ms VERSION %u features %#x\n", mss_now(), p1, p2);
++		if (p1 == 1) {
++			gl.features &= p2;
++		}
++		if (p1 != 0) {
++			glink_cmd(G_VERSION_ACK, 1, gl.features);
++		}
++		break;
++	case G_VERSION_ACK:
++		printf("SWEET GLINK: t=+%u ms VERSION_ACK %u features %#x\n", mss_now(), p1, p2);
++		if (p1 != 0 && !(p1 == 1 && p2 == gl.features)) {
++			gl.features &= (p1 == 1) ? p2 : ~0u;
++			glink_cmd(G_VERSION, 1, gl.features);
++		}
++		break;
++	case G_OPEN: {
++		char name[33];
++		n = 8 + p2;
++		if (p2 == 0 || p2 > 64 || ((n + 7) & ~7u) > gl.rx_len) {
++			gl.bad = "bad OPEN";
++			return false;
++		}
++		if (avail < ((n + 7) & ~7u)) {
++			return false;
++		}
++		bzero(name, sizeof(name));
++		rx_peek(8, name, MIN(p2, 32u));
++		printf("SWEET GLINK: t=+%u ms modem opens \"%s\" (rcid %u)%s\n", mss_now(), name, p1,
++		    strcmp(name, "IPCRTR") ? ", not ours" : "");
++		if (strcmp(name, "IPCRTR") == 0) {
++			gl.rcid = p1;
++			gl.remote_open = true;
++			glink_cmd(G_OPEN_ACK, p1, 0);   /* qcom_glink_create_remote */
++			if (!gl.open_sent) {
++				glink_open();
++			}
++		}
++		break;
++	}
++	case G_OPEN_ACK:
++		printf("SWEET GLINK: t=+%u ms OPEN_ACK lcid %u\n", mss_now(), p1);
++		gl.open_acked |= p1 == GLINK_LCID;
++		break;
++	case G_CLOSE:
++		printf("SWEET GLINK: t=+%u ms modem closes rcid %u\n", mss_now(), p1);
++		glink_cmd(G_CLOSE_ACK, p1, 0);
++		if (p1 == gl.rcid) {
++			gl.remote_open = false;
++		}
++		break;
++	case G_INTENT:
++		n = 8 + 8 * p2;
++		if (p2 == 0 || p2 > 64) {
++			gl.bad = "bad INTENT";
++			return false;
++		}
++		if (avail < n) {
++			return false;
++		}
++		for (uint32_t i = 0; i < p2; i++) {
++			uint32_t pair[2];
++			rx_peek(8 + 8 * i, pair, 8);
++			if (p1 == gl.rcid && gl.nri < sizeof(gl.ri) / sizeof(gl.ri[0])) {
++				gl.ri[gl.nri].size = pair[0];
++				gl.ri[gl.nri].id = pair[1];
++				gl.ri[gl.nri].used = false;
++				gl.nri++;
++			}
++		}
++		gl.intent_req = false;
++		break;
++	case G_RX_DONE:
++	case G_RX_DONE_REUSE:
++		for (unsigned i = 0; p1 == gl.rcid && i < gl.nri; i++) {
++			if (gl.ri[i].id == p2) {
++				if (cmd == G_RX_DONE_REUSE) {
++					gl.ri[i].used = false;
++				} else {
++					gl.ri[i] = gl.ri[--gl.nri];
++				}
++				break;
++			}
++		}
++		break;
++	case G_INTENT_REQ: {    /* qcom_glink_handle_intent_req: one intent, if it fits our buffer */
++		bool ok = p1 == gl.rcid && p2 <= GLINK_INTENT_SIZE;
++		if (ok) {
++			glink_intents(1);
++		}
++		glink_cmd(G_INTENT_REQ_ACK, GLINK_LCID, ok);
++		break;
++	}
++	case G_INTENT_REQ_ACK:
++		if (p2 == 0) {
++			gl.intent_req = false;  /* refused: ask again on the next send */
++		}
++		break;
++	case G_CLOSE_ACK:
++	case G_SIGNALS:
++		break;
++	case G_READ_NOTIF:
++		rx_advance(8);
++		glink_kick();
++		gl.rx_msgs++;
++		return true;
++	case G_TX_DATA:
++	case G_TX_DATA_CONT: {
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(0, m, 16);              /* m[2] chunk size, m[3] bytes left after it */
++		n = 16 + m[2];
++		if (m[2] > gl.rx_len || ((n + 7) & ~7u) > gl.rx_len) {
++			gl.bad = "bad TX_DATA chunk";
++			return false;
++		}
++		if (avail < ((n + 7) & ~7u)) {
++			return false;
++		}
++		if (cmd == G_TX_DATA) {
++			gl.asm_len = 0;
++			gl.asm_drop = false;
++		}
++		if (gl.asm_len + m[2] <= sizeof(gl_asm)) {
++			rx_peek(16, gl_asm + gl.asm_len, m[2]);
++			gl.asm_len += m[2];
++		} else {
++			gl.asm_drop = true;
++		}
++		rx_advance(n);
++		gl.rx_msgs++;
++		if (m[3] == 0) {
++			if (p1 == gl.rcid && gl.remote_open && !gl.asm_drop) {
++				qrtr_rx(gl_asm, gl.asm_len);
++			} else {
++				printf("SWEET GLINK: t=+%u ms dropped data on rcid %u (%u bytes)\n", mss_now(), p1,
++				    gl.asm_len);
++			}
++			if (gl.features & 1) {
++				glink_cmd(G_RX_DONE_REUSE, GLINK_LCID, p2);
++			} else {
++				glink_cmd(G_RX_DONE, GLINK_LCID, p2);
++				glink_intents(1);
++			}
++		}
++		return true;
++	}
++	default:
++		printf("SWEET GLINK: t=+%u ms unknown command %u (%#x %#x)\n", mss_now(), cmd, p1, p2);
++		gl.bad = "unknown glink command";
++		return false;
++	}
++	rx_advance(n);
++	gl.rx_msgs++;
++	return true;
++}
++
++static bool
++glink_start(void)
++{
++	uint64_t a = (SMEM_PA + mss_apm.off) & ~0x3fffull;
++	uint64_t b = (SMEM_PA + mss_apm.off + mss_apm.size + 0x3fff) & ~0x3fffull;
++	uint32_t dsize = 0, tsize = 0;
++	bool dmade = false, tmade = false;
++
++	apm_va = io_map(a, (vm_size_t)(b - a), MSS_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++	apm_pa = a;
++	apm_len = (vm_size_t)(b - a);
++	uint32_t desc = smem_get_or_alloc(GLINK_DESC_ITEM, 32, &dsize, &dmade);
++	uint32_t tx = desc ? smem_get_or_alloc(GLINK_TX_ITEM, 0x4000, &tsize, &tmade) : 0;
++	printf("SWEET GLINK: descriptor item %u +%#x %u bytes (%s), tx fifo item %u +%#x %u bytes (%s)\n",
++	    GLINK_DESC_ITEM, desc, dsize, dmade ? "ours" : "the modem's", GLINK_TX_ITEM, tx, tsize,
++	    tmade ? "ours" : "the modem's");
++	if (!apm_va || !desc || dsize != 32 || !tx || (tsize & 7) || tsize < 0x400 || mss_bad ||
++	    !apm_ok(desc + 28) || !apm_ok(tx + tsize - 4)) {
++		return false;
++	}
++	gl.desc = desc;
++	gl.tx = tx;
++	gl.tx_len = tsize;
++	gl.features = 1;                        /* GLINK_FEATURE_INTENT_REUSE */
++	gl.next_iid = 1;
++	apm_wr(desc + 8, 0);                    /* *rx_pipe->tail = 0; *tx_pipe->head = 0 */
++	apm_wr(desc + 4, 0);
++	glink_cmd(G_VERSION, 1, gl.features);
++	return !gl.bad && !mss_bad;
++}
++
++static void
++glink_poll(unsigned t)
++{
++	static unsigned next_look;
++
++	if (!gl.rx && t >= next_look) {        /* glink_smem_rx_avail: the modem makes item 480 */
++		uint32_t size = 0, off = smem_part_find(&mss_apm, GLINK_RX_ITEM, &size);
++		next_look = t + 10;
++		if (off && size != ~0u) {
++			printf("SWEET GLINK: t=+%u ms modem rx fifo item %u +%#x, %u bytes\n", t, GLINK_RX_ITEM,
++			    off, size);
++			if ((size & 7) || size < 0x400 || !apm_ok(off) || !apm_ok(off + size - 4)) {
++				gl.bad = "item 480 unusable";
++				return;
++			}
++			gl.rx = off;
++			gl.rx_len = size;
++		}
++	}
++	for (unsigned i = 0; i < 64 && gl.rx && glink_rx_one(); i++) {
++	}
++	glq_pump();
++	if (glink_up() && !gl.intents_sent) {
++		glink_intents(GLINK_INTENTS);
++		gl.intents_sent = true;
++		printf("SWEET GLINK: t=+%u ms IPCRTR open both ways (features %#x), %u intents of %u bytes\n", t,
++		    gl.features, GLINK_INTENTS, GLINK_INTENT_SIZE);
++	}
++	if (glink_up() && !qr.hello_sent) {
++		qrtr_ctrl(Q_HELLO, 0, 0, 0, 0);
++		qr.hello_sent = true;
++		printf("SWEET QRTR: t=+%u ms HELLO sent to node %#x\n", t, qr.node);
++	}
++	if (t >= 2000 && !gl.open_sent && gl.rx) {
++		printf("SWEET GLINK: t=+%u ms the modem has not opened IPCRTR: opening it\n", t);
++		glink_open();
++	}
++}
++
++static void
++glink_summary(void)
++{
++	printf("SWEET GLINK: summary: rx %u msgs, tx %u, IPCRTR %s, modem intents %u, queued %u, dropped %u%s%s; "
++	    "qrtr node %u hello %s, %u servers, %u resume_tx, %u del_client\n", gl.rx_msgs, gl.tx_msgs,
++	    glink_up() ? "up" : "down", gl.nri, glq_tail - glq_head, gl.qdrops, gl.bad ? ", error: " : "",
++	    gl.bad ? gl.bad : "", qr.node, qr.hello_rx ? "yes" : "no", qr.nsrv, qr.resumes, qr.del_clients);
++	for (unsigned i = 0; i < qr.nsrv; i++) {
++		printf("SWEET QRTR:   service %#x instance %#x node %u port %#x%s\n", qr.srv[i].svc,
++		    qr.srv[i].inst, qr.srv[i].node, qr.srv[i].port, qrtr_svc_name(qr.srv[i].svc));
++	}
++}
++
++/* ipa_smp2p_notify: once the modem raises bit 0 of its "ipa" entry, ours = valid (bit 0), IPA off */
++static void
++mss_ipa_poll(void)
++{
++	static uint32_t in, last;
++	static bool answered;
++	uint32_t size = 0, item, v;
++
++	if (!in && (item = smem_part_find(&mss_apm, SMP2P_IN_ITEM, &size)) != 0 && size >= 20) {
++		in = smp2p_entry(item, "ipa");
++	}
++	if (!in || (v = smem32(in)) == last) {
++		return;
++	}
++	printf("SWEET MSS: t=+%u ms modem ipa entry %#x -> %#x\n", mss_now(), last, v);
++	if ((v & 1) && !(last & 1) && !answered && ms.out_off) {
++		smem_w32(ms.out_off + 20 + 20 + 16, 1);
++		smp2p_kick();
++		answered = true;
++		printf("SWEET MSS: ipa clock query answered: valid, AP IPA off\n");
++	}
++	last = v;
++}
++
++/* the stage-6 watch; ends in the stop path, like stage 5's */
++static void
++mss_stage6(uint32_t sk)
++{
++	const char *why = NULL;
++	bool up = false;
++	unsigned t = 0, next = 0;
++
++	mss_t0 = mach_absolute_time();
++	if (!glink_start()) {
++		why = "glink smem items";
++	}
++	while (!why && (t = mss_now()) < MSS_WATCH6_MS) {
++		if (t >= next) {
++			uint32_t now = mss_slave_kernel();
++			next = t + 10;
++			if (now != sk) {
++				printf("SWEET MSS: t=+%u ms slave-kernel %#x%s\n", t, now, (now & SK_FATAL) ? " FATAL" : "");
++				sk = now;
++			}
++			if (sk == ~0u || (sk & SK_FATAL)) {
++				mss_crash_reason();
++				ms.running = false;     /* crashed: no stop request */
++				why = "modem fatal";
++				break;
++			}
++			mss_ipa_poll();
++		}
++		glink_poll(t);
++		if (gl.bad || mss_bad) {
++			why = gl.bad ? gl.bad : "refused access";
++		} else if (!up && glink_up() && qr.hello_rx) {
++			up = true;
++			mss_reached = 6;
++			printf("SWEET MSS: stage 6: ok: IPCRTR up, qrtr HELLO from node %u, after %u ms\n", qr.node, t);
++		} else if (!up && t >= 10000) {
++			why = "no IPCRTR or HELLO within 10 s";
++		}
++		delay(1000);
++	}
++	glink_summary();
++	if (!up) {
++		printf("SWEET MSS: stage 6: FAILED: %s\n", why ? why : "?");
++	} else if (why) {
++		printf("SWEET MSS: watch: %s at +%u ms\n", why, t);
++	} else {
++		printf("SWEET MSS: watch: %u s without a fatal\n", MSS_WATCH6_MS / 1000);
++	}
++	mss_stop(why ? why : "watch over");
++	if (apm_va) {
++		ml_io_unmap(apm_va, apm_len);
++		apm_va = 0;
++	}
++}
++
+ /* --- stage 5: q6v5_mpss_load + qcom_q6v5_wait_for_start, then a watch --- */
+ static int32_t
+ mss_mba_status(void)
+@@ -1532,6 +2315,10 @@
+ 	(void)mss_assign("mba (reclaim)", MBA_PA, MBA_SIZE, &ms.mba_perm, PERM_HLOS);
+ 	printf("SWEET MSS: stage 5: ok: modem ready after %u ms (slave-kernel %#x%s)\n", t, sk,
+ 	    (sk & SK_HANDOVER) ? ", handover" : "");
++	if (mss_mode >= 6) {
++		mss_stage6(sk);         /* 0264: its own watch and stop */
++		return true;
++	}
+ 
+ 	/* watch: every change of slave-kernel; a fatal ends it */
+ 	for (unsigned w = 0; w < MSS_WATCH_S * 1000; w += 10) {
+@@ -1560,6 +2347,7 @@
+ {
+ 	int mode = (int)(uintptr_t)arg, reached = 1;
+ 
++	mss_mode = mode;
+ 	if (mss_stage2()) {
+ 		reached = 2;
+ 		if (mode >= 3 && mss_stage3(mode == 3)) {
+@@ -1567,7 +2355,7 @@
+ 			if (mode >= 4 && mss_stage4(mode == 4)) {
+ 				reached = 4;
+ 				if (mode >= 5 && mss_stage5()) {
+-					reached = 5;
++					reached = MAX(5, mss_reached);
+ 				}
+ 			}
+ 		}
+@@ -1577,7 +2365,7 @@
+ 		mss_win_va = 0;
+ 	}
+ 	printf("SWEET MSS: done: mss=%d, last good stage %d%s\n", mode, reached,
+-	    reached == (mode > 5 ? 5 : mode) ? "" : " (stopped early)");
++	    reached == (mode > 6 ? 6 : mode) ? "" : " (stopped early)");
+ 	(void)thread_terminate(current_thread());
+ }
+ 

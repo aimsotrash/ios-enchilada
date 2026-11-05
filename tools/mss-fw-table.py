@@ -2,6 +2,11 @@
 """Byte offsets of the MSS firmware files inside the modem_a FAT image (xnu 0260 mss_fw[]).
 
   python3 -I tools/mss-fw-table.py backup/modem-fw/modem_a.img backup/modem-fw/modem_a/image
+  python3 -I tools/mss-fw-table.py --tftp backup/modem-fw/modem_a.img backup/modem-fw/modem_a/image
+
+--tftp (xnu 0265 mss_tftp[]): every file the modem may ask the TFTP server for, i.e. all files
+under image/ except the PIL images the apps side loads (X.mdt + X.bNN, mba.mbn), as
+{ path relative to image/, offset, size }. A zero-length file gets offset 0.
 
 The kernel reads each file straight from the modem_a partition (UFS LUN 4) at the offset printed
 here, so a file must lie in the image as one contiguous byte run. That is checked the direct way:
@@ -42,14 +47,37 @@ def find(img, data):
         start = at + 1
 
 
+def tftp_files(image_dir):
+    pil = {f[:-4] for f in os.listdir(image_dir) if f.endswith('.mdt')}
+    out = []
+    for d, _, files in os.walk(image_dir):
+        for f in files:
+            base, ext = os.path.splitext(f)
+            seg = ext == '.mdt' or (len(ext) == 4 and ext[1] == 'b' and ext[2:].isdigit())
+            if d == image_dir and ((base in pil and seg) or f == 'mba.mbn'):
+                continue
+            out.append(os.path.relpath(os.path.join(d, f), image_dir))
+    return sorted(out)
+
+
 def main():
-    if len(sys.argv) != 3:
+    tftp = sys.argv[1:2] == ['--tftp']
+    args = sys.argv[2:] if tftp else sys.argv[1:]
+    if len(args) != 2:
         sys.exit(__doc__)
-    with open(sys.argv[1], 'rb') as f:
+    with open(args[0], 'rb') as f:
         img = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    if tftp:
+        for name in tftp_files(args[1]):
+            data = open(os.path.join(args[1], name), 'rb').read()
+            at = find(img, data) if data else 0
+            if at < 0:
+                sys.exit('%s: not one contiguous run in the image' % name)
+            print('\t{ "%s", %#x, %#x },' % (name, at, len(data)))
+        return
     rows = []
-    for name in wanted(sys.argv[2]):
-        data = open(os.path.join(sys.argv[2], name), 'rb').read()
+    for name in wanted(args[1]):
+        data = open(os.path.join(args[1], name), 'rb').read()
         at = find(img, data)
         if at < 0:
             sys.exit('%s: not one contiguous run in the image' % name)
