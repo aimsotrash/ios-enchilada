@@ -1,0 +1,28 @@
+sweet: BT fake: echo the LE meta VSC (0xfce9) sub-opcode in its Command Complete
+
+boot36 (0273): bluetoothd's 45th command is VSC 0xfce9 01 27 10 10 00 (LE meta, sub-opcode 1 =
+BD_VSC_LE_META_ENA_FEATURES); our reply is status 0 + 128 zero bytes. 15.6 s later the unified log has
+"Bluetooth error - restarting { build=release, reason=3602, context="BD_VSC_LE_META_ENA_FEATURES" }"
+(3602 = 0xe12 = BT_VSC_STALL_ERROR, raised after "VSC stall detected, %s (0x%x)" at 0x1003cd1d0 ->
+0x1003cd224) and bluetoothd exits 1. _BCM_SubOpcodeChecker (0x100126390) accepts a
+0xfce9 completion only when it has no return bytes or its first return byte equals the sub-opcode it
+sent; the zero pad (since 0273) made byte 0 = 0 != 1, so the completion is dropped and the waiter times
+out. Answer byte 0 = command parameter 0 for 0xfce9.
+
+--- a/bsd/dev/sweet_bt.c	2026-11-05 12:17:48.279957532 -0800
++++ b/bsd/dev/sweet_bt.c	2026-11-05 12:17:53.867745727 -0800
+@@ -194,6 +194,14 @@
+ 		ev[6] = 0x01;                   /* Unknown HCI Command */
+ 	} else if ((op >> 10) == 0x3f && u->pad) {
+ 		n = BT_VSC_PAD;                 /* ev[] is zeroed past the header */
++		/*
++		 * LE meta VSC (0xfce9): the first return byte echoes the sub-opcode (param 0);
++		 * bluetoothd's _BCM_SubOpcodeChecker drops a reply whose byte differs, the waiter
++		 * stalls 15 s and it restarts ("VSC stall detected", reason 3602 BT_VSC_STALL_ERROR).
++		 */
++		if (op == 0xfce9 && plen > 0) {
++			ret[0] = par[0];
++		}
+ 	} else if ((op >> 10) == 0x01 && op != 0x0402) {
+ 		/*
+ 		 * Link control commands (Inquiry, Create_Connection, ...) are answered with Command
