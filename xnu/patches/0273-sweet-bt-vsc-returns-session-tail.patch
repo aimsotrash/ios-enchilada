@@ -1,0 +1,183 @@
+sweet: BT fake: zero-padded vendor command returns for bluetoothd, per-session tail log
+
+boot35 (0272): BlueTool's boot script runs to the end (Write_RAM x ~840, Launch_RAM, device -s 115200,
+bcm -B/-A/-N/-Q/-x/-s all answered), bluetoothd then opens its own POSIX H4 session (the "48 packets"
+one) and aborts on packet 48: every bluetoothd crash report (SIGABRT, H4 reader thread 0x100067ae0 ->
+0x100068bc0 -> 0x100069100 -> 0x100118af0 -> 0x100119954 -> 0x10012652c -> AssertFail 0x1000c0d90) is
+_BCM_CreateMultiAdvInstParser (0x100126424): on status 0 it reads a 1-byte instance from the Command
+Complete of VSC 0xfd48 (create multi-adv instance, sent at 0x10012dc04), which our status-only reply
+does not have: "ByteStream_NumReadBytesAvail(*pBs) >= 1". launchd restarts bluetoothd every 10 s.
+
+- vendor commands (OGF 0x3f) from any process but BlueTool: status 0 + 128 zero bytes, so BCM VSC
+  parsers that read fixed fields find them and every count/length is 0; BlueTool keeps the
+  status-only replies its firmware download already accepts (btfake=2 is unchanged)
+- LE_Read_Maximum_Advertising_Data_Length (1650) and LE_Read_Number_of_Supported_Advertising_Sets (16)
+- logging: Write_RAM and its replies are counted, not printed; connect/disconnect always printed with
+  the process name and the Write_RAM/unlogged counts; a session that ran out of log budget prints
+  its last 32 packets at disconnect (first 16 such sessions per boot)
+
+--- a/bsd/dev/sweet_bt.c	2026-11-05 11:58:18.445768377 -0800
++++ b/bsd/dev/sweet_bt.c	2026-11-05 11:59:42.090644963 -0800
+@@ -25,6 +25,9 @@
+  *
+  * Log lines "SWEET BT: uN rx <hex>" (a complete H4 packet the host wrote to unit N) and
+  * "uN tx <hex>" (one it reads back), first 64 bytes, BT_LOG_LINES lines per boot, then counts.
++ * Firmware Write_RAM (0xfc4c) and its replies are only counted. Connect and disconnect lines
++ * (with the process name) are always printed; a session that lost lines to the budget also
++ * prints its last BT_RING packets ("uN tail <seq> rx|tx <hex>", 24 bytes) at disconnect.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -49,9 +52,24 @@
+ #define BT_LOG_BYTES    64
+ #define BT_LOG_LINES    400
+ #define BT_PKT_MAX      (4 + 255)       /* an H4 command: type, opcode, length, parameters */
++#define BT_RING         32              /* last packets of a session, printed at disconnect */
++#define BT_RING_BYTES   24
++#define BT_TAIL_DUMPS   16              /* sessions whose tail is printed, per boot */
++/*
++ * Zero return parameters after status 0 for vendor commands from anyone but BlueTool:
++ * bluetoothd's BCM VSC parsers read their fields without looking at the event length
++ * (_BCM_CreateMultiAdvInstParser, 0xfd48, asserted "ByteStream_NumReadBytesAvail(*pBs) >= 1"
++ * and aborted bluetoothd). Zero counts and lengths keep every list empty.
++ */
++#define BT_VSC_PAD      128
+ 
+ _Static_assert(sizeof(struct user_termios) == 72, "TIOCGETA from a 64-bit process");
+ 
++struct bt_rec {
++	uint8_t         tx, len;        /* direction, bytes kept */
++	uint8_t         b[BT_RING_BYTES];
++};
++
+ struct bt_unit {
+ 	u_int32_t       unit;
+ 	struct user_termios tio;
+@@ -59,6 +77,13 @@
+ 	uint32_t        have;           /* bytes in pkt[] */
+ 	uint32_t        skip;           /* data packet payload still to drop */
+ 	uint32_t        rx, tx;         /* packets */
++	char            who[MAXCOMLEN + 1];
++	bool            pad;            /* not BlueTool: pad vendor command returns */
++	bool            hush;           /* current packet is a Write_RAM (or its reply): not printed */
++	uint32_t        wram;           /* Write_RAM (0xfc4c) commands */
++	uint32_t        quiet;          /* packets not printed for lack of log budget */
++	uint32_t        nrec;           /* packets recorded in ring[] (total, ring index = nrec % BT_RING) */
++	struct bt_rec   ring[BT_RING];
+ };
+ 
+ /* One lock for the parser, the log budget and every unit (one host at a time in practice). */
+@@ -84,20 +109,35 @@
+ }
+ 
+ static void
+-bt_hex(const struct bt_unit *u, const char *dir, const uint8_t *p, size_t n)
++bt_hexstr(char *s, const uint8_t *p, size_t k)
+ {
+ 	static const char digits[] = "0123456789abcdef";
+-	char s[2 * BT_LOG_BYTES + 1];
+-	size_t k = MIN(n, BT_LOG_BYTES);
+ 
+-	if (!bt_log_ok()) {
+-		return;
+-	}
+ 	for (size_t i = 0; i < k; i++) {
+ 		s[2 * i] = digits[p[i] >> 4];
+ 		s[2 * i + 1] = digits[p[i] & 15];
+ 	}
+ 	s[2 * k] = '\0';
++}
++
++static void
++bt_hex(struct bt_unit *u, const char *dir, const uint8_t *p, size_t n)
++{
++	char s[2 * BT_LOG_BYTES + 1];
++	size_t k = MIN(n, BT_LOG_BYTES);
++	struct bt_rec *r = &u->ring[u->nrec++ % BT_RING];
++
++	r->tx = dir[0] == 't';
++	r->len = (uint8_t)MIN(n, BT_RING_BYTES);
++	memcpy(r->b, p, r->len);
++	if (u->hush) {
++		return;
++	}
++	if (!bt_log_ok()) {
++		u->quiet++;
++		return;
++	}
++	bt_hexstr(s, p, k);
+ 	if (n > k) {
+ 		printf("SWEET BT: u%u %s %s... (%zu bytes)\n", u->unit, dir, s, n);
+ 	} else {
+@@ -139,6 +179,8 @@
+ 	{ 0x202f, 8, { 0xfb, 0x00, 0x48, 0x08, 0xfb, 0x00, 0x48, 0x08 } }, /* LE_Read_Maximum_Data_Length */
+ 	{ 0x2023, 4, { 0x1b, 0x00, 0x48, 0x01 } },      /* LE_Read_Suggested_Default_Data_Length */
+ 	{ 0x204a, 1, { 0x08 } },                        /* LE_Read_Periodic_Advertiser_List_Size */
++	{ 0x203a, 2, { 0x72, 0x06 } },                  /* LE_Read_Maximum_Advertising_Data_Length: 1650 */
++	{ 0x203b, 1, { 0x10 } },                        /* LE_Read_Number_of_Supported_Advertising_Sets */
+ };
+ 
+ static void
+@@ -150,6 +192,8 @@
+ 
+ 	if ((op >> 10) == 0x3f && bt_mode == 2) {
+ 		ev[6] = 0x01;                   /* Unknown HCI Command */
++	} else if ((op >> 10) == 0x3f && u->pad) {
++		n = BT_VSC_PAD;                 /* ev[] is zeroed past the header */
+ 	} else if ((op >> 10) == 0x01 && op != 0x0402) {
+ 		/*
+ 		 * Link control commands (Inquiry, Create_Connection, ...) are answered with Command
+@@ -223,9 +267,13 @@
+ 			if (u->have < hdr + u->pkt[3]) {
+ 				continue;
+ 			}
++			uint16_t op = (uint16_t)(u->pkt[1] | u->pkt[2] << 8);
+ 			u->rx++;
++			u->hush = op == 0xfc4c;         /* firmware Write_RAM: ~840 per boot script, counted */
++			u->wram += u->hush;
+ 			bt_hex(u, "rx", u->pkt, u->have);
+-			bt_command(u, (uint16_t)(u->pkt[1] | u->pkt[2] << 8), &u->pkt[4], u->pkt[3]);
++			bt_command(u, op, &u->pkt[4], u->pkt[3]);
++			u->hush = false;
+ 		} else {
+ 			/* data: log the header and the payload length, drop the payload */
+ 			uint32_t len = t == 0x03 ? u->pkt[3] : (u->pkt[3] | u->pkt[4] << 8) & (t == 0x05 ? 0x3fff : 0xffff);
+@@ -249,11 +297,11 @@
+ 	u->unit = sac->sc_unit;
+ 	u->tio.c_cflag = CS8 | CREAD | CLOCAL;
+ 	u->tio.c_ispeed = u->tio.c_ospeed = 115200;
++	proc_selfname(u->who, sizeof(u->who));
++	u->pad = strcmp(u->who, "BlueTool") != 0;
+ 	*info = u;
+ 	lck_mtx_lock(&bt_lock);
+-	if (bt_log_ok()) {
+-		printf("SWEET BT: u%u connected (pid %d)\n", u->unit, proc_selfpid());
+-	}
++	printf("SWEET BT: u%u connected (pid %d %s)\n", u->unit, proc_selfpid(), u->who);
+ 	lck_mtx_unlock(&bt_lock);
+ 	return 0;
+ }
+@@ -261,11 +309,22 @@
+ static errno_t
+ bt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *info)
+ {
++	static uint32_t dumps;
+ 	struct bt_unit *u = info;
++	char s[2 * BT_RING_BYTES + 1];
+ 
+ 	(void)ref;
+ 	lck_mtx_lock(&bt_lock);
+-	printf("SWEET BT: u%u disconnected after %u packets in, %u out\n", unit, u->rx, u->tx);
++	printf("SWEET BT: u%u (%s) disconnected after %u packets in, %u out (%u Write_RAM, %u unlogged)\n",
++	    unit, u->who, u->rx, u->tx, u->wram, u->quiet);
++	if (u->quiet > 0 && dumps < BT_TAIL_DUMPS) {
++		dumps++;
++		for (uint32_t i = u->nrec > BT_RING ? u->nrec - BT_RING : 0; i < u->nrec; i++) {
++			const struct bt_rec *r = &u->ring[i % BT_RING];
++			bt_hexstr(s, r->b, r->len);
++			printf("SWEET BT: u%u tail %u %s %s\n", unit, i, r->tx ? "tx" : "rx", s);
++		}
++	}
+ 	lck_mtx_unlock(&bt_lock);
+ 	kfree_type(struct bt_unit, u);
+ 	return 0;
