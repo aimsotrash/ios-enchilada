@@ -1,0 +1,100 @@
+enchilada: RPMh: ACTIVE ARC votes for the modem's proxy rails (cx, mx, mss)
+
+q6v5_pds_enable() puts the sdm845 mss_pil power domains cx, mx and mss at their highest
+performance state before the MBA boots. sweet_rpmh_arc_vote(res, corner, &sent) sends that the
+way rpmhpd.c does, through the proven apps-RSC ACTIVE TCS path: the ARC (cmd-db slave 3) entry is
+looked up as for VRM/BCM, its aux data read as the u16 level list that rpmhpd_update_level_mapping
+uses (a zero after the first entry ends it), and the corner index is sent as one command with a
+response; corner < 0 = the top corner (INT_MAX), 0 = off. Each corner and its level is logged.
+SDM845 only (rpmhrsc/rpmhtcs as for the DDR vote) and only cx.lvl, mx.lvl, mss.lvl. Unused until
+mss>=4 (0262).
+
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -14,6 +14,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_ddr_vote(void);
++int sweet_rpmh_arc_vote(const char *res, int corner, unsigned *sent);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u     /* sweet (SM7150) default */
+@@ -76,6 +77,7 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
+ #define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+@@ -533,5 +535,70 @@
+ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * 0261: an ACTIVE vote for an ARC rail, as rpmhpd.c sends it for the modem's proxy power domains
++ * (sdm845 mss_pil: cx, mx, mss). The data is a corner index into the resource's cmd-db aux data, a
++ * list of u16 levels whose zero padding (any zero after the first entry) ends it
++ * (rpmhpd_update_level_mapping); corner < 0 asks for the highest corner, which is what
++ * q6v5_pds_enable's dev_pm_genpd_set_performance_state(INT_MAX) sends. One command with a response
++ * (rpmh_write, wait_for_compl). SDM845 and these three names only; *sent gets the corner voted.
++ */
++int
++sweet_rpmh_arc_vote(const char *res, int corner, unsigned *sent)
++{
++	uint32_t address = 0, off = 0, len = 0;
++	unsigned count = 0;
++	int error = EIO;
++
++	if (!res || (strcmp(res, "cx.lvl") && strcmp(res, "mx.lvl") && strcmp(res, "mss.lvl"))) {
++		printf("SWEET RPMH: ARC vote: cx.lvl, mx.lvl or mss.lvl only\n");
++		return EINVAL;
++	}
++	rh_bases();
++	if (rh_rsc_pa != 0x179e0000u || rh_tcs_pa != 0x179e0d00u) {
++		printf("SWEET RPMH: ARC vote is SDM845-only (rsc %#x tcs %#x); not sent\n", rh_rsc_pa, rh_tcs_pa);
++		return ENODEV;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_ARC, &address, &off, &len);
++	}
++	if (!error) {
++		for (unsigned i = 0; i < len / 2 && i < 16; ++i) {
++			uint16_t lvl = rh_db16(off + 2 * i);
++			if (i > 0 && lvl == 0) {
++				break;
++			}
++			printf("SWEET RPMH: %s corner %u = level %u\n", res, i, lvl);
++			count = i + 1;
++		}
++		if (count == 0 || (corner >= 0 && (unsigned)corner >= count)) {
++			printf("SWEET RPMH: %s has %u corners; corner %d refused\n", res, count, corner);
++			error = EINVAL;
++		}
++	}
++	if (!error) {
++		const uint32_t data = corner < 0 ? count - 1 : (uint32_t)corner;
++		const uint32_t msgid = RH_WRITE_ACK;
++		char what[32];
++		snprintf(what, sizeof(what), "%s corner %u", res, data);
++		error = rh_send(1, &address, &data, &msgid, 1, what);
++		if (!error && sent) {
++			*sent = data;
++		}
++	}
++	printf("SWEET RPMH: ARC %s vote %s (errno %d)\n", res, error ? "FAILED" : "complete", error);
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -1,0 +1,117 @@
+enchilada: UFS: read-only reader for one partition on another LUN (modem firmware, mss=2+)
+
+The modem firmware is read where the phone keeps it: modem_a, /dev/block/sde4, i.e. UFS LUN 4
+(sha256 of the partition = backup/modem-fw/modem_a.img). sweet_ufs_read_part(lun, name, off,
+dst, len) finds the partition in that LUN's GPT (ufs_find_partition, which now returns the bounds
+instead of setting the root partition's), clears a unit attention with up to three TEST UNIT
+READYs as init does, and copies the byte range out through the 1 MiB bounce buffer with
+READ(10) only; ranges outside the partition are refused. su.lun is switched only while
+sweet_ufs_lock is held and is restored before it is dropped, and every write (strategy, the
+sweetlog thread) takes the same lock, so a write can never be issued to another LUN; the root
+partition's bounds (the write fence) are not touched. Same approach as ios-topaz 0115.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -303,7 +303,7 @@
+ }
+ 
+ static int
+-ufs_find_partition(const char *want)
++ufs_find_partition(const char *want, uint64_t *first_block, uint64_t *nblocks)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -348,14 +348,73 @@
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_block = first;
++		*nblocks = last - first + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+ 
++/*
++ * 0260: read-only access to one partition on another LUN, for the modem firmware (sweet_mss.c
++ * reads modem_a on LUN 4, as topaz 0115 does). su.lun is switched only while sweet_ufs_lock is
++ * held and restored before it is dropped; every write (strategy, sweetlog) takes the same lock,
++ * so no write can reach another LUN, and this path issues READ(10) only. That partition's bounds
++ * live here; the root partition's (su.first_block/nblocks, the write fence) are not touched.
++ */
++int sweet_ufs_read_part(unsigned lun, const char *name, uint64_t off, void *dst, uint32_t len);
++
++int
++sweet_ufs_read_part(unsigned lun, const char *name, uint64_t off, void *dst, uint32_t len)
++{
++	static char part[37];
++	static unsigned part_lun;
++	static uint64_t part_first, part_blocks;
++	int error = 0;
++
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	if (lun > 7 || strlen(name) >= sizeof(part)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t saved = su.lun;
++	su.lun = (uint8_t)lun;
++	if (part_lun != lun || strcmp(part, name) != 0) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* as at init: the first command to a LUN may report a unit attention */
++		for (int i = 0; i < 3 && ufs_scsi(tur, sizeof(tur), 0, false); i++) {
++		}
++		part[0] = '\0';
++		error = ufs_find_partition(name, &part_first, &part_blocks);
++		if (!error) {
++			strlcpy(part, name, sizeof(part));
++			part_lun = lun;
++			printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu blocks, read-only\n",
++			    name, lun, part_first, part_blocks);
++		}
++	}
++	uint64_t bytes = part_blocks * UFS_BLOCK;
++	if (!error && (off > bytes || len > bytes - off)) {
++		error = EINVAL;
++	}
++	for (uint32_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t n = MIN(len - done, BOUNCE_SIZE - skip);
++		error = ufs_read_blocks(part_first + pos / UFS_BLOCK, (skip + n + UFS_BLOCK - 1) / UFS_BLOCK);
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(su.dma + DMA_BOUNCE) + skip, n);
++			done += n;
++		}
++	}
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -633,7 +692,7 @@
+ 		}
+ 	}
+ 	if (!error) {
+-		error = ufs_find_partition(want);
++		error = ufs_find_partition(want, &su.first_block, &su.nblocks);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+@@ -666,7 +725,7 @@
+ 	sweet_touch_init();
+ 	sweet_gpu_probe();
+ 	sweet_usb_probe();
+-	sweet_mss_probe();         /* boot-arg mss=1, read-only */
++	sweet_mss_probe();         /* boot-arg mss=1 read-only probe; mss=2..5 stages (0262) */
+ 	return 0;
+ }
+ 

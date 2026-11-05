@@ -44,6 +44,12 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+# Synthetic BD address for /arm-io/bluetooth (ADT_BT=1): fixed, locally administered
+# (bit 1 of the first octet set), unicast (bit 0 clear), never a vendor OUI or the
+# phone's own address. Byte 0 is the first one printed (bluetoothd "%02x:..."), so
+# HCI Read_BD_ADDR sends it reversed (bsd/dev/sweet_bt.c).
+_bt = hashlib.sha256(b'sweet bt fake controller').digest()
+BT_ADDR = bytes([_bt[0] & 0xfc | 0x02]) + _bt[1:6]     # 66:df:f8:7d:d2:41
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -276,7 +282,21 @@ def build(seed=None, qemu=False, highmem=False, mem_size=None):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + ([
+        # ADT_BT=1 (PLAN-ENCHILADA.md §8 step 2). bluetoothd and BlueTool find it as the IOService
+        # named "bluetooth" (IOServiceNameMatching; the arm-io nub SweetPlatformExpert
+        # creates) and read these with IORegistryEntrySearchCFProperty(IODeviceTree):
+        # local-mac-address (6 bytes; without it bluetoothd exits "No bluetooth on this
+        # device"), transport-encoding (u32: 1 = H4, the plain UART transport; absent =
+        # 3 = H4BC in bluetoothd, 8 = none in BlueTool; 7 = PCIe would make BlueTool
+        # want the Wi-Fi HWIdentifiers), transport-speed (u32 baud, ignored below 115200;
+        # absent = 2400000; 3000000 is what a WCN3990 bridge would run).
+        node('bluetooth', [
+            ph(),
+            ('local-mac-address', BT_ADDR),
+            ('transport-encoding', u32(1)),
+            ('transport-speed', u32(3000000)),
+        ])] if os.environ.get('ADT_BT') == '1' else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),

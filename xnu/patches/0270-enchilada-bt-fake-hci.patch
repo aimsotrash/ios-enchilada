@@ -1,0 +1,491 @@
+enchilada: BT: fake H4 controller on the com.apple.uart.bluetooth kernel control (btfake=1)
+
+Bluetooth round 2 (PLAN-ENCHILADA.md §8 step 2): let the iOS 16 bluetoothd and BlueTool get past their
+hardware checks against a controller that exists only in the kernel, and log every packet they
+send, so the next boot shows what a real WCN3990 bridge must answer. Their UART transport is not a
+tty: both open a kernel control (PF_SYSTEM/SYSPROTO_CONTROL, SOCK_STREAM), set the line with
+getsockopt/setsockopt(TIOCGETA/TIOCSETA) and move plain H4 with write()/read(). bsd/dev/sweet_bt.c
+registers that control as "com.apple.uart.bluetooth" (BlueTool's default; bluetoothd needs
+BT_HCI_TRANSPORT=H4:POSIX:com.apple.uart.bluetooth in its launchd job, its own default is the
+Skywalk variant), keeps the termios per connection, reassembles H4 packets and answers every HCI
+command with Command Complete (Command Status for OGF 1): canned return parameters for the
+commands bluetoothd's init chain and BlueTool's chip probe read (Read_Local_Version = Broadcom,
+HCI/LMP 5.0, subversion 0x420e, which BlueTool maps to BCM4357B1; Read_BD_ADDR = /arm-io/bluetooth
+local-mac-address; supported commands, features, buffer sizes, LE sizes and states), status only
+for the rest. btfake=1: vendor commands (OGF 0x3f) succeed; btfake=2: they fail with 0x01 as a
+WCN3990 would. ACL/SCO/ISO are dropped. /dev/uart.bluetooth, cu.bluetooth, btreset, btwake and
+btpoweroff are no-op nodes (bluetoothd access()es the first two, BlueTool access()es btpoweroff
+and pulses the others by open/close). Log: "SWEET BT: uN rx <hex>" (host to controller) and
+"uN tx <hex>" (controller to host), first 64 bytes of each packet, termios and node open/close
+lines, 400 lines per boot, then counts; one registration line at boot and one per disconnect.
+Called from bsd_init() after domaininit(). Without btfake (or btfake=0) nothing is registered.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -391,6 +391,7 @@
+ bsd/kern/kern_crossarch.c		standard
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/sweet_amfi.c			standard
++bsd/dev/sweet_bt.c			standard
+ 
+ # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
+ bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -769,6 +769,11 @@
+ 	flow_divert_init();
+ #endif  /* FLOW_DIVERT */
+ #endif /* SOCKETS */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && SOCKETS
++	/* boot-arg btfake=1: the fake Bluetooth controller (bsd/dev/sweet_bt.c) */
++	extern void sweet_bt_init(void);
++	sweet_bt_init();
++#endif
+ #if SKYWALK
+ 	bsd_init_kprintf("calling skywalk_init\n");
+ 	(void) skywalk_init();
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,442 @@
++/*
++ * Fake Bluetooth controller for the iOS 16 userland (PLAN-ENCHILADA.md §8 step 2, round 2).
++ * Boot-arg btfake=1 (or 2); absent or 0 = nothing is registered.
++ * No hardware is touched: it only records what bluetoothd and BlueTool send.
++ *
++ * The UART transport of iOS 16 is not a tty. bluetoothd (its "POSIX" HCI driver) and BlueTool
++ * open a kernel control: socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL), CTLIOCGINFO on a
++ * name, connect(), then getsockopt/setsockopt(SYSPROTO_CONTROL, TIOCGETA / TIOCSETA, struct
++ * termios) in place of tcgetattr/tcsetattr, and plain H4 through write()/read(). BlueTool's
++ * default name (env BT_UART, "device -D") is "com.apple.uart.bluetooth". bluetoothd's default
++ * is "com.apple.uart.sk.bluetooth", which takes a Skywalk channel path (IOAOSSKYSETCHANNELSPEC,
++ * os_channel_create) that cannot be faked here, so its launchd job needs
++ * BT_HCI_TRANSPORT=H4:POSIX:com.apple.uart.bluetooth (tools/patch-launchd-plist.py --env).
++ *
++ * Every HCI command gets Command Complete (Command Status for OGF 1), with canned return
++ * parameters for what bluetoothd's init chain and BlueTool's chip probe read and status only
++ * for the rest. Read_Local_Version says Broadcom (15), HCI/LMP 5.0, LMP subversion 0x420e,
++ * which BlueTool's getChipset() maps to "BCM4357B1" (the iPhone X chip). btfake=1: vendor
++ * commands (OGF 0x3f) succeed as well; btfake=2: they fail with 0x01 (Unknown HCI Command), as
++ * a WCN3990 would answer Broadcom VSCs. ACL/SCO/ISO packets are logged and dropped.
++ *
++ * /dev/uart.bluetooth, cu.bluetooth, btreset, btwake and btpoweroff are no-op nodes: bluetoothd
++ * only access()es the first two; BlueTool access()es btpoweroff and pulses btwake/btreset by
++ * open + close (Apple's GPIO nodes assert while open). Opens and closes are logged.
++ *
++ * Log lines "SWEET BT: uN rx <hex>" (a complete H4 packet the host wrote to unit N) and
++ * "uN tx <hex>" (one it reads back), first 64 bytes, BT_LOG_LINES lines per boot, then counts.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++void sweet_bt_init(void);
++
++#define BT_CTL_NAME     "com.apple.uart.bluetooth"
++#define BT_LOG_BYTES    64
++#define BT_LOG_LINES    400
++#define BT_PKT_MAX      (4 + 255)       /* an H4 command: type, opcode, length, parameters */
++
++_Static_assert(sizeof(struct user_termios) == 72, "TIOCGETA from a 64-bit process");
++
++struct bt_unit {
++	u_int32_t       unit;
++	struct user_termios tio;
++	uint8_t         pkt[BT_PKT_MAX];
++	uint32_t        have;           /* bytes in pkt[] */
++	uint32_t        skip;           /* data packet payload still to drop */
++	uint32_t        rx, tx;         /* packets */
++};
++
++/* One lock for the parser, the log budget and every unit (one host at a time in practice). */
++static LCK_GRP_DECLARE(bt_grp, "sweet_bt");
++static LCK_MTX_DECLARE(bt_lock, &bt_grp);
++static kern_ctl_ref bt_ctl;
++static uint32_t bt_mode;
++static uint32_t bt_lines;
++static uint8_t bt_addr[6];      /* /arm-io/bluetooth local-mac-address, first octet printed first */
++
++static bool
++bt_log_ok(void)
++{
++	if (bt_lines < BT_LOG_LINES) {
++		bt_lines++;
++		return true;
++	}
++	if (bt_lines == BT_LOG_LINES) {
++		bt_lines++;
++		printf("SWEET BT: %u log lines used; packets are only counted from now on\n", BT_LOG_LINES);
++	}
++	return false;
++}
++
++static void
++bt_hex(const struct bt_unit *u, const char *dir, const uint8_t *p, size_t n)
++{
++	static const char digits[] = "0123456789abcdef";
++	char s[2 * BT_LOG_BYTES + 1];
++	size_t k = MIN(n, BT_LOG_BYTES);
++
++	if (!bt_log_ok()) {
++		return;
++	}
++	for (size_t i = 0; i < k; i++) {
++		s[2 * i] = digits[p[i] >> 4];
++		s[2 * i + 1] = digits[p[i] & 15];
++	}
++	s[2 * k] = '\0';
++	if (n > k) {
++		printf("SWEET BT: u%u %s %s... (%zu bytes)\n", u->unit, dir, s, n);
++	} else {
++		printf("SWEET BT: u%u %s %s\n", u->unit, dir, s);
++	}
++}
++
++static void
++bt_tx(struct bt_unit *u, uint8_t *p, size_t n)
++{
++	u->tx++;
++	bt_hex(u, "tx", p, n);
++	errno_t e = ctl_enqueuedata(bt_ctl, u->unit, p, n, 0);
++	if (e != 0 && bt_log_ok()) {
++		printf("SWEET BT: u%u enqueue of %zu bytes failed (%d)\n", u->unit, n, e);
++	}
++}
++
++/* Return parameters after the status byte, for the commands that read something. */
++static const uint8_t bt_version[] = {
++	0x09, 0x00, 0x10,               /* HCI 5.0, revision 0x1000 */
++	0x09, 0x0f, 0x00, 0x0e, 0x42,   /* LMP 5.0, Broadcom, LMP subversion 0x420e = BCM4357B1 */
++};
++/* A Broadcom BR/EDR + LE page 0: 3-slot/5-slot, EDR, SSP, LE, extended features. */
++static const uint8_t bt_features[8] = { 0xbf, 0xfe, 0xcf, 0xfe, 0xdb, 0xff, 0x7b, 0x87 };
++static const struct {
++	uint16_t        op;
++	uint8_t         len;
++	uint8_t         p[16];
++} bt_table[] = {
++	{ 0x1005, 7, { 0xfd, 0x03, 0x40, 0x08, 0x00, 0x01, 0x00 } },    /* Read_Buffer_Size: ACL 1021 x 8, SCO 64 x 1 */
++	{ 0x2002, 3, { 0xfb, 0x00, 0x0a } },                            /* LE_Read_Buffer_Size: 251 x 10 */
++	{ 0x2060, 6, { 0xfb, 0x00, 0x0a, 0x00, 0x00, 0x00 } },          /* LE_Read_Buffer_Size v2, no ISO */
++	{ 0x2003, 8, { 0xff, 0x01 } },                  /* LE features: encryption .. privacy, ext scan filter, 2M PHY */
++	{ 0x2007, 1, { 0x04 } },                        /* LE_Read_Advertising_Channel_Tx_Power: 4 dBm */
++	{ 0x200f, 1, { 0x20 } },                        /* LE_Read_Filter_Accept_List_Size */
++	{ 0x201c, 8, { 0xff, 0xff, 0xff, 0xff, 0xff, 0x03 } },          /* LE_Read_Supported_States: all 42 */
++	{ 0x202a, 1, { 0x20 } },                        /* LE_Read_Resolving_List_Size */
++	{ 0x202f, 8, { 0xfb, 0x00, 0x48, 0x08, 0xfb, 0x00, 0x48, 0x08 } }, /* LE_Read_Maximum_Data_Length */
++	{ 0x2023, 4, { 0x1b, 0x00, 0x48, 0x01 } },      /* LE_Read_Suggested_Default_Data_Length */
++	{ 0x204a, 1, { 0x08 } },                        /* LE_Read_Periodic_Advertiser_List_Size */
++};
++
++static void
++bt_command(struct bt_unit *u, uint16_t op, const uint8_t *par, uint8_t plen)
++{
++	uint8_t ev[3 + 255] = { 0x04, 0x0e, 0, 1, (uint8_t)op, (uint8_t)(op >> 8), 0x00 };
++	uint8_t *ret = &ev[7];
++	size_t n = 0;
++
++	if ((op >> 10) == 0x3f && bt_mode == 2) {
++		ev[6] = 0x01;                   /* Unknown HCI Command */
++	} else if ((op >> 10) == 0x01 && op != 0x0402) {
++		/*
++		 * Link control commands (Inquiry, Create_Connection, ...) are answered with Command
++		 * Status and nothing follows. ponytail: the few OGF 1 replies that are really Command
++		 * Complete (PIN/link key/IO capability replies) get Status too; none comes before
++		 * a connection, which a fake never makes.
++		 */
++		uint8_t cs[] = { 0x04, 0x0f, 4, 0x00, 1, (uint8_t)op, (uint8_t)(op >> 8) };
++		bt_tx(u, cs, sizeof(cs));
++		return;
++	} else if (op == 0x1001) {              /* Read_Local_Version_Information */
++		memcpy(ret, bt_version, n = sizeof(bt_version));
++	} else if (op == 0x1002) {              /* Read_Local_Supported_Commands: everything */
++		memset(ret, 0xff, n = 64);
++	} else if (op == 0x1003) {              /* Read_Local_Supported_Features */
++		memcpy(ret, bt_features, n = sizeof(bt_features));
++	} else if (op == 0x1004) {              /* Read_Local_Extended_Features(page): 0..2, 1 and 2 empty */
++		ret[0] = plen ? par[0] : 0;
++		ret[1] = 2;
++		if (ret[0] == 0) {
++			memcpy(&ret[2], bt_features, sizeof(bt_features));
++		}
++		n = 10;
++	} else if (op == 0x1009) {              /* Read_BD_ADDR, least significant octet first */
++		for (n = 0; n < 6; n++) {
++			ret[n] = bt_addr[5 - n];
++		}
++	} else if (op == 0x0c14) {              /* Read_Local_Name */
++		n = 248;
++		strlcpy((char *)ret, "sweet fake BT", n);
++	} else {
++		for (size_t i = 0; i < sizeof(bt_table) / sizeof(bt_table[0]); i++) {
++			if (bt_table[i].op == op) {
++				memcpy(ret, bt_table[i].p, n = bt_table[i].len);
++				break;
++			}
++		}
++	}
++	ev[2] = (uint8_t)(4 + n);
++	bt_tx(u, ev, 7 + n);
++}
++
++/* H4 bytes from the host, in whatever pieces write() made of them. */
++static void
++bt_feed(struct bt_unit *u, const uint8_t *p, size_t n)
++{
++	while (n > 0) {
++		if (u->skip > 0) {
++			size_t k = MIN(n, (size_t)u->skip);
++			u->skip -= (uint32_t)k;
++			p += k;
++			n -= k;
++			continue;
++		}
++		u->pkt[u->have++] = *p++;
++		n--;
++		/* header size by packet type: command 4, ACL 5, SCO 4, ISO 5 (type byte included) */
++		uint8_t t = u->pkt[0];
++		uint32_t hdr = (t == 0x01 || t == 0x03) ? 4 : (t == 0x02 || t == 0x05) ? 5 : 0;
++		if (hdr == 0) {
++			if (bt_log_ok()) {
++				printf("SWEET BT: u%u rx stray byte 0x%02x (not an H4 packet type)\n", u->unit, t);
++			}
++			u->have = 0;
++			continue;
++		}
++		if (u->have < hdr) {
++			continue;
++		}
++		if (t == 0x01) {
++			if (u->have < hdr + u->pkt[3]) {
++				continue;
++			}
++			u->rx++;
++			bt_hex(u, "rx", u->pkt, u->have);
++			bt_command(u, (uint16_t)(u->pkt[1] | u->pkt[2] << 8), &u->pkt[4], u->pkt[3]);
++		} else {
++			/* data: log the header and the payload length, drop the payload */
++			uint32_t len = t == 0x03 ? u->pkt[3] : (u->pkt[3] | u->pkt[4] << 8) & (t == 0x05 ? 0x3fff : 0xffff);
++			u->rx++;
++			bt_hex(u, "rx", u->pkt, u->have);
++			if (bt_log_ok()) {
++				printf("SWEET BT: u%u rx data type %u, %u payload bytes dropped\n", u->unit, t, len);
++			}
++			u->skip = len;
++		}
++		u->have = 0;
++	}
++}
++
++static errno_t
++bt_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **info)
++{
++	struct bt_unit *u = kalloc_type(struct bt_unit, Z_WAITOK | Z_ZERO | Z_NOFAIL);
++
++	(void)ref;
++	u->unit = sac->sc_unit;
++	u->tio.c_cflag = CS8 | CREAD | CLOCAL;
++	u->tio.c_ispeed = u->tio.c_ospeed = 115200;
++	*info = u;
++	lck_mtx_lock(&bt_lock);
++	if (bt_log_ok()) {
++		printf("SWEET BT: u%u connected (pid %d)\n", u->unit, proc_selfpid());
++	}
++	lck_mtx_unlock(&bt_lock);
++	return 0;
++}
++
++static errno_t
++bt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *info)
++{
++	struct bt_unit *u = info;
++
++	(void)ref;
++	lck_mtx_lock(&bt_lock);
++	printf("SWEET BT: u%u disconnected after %u packets in, %u out\n", unit, u->rx, u->tx);
++	lck_mtx_unlock(&bt_lock);
++	kfree_type(struct bt_unit, u);
++	return 0;
++}
++
++static errno_t
++bt_send(kern_ctl_ref ref, u_int32_t unit, void *info, mbuf_t m, int flags)
++{
++	(void)ref; (void)unit; (void)flags;
++	lck_mtx_lock(&bt_lock);
++	for (mbuf_t n = m; n != NULL; n = mbuf_next(n)) {
++		bt_feed(info, mbuf_data(n), mbuf_len(n));
++	}
++	lck_mtx_unlock(&bt_lock);
++	mbuf_freem(m);
++	return 0;
++}
++
++/* termios through sockopts: kept per unit, never applied (no UART); everything else accepted. */
++static errno_t
++bt_setopt(kern_ctl_ref ref, u_int32_t unit, void *info, int opt, void *data, size_t len)
++{
++	struct bt_unit *u = info;
++
++	(void)ref;
++	lck_mtx_lock(&bt_lock);
++	if (((uint32_t)opt == TIOCSETA || (uint32_t)opt == TIOCSETAW || (uint32_t)opt == TIOCSETAF) &&
++	    len == sizeof(u->tio)) {
++		memcpy(&u->tio, data, len);
++		if (bt_log_ok()) {
++			printf("SWEET BT: u%u termios: %llu baud, cflag 0x%llx, iflag 0x%llx\n", unit,
++			    u->tio.c_ospeed, u->tio.c_cflag, u->tio.c_iflag);
++		}
++	} else if (bt_log_ok()) {
++		printf("SWEET BT: u%u setsockopt 0x%08x (%zu bytes) accepted\n", unit, (uint32_t)opt, len);
++	}
++	lck_mtx_unlock(&bt_lock);
++	return 0;
++}
++
++static errno_t
++bt_getopt(kern_ctl_ref ref, u_int32_t unit, void *info, int opt, void *data, size_t *len)
++{
++	struct bt_unit *u = info;
++	errno_t e = 0;
++
++	(void)ref;
++	lck_mtx_lock(&bt_lock);
++	if ((uint32_t)opt == TIOCGETA && data != NULL && *len >= sizeof(u->tio)) {
++		memcpy(data, &u->tio, sizeof(u->tio));
++		*len = sizeof(u->tio);
++	} else {
++		e = ENOPROTOOPT;
++		if (bt_log_ok()) {
++			printf("SWEET BT: u%u getsockopt 0x%08x (%zu bytes) refused\n", unit, (uint32_t)opt, *len);
++		}
++	}
++	lck_mtx_unlock(&bt_lock);
++	return e;
++}
++
++/* The /dev nodes: minor = index in bt_nodes[]. */
++static const char *const bt_nodes[] = {
++	"uart.bluetooth", "cu.bluetooth", "btreset", "btwake", "btpoweroff",
++};
++
++static void
++bt_node_log(dev_t dev, const char *what)
++{
++	lck_mtx_lock(&bt_lock);
++	if (bt_log_ok() && (unsigned)minor(dev) < sizeof(bt_nodes) / sizeof(bt_nodes[0])) {
++		printf("SWEET BT: /dev/%s %s by pid %d\n", bt_nodes[minor(dev)], what, proc_selfpid());
++	}
++	lck_mtx_unlock(&bt_lock);
++}
++
++static int
++bt_node_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)flags; (void)devtype; (void)p;
++	bt_node_log(dev, "opened");
++	return 0;
++}
++
++static int
++bt_node_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)flags; (void)devtype; (void)p;
++	bt_node_log(dev, "closed");
++	return 0;
++}
++
++static int
++bt_node_read(dev_t dev, struct uio *uio, int flags)
++{
++	(void)dev; (void)uio; (void)flags;
++	return 0;
++}
++
++static int
++bt_node_write(dev_t dev, struct uio *uio, int flags)
++{
++	(void)flags;
++	bt_node_log(dev, "written");
++	uio_update(uio, uio_resid(uio));
++	return 0;
++}
++
++static int
++bt_node_ioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
++{
++	(void)dev; (void)cmd; (void)data; (void)flags; (void)p;
++	return 0;
++}
++
++static const struct cdevsw bt_cdevsw = {
++	.d_open   = bt_node_open,
++	.d_close  = bt_node_close,
++	.d_read   = bt_node_read,
++	.d_write  = bt_node_write,
++	.d_ioctl  = bt_node_ioctl,
++	.d_stop   = eno_stop,
++	.d_reset  = eno_reset,
++	.d_select = eno_select,
++	.d_mmap   = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type   = 0,
++};
++
++void
++sweet_bt_init(void)
++{
++	struct kern_ctl_reg reg = {
++		.ctl_name = BT_CTL_NAME,
++		.ctl_flags = CTL_FLAG_REG_SOCK_STREAM,  /* both open it SOCK_STREAM; no PRIVILEGED */
++		.ctl_sendsize = 64 * 1024,
++		.ctl_recvsize = 64 * 1024,
++		.ctl_connect = bt_connect,
++		.ctl_disconnect = bt_disconnect,
++		.ctl_send = bt_send,
++		.ctl_setopt = bt_setopt,
++		.ctl_getopt = bt_getopt,
++	};
++	DTEntry node;
++	void const *mac = NULL;
++	unsigned int size = 0;
++	int major;
++	errno_t e;
++
++	if (!PE_parse_boot_argn("btfake", &bt_mode, sizeof(bt_mode)) || bt_mode == 0) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "local-mac-address", &mac, &size) == kSuccess && size == 6) {
++		memcpy(bt_addr, mac, 6);
++	} else {
++		printf("SWEET BT: no /arm-io/bluetooth local-mac-address (mkadt ADT_BT=1); "
++		    "bluetoothd will exit, Read_BD_ADDR answers zeros\n");
++	}
++	major = cdevsw_add(-1, &bt_cdevsw);
++	for (int i = 0; major >= 0 && i < (int)(sizeof(bt_nodes) / sizeof(bt_nodes[0])); i++) {
++		(void)devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", bt_nodes[i]);
++	}
++	e = ctl_register(&reg, &bt_ctl);
++	printf("SWEET BT: fake H4 controller \"%s\" %s (%d), vendor commands %s, "
++	    "BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x, /dev nodes %s\n",
++	    BT_CTL_NAME, e == 0 ? "registered" : "NOT registered", e,
++	    bt_mode == 2 ? "fail (0x01)" : "succeed",
++	    bt_addr[0], bt_addr[1], bt_addr[2], bt_addr[3], bt_addr[4], bt_addr[5],
++	    major >= 0 ? "made" : "NOT made");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
