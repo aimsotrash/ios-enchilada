@@ -1,0 +1,522 @@
+enchilada: BT: btreal=4, bluetoothd's HCI relayed to the real WCN3990 (Broadcom identity and VSCs stay canned)
+
+Round 2 of logs/bt/real-controller-plan.md. sweet_btq.c stage 4 (after stage 3): the ADT
+local-mac-address goes to the chip with EDL_WRITE_BD_ADDR 0xfc14 (btqca.c qca_set_bdaddr, most
+significant octet first; Read_BD_ADDR then says whether it matches, never printing it), then the
+bring-up thread becomes the proxy's RX side: it polls SE6's RX FIFO into a 4 KiB buffer, taking
+words only while there is room (else RFR holds the chip off), splits H4 events / ACL / SCO (at most
+5 + 1024 bytes; longer headers resync byte by byte) and hands each packet to sweet_bt_from_chip();
+every in-band-sleep WAKE_IND gets its WAKE_ACK (the host never sends SLEEP_IND, so hci_qca.c's
+host TX side stays awake and never needs WAKE_IND). sweet_btq_send() writes one packet under the
+SE lock; a TX failure ends the proxy. sweet_bt.c: the first non-BlueTool unit that connects once
+the proxy is up owns the chip; its commands go to the chip except Read_Local_Version (fake
+Broadcom BCM4357B1), Read_BD_ADDR (ADT) and every OGF 0x3f VSC (canned, 0273/0274 kept), its
+ACL/SCO/ISO packets are relayed whole (no longer dropped), and the chip's packets reach only that
+unit, Qualcomm vendor events (0xff) dropped and counted. BlueTool's sessions stay canned: the
+Broadcom .hcd never reaches the chip. Relayed packets log 6 bytes (peer addresses). btreal<=3
+behave as before.
+
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -28,6 +28,16 @@
+  * Firmware Write_RAM (0xfc4c) and its replies are only counted. Connect and disconnect lines
+  * (with the process name) are always printed; a session that lost lines to the budget also
+  * prints its last BT_RING packets ("uN tail <seq> rx|tx <hex>", 24 bytes) at disconnect.
++ *
++ * 0279, btreal=4 (bsd/dev/sweet_btq.c stage 4): once the real WCN3990 is up, the first unit
++ * that is not BlueTool and connects after that is the proxy owner. Its HCI commands, ACL, SCO
++ * and ISO packets go to the chip (sweet_btq_send), except Read_Local_Version, Read_BD_ADDR and
++ * every OGF 0x3f (Broadcom) VSC, which keep their canned answers (0273/0274 included); the
++ * chip's events and data come back through sweet_bt_from_chip() to the owner only, Qualcomm
++ * vendor events (0xff) dropped. BlueTool's sessions stay canned, so its Broadcom boot script
++ * (Write_RAM of the .hcd, baud VSCs) never reaches the chip, and termios stays a no-op: the
++ * kernel keeps the UART at 3.2 Mbaud. Relayed packets log BT_RELAY_BYTES only: inquiry
++ * results, advertising reports and connection commands carry peer addresses.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -52,7 +62,8 @@
+ #define BT_CTL_NAME     "com.apple.uart.bluetooth"
+ #define BT_LOG_BYTES    64
+ #define BT_LOG_LINES    400
+-#define BT_PKT_MAX      (4 + 255)       /* an H4 command: type, opcode, length, parameters */
++#define BT_PKT_MAX      (5 + 1024)      /* an H4 command (4 + 255) or a relayed ACL of <= 1024 bytes */
++#define BT_RELAY_BYTES  6               /* logged of a relayed packet: header, no full address */
+ #define BT_RING         32              /* last packets of a session, printed at disconnect */
+ #define BT_RING_BYTES   24
+ #define BT_TAIL_DUMPS   16              /* sessions whose tail is printed, per boot */
+@@ -81,6 +92,8 @@
+ 	char            who[MAXCOMLEN + 1];
+ 	bool            pad;            /* not BlueTool: pad vendor command returns */
+ 	bool            hush;           /* current packet is a Write_RAM (or its reply): not printed */
++	bool            proxy;          /* 0279: the owner of the real controller */
++	bool            relay;          /* current packet goes to / comes from the chip */
+ 	uint32_t        wram;           /* Write_RAM (0xfc4c) commands */
+ 	uint32_t        quiet;          /* packets not printed for lack of log budget */
+ 	uint32_t        nrec;           /* packets recorded in ring[] (total, ring index = nrec % BT_RING) */
+@@ -94,6 +107,13 @@
+ static uint32_t bt_mode;
+ static uint32_t bt_lines;
+ static uint8_t bt_addr[6];      /* /arm-io/bluetooth local-mac-address, first octet printed first */
++static struct bt_unit *bt_owner;        /* 0279: the unit the real controller talks to */
++static uint32_t bt_chip_drop, bt_qca_events;
++
++extern bool sweet_btq_proxy_ready(void);
++extern int sweet_btq_send(const uint8_t *p, uint32_t n);
++void sweet_bt_from_chip(const uint8_t *p, uint32_t n);
++bool sweet_bt_addr(uint8_t a[6]);
+ 
+ static bool
+ bt_log_ok(void)
+@@ -125,11 +145,11 @@
+ bt_hex(struct bt_unit *u, const char *dir, const uint8_t *p, size_t n)
+ {
+ 	char s[2 * BT_LOG_BYTES + 1];
+-	size_t k = MIN(n, BT_LOG_BYTES);
++	size_t k = MIN(n, u->relay ? BT_RELAY_BYTES : BT_LOG_BYTES);
+ 	struct bt_rec *r = &u->ring[u->nrec++ % BT_RING];
+ 
+ 	r->tx = dir[0] == 't';
+-	r->len = (uint8_t)MIN(n, BT_RING_BYTES);
++	r->len = (uint8_t)MIN(k, BT_RING_BYTES);
+ 	memcpy(r->b, p, r->len);
+ 	if (u->hush) {
+ 		return;
+@@ -245,6 +265,46 @@
+ 	bt_tx(u, ev, 7 + n);
+ }
+ 
++/* 0279: the owner's packet (u->pkt, u->have bytes) to the real controller */
++static void
++bt_relay(struct bt_unit *u)
++{
++	int e = sweet_btq_send(u->pkt, u->have);
++
++	if (e != 0 && bt_log_ok()) {
++		printf("SWEET BT: u%u relay of %u bytes to the chip failed (%d); dropped\n", u->unit, u->have, e);
++	}
++}
++
++/* 0279: a complete H4 packet from the real controller (sweet_btq.c's RX thread, no lock held) */
++void
++sweet_bt_from_chip(const uint8_t *p, uint32_t n)
++{
++	lck_mtx_lock(&bt_lock);
++	if (p[0] == 0x04 && n >= 2 && p[1] == 0xff) {
++		if (bt_qca_events++ < 8 && bt_log_ok()) {
++			printf("SWEET BT: Qualcomm vendor event (%u bytes) dropped\n", n);
++		}
++	} else if (bt_owner == NULL) {
++		bt_chip_drop++;
++	} else {
++		bt_owner->relay = true;
++		bt_tx(bt_owner, (uint8_t *)(uintptr_t)p, n);
++		bt_owner->relay = false;
++	}
++	lck_mtx_unlock(&bt_lock);
++}
++
++/* 0279: the ADT BD address, most significant octet first; false if there is none */
++bool
++sweet_bt_addr(uint8_t a[6])
++{
++	static const uint8_t zero[6];
++
++	memcpy(a, bt_addr, 6);
++	return memcmp(bt_addr, zero, 6) != 0;
++}
++
+ /* H4 bytes from the host, in whatever pieces write() made of them. */
+ static void
+ bt_feed(struct bt_unit *u, const uint8_t *p, size_t n)
+@@ -280,12 +340,29 @@
+ 			u->rx++;
+ 			u->hush = op == 0xfc4c;         /* firmware Write_RAM: ~840 per boot script, counted */
+ 			u->wram += u->hush;
++			u->relay = u->proxy && op != 0x1001 && op != 0x1009 && (op >> 10) != 0x3f;
+ 			bt_hex(u, "rx", u->pkt, u->have);
+-			bt_command(u, op, &u->pkt[4], u->pkt[3]);
+-			u->hush = false;
++			if (u->relay) {
++				bt_relay(u);
++			} else {
++				bt_command(u, op, &u->pkt[4], u->pkt[3]);
++			}
++			u->hush = u->relay = false;
+ 		} else {
+-			/* data: log the header and the payload length, drop the payload */
++			/* data: relayed whole for the proxy owner, else log the header and drop the payload */
+ 			uint32_t len = t == 0x03 ? u->pkt[3] : (u->pkt[3] | u->pkt[4] << 8) & (t == 0x05 ? 0x3fff : 0xffff);
++			if (u->proxy && hdr + len <= BT_PKT_MAX) {
++				if (u->have < hdr + len) {
++					continue;
++				}
++				u->rx++;
++				u->relay = true;
++				bt_hex(u, "rx", u->pkt, u->have);
++				bt_relay(u);
++				u->relay = false;
++				u->have = 0;
++				continue;
++			}
+ 			u->rx++;
+ 			bt_hex(u, "rx", u->pkt, u->have);
+ 			if (bt_log_ok()) {
+@@ -311,6 +388,12 @@
+ 	*info = u;
+ 	lck_mtx_lock(&bt_lock);
+ 	printf("SWEET BT: u%u connected (pid %d %s)\n", u->unit, proc_selfpid(), u->who);
++	if (u->pad && bt_owner == NULL && sweet_btq_proxy_ready()) {
++		bt_owner = u;
++		u->proxy = true;
++		printf("SWEET BT: u%u owns the real controller (WCN3990); %u chip packets dropped while unowned\n",
++		    u->unit, bt_chip_drop);
++	}
+ 	lck_mtx_unlock(&bt_lock);
+ 	return 0;
+ }
+@@ -324,8 +407,12 @@
+ 
+ 	(void)ref;
+ 	lck_mtx_lock(&bt_lock);
+-	printf("SWEET BT: u%u (%s) disconnected after %u packets in, %u out (%u Write_RAM, %u unlogged)\n",
+-	    unit, u->who, u->rx, u->tx, u->wram, u->quiet);
++	printf("SWEET BT: u%u (%s) disconnected after %u packets in, %u out (%u Write_RAM, %u unlogged)%s\n",
++	    unit, u->who, u->rx, u->tx, u->wram, u->quiet, u->proxy ? " [real controller]" : "");
++	if (bt_owner == u) {
++		bt_owner = NULL;
++		printf("SWEET BT: real controller unowned (%u Qualcomm vendor events dropped so far)\n", bt_qca_events);
++	}
+ 	if (u->quiet > 0 && dumps < BT_TAIL_DUMPS) {
+ 		dumps++;
+ 		for (uint32_t i = u->nrec > BT_RING ? u->nrec - BT_RING : 0; i < u->nrec; i++) {
+--- a/bsd/dev/sweet_btq.c
++++ b/bsd/dev/sweet_btq.c
+@@ -25,6 +25,14 @@
+  *     btqca.c sets them), HCI_Reset, then Read_Local_Version (manufacturer 29 = Qualcomm).
+  *     Both files come from the bluetooth_a partition (UFS LUN 4, read only through 0260), at the
+  *     offsets of bq_fw[] (FAT16 image, files contiguous), checked by size and crc32.
++ *  4  0279, the proxy (logs/bt/real-controller-plan.md): the ADT local-mac-address goes to the chip
++ *     with EDL_WRITE_BD_ADDR 0xfc14 (btqca.c qca_set_bdaddr), then this thread becomes the RX side:
++ *     it polls the SE's RX FIFO into bq.rx[] and hands each complete H4 event / ACL / SCO packet to
++ *     sweet_bt_from_chip(); sweet_bt.c sends bluetoothd's packets through sweet_btq_send(). In-band
++ *     sleep: every WAKE_IND (0xfd) is answered with WAKE_ACK (0xfc); the host never sends SLEEP_IND,
++ *     so its TX side never sleeps and never needs a WAKE_IND (hci_qca.c's tx_ibs_state stays AWAKE).
++ *     Bounded: RX FIFO words are taken only while bq.rx[] has room, so a slow reader stalls the
++ *     chip through RFR (RX_RFR_WATERMARK) instead of losing bytes. Any TX failure ends the proxy.
+  *
+  * Sources (Linux v6.12): sdm845.dtsi, sdm845-oneplus-common.dtsi (&uart6, max-speed 3200000,
+  * rails), pinctrl-sdm845.c, gcc-sdm845.c, clk-rcg2.c, clk-alpha-pll.c, clk-rpmh.c,
+@@ -41,6 +49,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -52,7 +61,11 @@
+ extern int sweet_rpmh_wlan_power(void);
+ extern int sweet_rpmh_addr(const char *res, uint32_t *addr);
+ extern int sweet_ufs_read_part(unsigned lun, const char *name, uint64_t off, void *dst, uint32_t len);
++extern void sweet_bt_from_chip(const uint8_t *p, uint32_t n);
++extern bool sweet_bt_addr(uint8_t a[6]);
+ void sweet_btq_init(void);
++bool sweet_btq_proxy_ready(void);
++int sweet_btq_send(const uint8_t *p, uint32_t n);
+ 
+ #define BQ_DELAY_S      30u
+ #define BQ_LUN          4u              /* bluetooth_a = /dev/block/sde5 (backup/by-name.txt) */
+@@ -186,6 +199,8 @@
+ #define MAX_TLV_SEGMENT         243u
+ #define BQ_OPER_BAUD            3200000u
+ #define ANY_VENDOR_EVENT        (-1)
++#define EDL_WRITE_BD_ADDR_OP    0xfc14u
++#define BQ_PKT_MAX              (5u + 1024u)    /* largest H4 packet taken from the chip: ACL header + 1024 */
+ 
+ struct bq_clk { uint32_t rate; uint16_t m, n; };
+ /* ftbl_gcc_qupv3_wrap0_s0_clk_src rows used here: GPLL0_OUT_EVEN (src 6), pre_div 1 */
+@@ -206,11 +221,17 @@
+ 	bool se_up;             /* this driver configured the SE */
+ 	bool dfs, gpll0_ok;
+ 	uint32_t tx_depth, rx_depth, sampling, baud, rate;
+-	uint32_t rx_have, rx_drop, s_seen, ibs[3], stray;
+-	uint8_t rx[1024];
++	uint32_t rx_have, s_seen, ibs[3], stray;
++	uint8_t rx[4096];       /* >= BQ_PKT_MAX */
+ 	uint8_t rom;            /* rom_ver byte of the firmware names (crbtfw%02x) */
++	bool ack_due;           /* a WAKE_IND waits for its WAKE_ACK */
++	volatile bool proxy;    /* stage 4 runs: sweet_btq_send() may write */
++	uint32_t rx_pkts, tx_pkts, rx_errs;
+ } bq;
+ static int bq_chan;
++/* stage 4: the SE between sweet_btq_send() (bt_send, under sweet_bt.c's lock) and the RX loop */
++static LCK_GRP_DECLARE(bq_grp, "sweet_btq");
++static LCK_MTX_DECLARE(bq_lock, &bq_grp);
+ 
+ #define BQ_STOP(fmt, ...) \
+ 	(printf("SWEET BTQ: stage %u: STOP " fmt "\n", bq.stage, ##__VA_ARGS__), false)
+@@ -378,18 +399,15 @@
+ 	uint32_t s = bq_rd(bq.se, SE_GENI_S_IRQ_STATUS);
+ 
+ 	bq.s_seen |= s;
+-	/* qcom_geni_serial_handle_rx_fifo(): the last word holds RX_LAST_BYTE_VALID bytes */
+-	for (uint32_t i = 0; i < wc && i < bq.rx_depth; i++) {
++	/* qcom_geni_serial_handle_rx_fifo(): the last word holds RX_LAST_BYTE_VALID bytes. Words
++	 * stay in the FIFO while bq.rx[] is full: RFR then holds the chip off. */
++	for (uint32_t i = 0; i < wc && i < bq.rx_depth && bq.rx_have + 4 <= sizeof(bq.rx); i++) {
+ 		uint32_t w = bq_rd(bq.se, SE_GENI_RX_FIFOn), k = 4;
+ 		if (i + 1 == wc && (st & RX_LAST) && ((st >> 28) & 7u)) {
+ 			k = (st >> 28) & 7u;
+ 		}
+ 		for (uint32_t j = 0; j < k && j < 4; j++) {
+-			if (bq.rx_have < sizeof(bq.rx)) {
+-				bq.rx[bq.rx_have++] = (uint8_t)(w >> (8 * j));
+-			} else {
+-				bq.rx_drop++;
+-			}
++			bq.rx[bq.rx_have++] = (uint8_t)(w >> (8 * j));
+ 		}
+ 	}
+ 	bq_wr(bq.se, SE_GENI_S_IRQ_CLEAR, s);
+@@ -480,7 +498,7 @@
+ bq_tx(const uint8_t *p, uint32_t n)
+ {
+ 	uint32_t i = 0, us = 0, irq;
+-	uint32_t limit = 20000u + (uint32_t)((uint64_t)n * 20000000u / bq.baud);     /* 20 ms + 2x wire time */
++	uint32_t limit = 100000u + (uint32_t)((uint64_t)n * 20000000u / bq.baud);    /* 100 ms + 2x wire time */
+ 
+ 	if (bq_rd(bq.se, SE_GENI_STATUS) & M_CMD_ACTIVE) {
+ 		return BQ_STOP("TX engine busy before a write (status %#x)", bq_rd(bq.se, SE_GENI_STATUS));
+@@ -532,28 +550,72 @@
+ }
+ 
+ /*
+- * One complete H4 event from bq.rx[] into ev (code, length, parameters), or 0. In-band sleep
+- * bytes (hci_qca.c HCI_IBS_WAKE_ACK 0xfc, WAKE_IND 0xfd, SLEEP_IND 0xfe) and stray bytes are
+- * counted and dropped, as qca_recv does while QCA_IBS_DISABLED.
++ * One complete H4 packet (type byte included) from bq.rx[], or 0: event 04, ACL 02, SCO 03. In-band
++ * sleep bytes (hci_qca.c HCI_IBS_WAKE_ACK 0xfc, WAKE_IND 0xfd, SLEEP_IND 0xfe) are counted, a
++ * WAKE_IND sets ack_due; any other byte, or a header announcing more than BQ_PKT_MAX, is dropped
++ * one byte at a time until a packet starts again.
+  */
+ static uint32_t
+-bq_take_event(uint8_t *ev)
++bq_take_packet(uint8_t *pkt)
+ {
+-	while (bq.rx_have > 0 && bq.rx[0] != 0x04) {
+-		if (bq.rx[0] >= 0xfc && bq.rx[0] <= 0xfe) {
+-			bq.ibs[bq.rx[0] - 0xfc]++;
+-		} else {
++	while (bq.rx_have > 0) {
++		uint8_t t = bq.rx[0];
++		uint32_t hdr = t == 0x04 ? 3 : t == 0x02 ? 5 : t == 0x03 ? 4 : 0, len;
++
++		if (hdr == 0) {
++			if (t >= 0xfc && t <= 0xfe) {
++				bq.ibs[t - 0xfc]++;
++				bq.ack_due |= t == 0xfd;
++			} else {
++				bq.stray++;
++			}
++			bq_consume(1);
++			continue;
++		}
++		if (bq.rx_have < hdr) {
++			return 0;
++		}
++		len = t == 0x02 ? bq_le16(bq.rx + 3) : bq.rx[hdr - 1];
++		if (hdr + len > BQ_PKT_MAX) {
+ 			bq.stray++;
++			bq_consume(1);
++			continue;
++		}
++		if (bq.rx_have < hdr + len) {
++			return 0;
+ 		}
+-		bq_consume(1);
++		memcpy(pkt, bq.rx, hdr + len);
++		bq_consume(hdr + len);
++		return hdr + len;
+ 	}
+-	if (bq.rx_have < 3 || bq.rx_have < 3u + bq.rx[2]) {
+-		return 0;
++	return 0;
++}
++
++/* One H4 event (code, length, parameters, without the 04) for stages 2-4; data packets dropped. */
++static uint32_t
++bq_take_event(uint8_t *ev)
++{
++	static uint8_t pkt[BQ_PKT_MAX];
++	uint32_t n;
++
++	while ((n = bq_take_packet(pkt)) > 0) {
++		if (pkt[0] == 0x04) {
++			memcpy(ev, pkt + 1, n - 1);
++			return n - 1;
++		}
++		bq.stray += n;
+ 	}
+-	uint32_t n = 2u + bq.rx[2];
+-	memcpy(ev, bq.rx + 1, n);
+-	bq_consume(n + 1);
+-	return n;
++	return 0;
++}
++
++/* hci_qca.c device_want_to_wakeup(): WAKE_ACK for the controller's WAKE_IND */
++static bool
++bq_ibs_ack(void)
++{
++	uint8_t b = 0xfc;
++
++	bq.ack_due = false;
++	return bq_tx(&b, 1);
+ }
+ 
+ static void
+@@ -598,8 +660,11 @@
+ 			}
+ 			bq_log_event("ignored", ev, n);
+ 		}
+-		if (bq.rx_drop || (bq.s_seen & (S_RX_OVERFLOW | S_PARITY))) {
+-			printf("SWEET BTQ: stage %u: RX lost bytes (dropped %u, s_irq %#x)\n", bq.stage, bq.rx_drop, bq.s_seen);
++		if (bq.s_seen & (S_RX_OVERFLOW | S_PARITY)) {
++			printf("SWEET BTQ: stage %u: RX lost bytes (s_irq %#x)\n", bq.stage, bq.s_seen);
++			return 0;
++		}
++		if (bq.ack_due && !bq_ibs_ack()) {
+ 			return 0;
+ 		}
+ 		if (us >= ms * 1000u) {
+@@ -1088,6 +1153,103 @@
+ 	return ok;
+ }
+ 
++/* -------------------------------------------------------------------------- stage 4 */
++
++/*
++ * qca_set_bdaddr(): EDL_WRITE_BD_ADDR with the address byte-swapped from bdaddr_t, i.e. most
++ * significant octet first, the order of the ADT local-mac-address; answered by a vendor event.
++ * Read_BD_ADDR (least significant first) then says whether the chip took it; never printed.
++ */
++static bool
++bq_bdaddr(void)
++{
++	uint8_t a[6], ev[2 + 255];
++	uint32_t n;
++	bool same = true;
++
++	if (!sweet_bt_addr(a)) {
++		return BQ_STOP("no BD address: btfake=1 and the ADT /arm-io/bluetooth local-mac-address are needed");
++	}
++	if (!bq_cmd(EDL_WRITE_BD_ADDR_OP, a, 6) || bq_wait(0xff, EDL_WRITE_BD_ADDR_OP, ANY_VENDOR_EVENT, ev, 2000) == 0) {
++		return BQ_STOP("EDL_WRITE_BD_ADDR not answered");
++	}
++	if (!bq_cmd(0x1009, NULL, 0) || (n = bq_wait(0x0e, 0x1009, 0, ev, 2000)) < 12 || ev[5] != 0) {
++		return BQ_STOP("Read_BD_ADDR failed");
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		same &= ev[6 + i] == a[5 - i];
++	}
++	printf("SWEET BTQ: stage 4: ADT BD address written (0xfc14); Read_BD_ADDR %s it\n", same ? "matches" : "does NOT match");
++	return true;
++}
++
++/* The RX side of the proxy; returns only when a TX failure ended it. */
++static void
++bq_proxy(void)
++{
++	static uint8_t pkt[BQ_PKT_MAX];
++	uint32_t n, idle = 0;
++
++	lck_mtx_lock(&bq_lock);
++	bq.stray = 0;
++	bq.proxy = true;
++	lck_mtx_unlock(&bq_lock);
++	printf("SWEET BTQ: stage 4: proxy on: bluetoothd's HCI goes to the WCN3990 at %u baud\n", bq.baud);
++	for (;;) {
++		lck_mtx_lock(&bq_lock);
++		if (!bq.proxy) {
++			lck_mtx_unlock(&bq_lock);
++			break;
++		}
++		bq_rx_poll();
++		n = bq_take_packet(pkt);
++		if (bq.ack_due && !bq_ibs_ack()) {
++			bq.proxy = false;
++		}
++		if (bq.s_seen & (S_RX_OVERFLOW | S_PARITY)) {
++			if (++bq.rx_errs <= 8) {
++				printf("SWEET BTQ: stage 4: RX error s_irq %#x (%u so far)\n", bq.s_seen, bq.rx_errs);
++			}
++			bq.s_seen = 0;
++		}
++		bq.rx_pkts += n > 0;
++		lck_mtx_unlock(&bq_lock);
++		if (n > 0) {
++			sweet_bt_from_chip(pkt, n);     /* takes sweet_bt.c's lock: never under bq_lock */
++			idle = 0;
++		} else if (++idle > 4) {
++			bq_sleep(1);                    /* ponytail: 1 ms poll; GIC SPI 607 when it matters */
++		}
++	}
++	printf("SWEET BTQ: stage 4: proxy off after %u packets in, %u out (ibs %u/%u/%u, stray %u, rx errors %u)\n",
++	    bq.rx_pkts, bq.tx_pkts, bq.ibs[0], bq.ibs[1], bq.ibs[2], bq.stray, bq.rx_errs);
++}
++
++bool
++sweet_btq_proxy_ready(void)
++{
++	return bq.proxy;
++}
++
++/* One H4 packet from bluetoothd to the chip (sweet_bt.c, under its lock). */
++int
++sweet_btq_send(const uint8_t *p, uint32_t n)
++{
++	int e = 0;
++
++	lck_mtx_lock(&bq_lock);
++	if (!bq.proxy) {
++		e = ENXIO;
++	} else if ((bq.ack_due && !bq_ibs_ack()) || !bq_tx(p, n)) {
++		bq.proxy = false;
++		e = EIO;
++	} else {
++		bq.tx_pkts++;
++	}
++	lck_mtx_unlock(&bq_lock);
++	return e;
++}
++
+ /* ------------------------------------------------------------------------------- run */
+ 
+ static void
+@@ -1112,6 +1274,14 @@
+ 			printf("SWEET BTQ: stage 3: ok\n");
+ 		}
+ 	}
++	if (ok && bq.want >= 4) {
++		bq.stage = 4;
++		ok = bq_bdaddr();
++		if (ok) {
++			bq_proxy();
++			ok = false;             /* only a TX failure ends the proxy */
++		}
++	}
+ 	if (bq.se_up) {
+ 		/* leave the line quiet: no reader from here on, RFR not ready, TX idle */
+ 		bq_rx_stop();
+@@ -1136,8 +1306,8 @@
+ 		printf("SWEET BTQ: btreal=%u needs SDM845 (rpmhrsc=0x179e0000); not started\n", bq.want);
+ 		return;
+ 	}
+-	if (bq.want > 3) {
+-		bq.want = 3;
++	if (bq.want > 4) {
++		bq.want = 4;
+ 	}
+ 	bq.sampling = 32;
+ 	bq.baud = 115200;
