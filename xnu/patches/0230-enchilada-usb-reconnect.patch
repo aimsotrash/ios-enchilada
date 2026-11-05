@@ -1,0 +1,185 @@
+enchilada: USB: the ECM data path survives a cable unplug/replug
+
+After the cable was pulled while ue0 was in use and plugged into another port, the host
+re-enumerated the phone, got NETWORK_CONNECTION and brought its link up, but the phone never
+answered ARP until a reboot. Nothing ran on disconnect or bus reset except clearing the address:
+ud.configured stayed true, so the new SET_CONFIGURATION(1) returned early from ud_configure()
+(no Start New Configuration, no DEPCFG, bulk OUT not re-armed, data toggles not reset), and a
+bulk IN frame queued for the old host that it never fetched left tx_busy set with no XferComplete
+ever to come, so every later frame (ARP replies included) sat in or fell off the 32-entry TX ring.
+Now a disconnect or USB reset event, and every SET_CONFIGURATION, does what Linux
+dwc3_gadget_{disconnect,reset}_interrupt + f_ecm ecm_disable do: a forced END TRANSFER on each
+data endpoint with a started transfer (resource index kept from START TRANSFER), the endpoints
+taken out of DALEPENA, tx_busy cleared and the TX ring dropped, link down; a control transfer cut
+off mid-way is ended and ep0 stalled and re-armed for SETUP (dwc3_ep0_reset_state). The new
+SET_CONFIGURATION then configures and arms the endpoints from scratch and SET_INTERFACE alt 1 sends
+NETWORK_CONNECTION and posts link up again. Completions arriving for bulk OUT while unconfigured
+are not re-armed. The PHY, clocks and event buffer are left alone: the replug enumerated fine.
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -287,8 +287,10 @@
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
++#define DEPCMD_FORCERM          (1u << 11)
+ 
+ #define TRB_HWO         (1u << 0)
+ #define TRB_LST         (1u << 1)
+@@ -341,6 +343,9 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* started transfers (cleared on XferComplete) and their resource index */
++	bool        xfer[6];
++	uint8_t     rsc[6];
+ } ud;
+ 
+ static inline void
+@@ -418,7 +423,22 @@
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0) {
++		ud.rsc[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
++		ud.xfer[ep] = true;
++	}
++}
++
++/* END TRANSFER, forced, no completion event (Linux __dwc3_stop_active_transfer). */
++static void
++ud_end_xfer(unsigned ep)
++{
++	if (!ud.xfer[ep]) {
++		return;
++	}
++	ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.rsc[ep] << 16), 0, 0, 0);
++	ud.xfer[ep] = false;
++	delay(1000);    /* Linux waits 1 ms after an End Transfer without CMDIOC */
+ }
+ 
+ static void
+@@ -505,6 +525,38 @@
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
++/*
++ * The host dropped the configuration (disconnect, bus reset, a new
++ * SET_CONFIGURATION): like Linux dwc3_stop_active_transfers + f_ecm
++ * ecm_disable. A bus reset does not end the data endpoints' transfers (the
++ * databook leaves that to software); a bulk IN frame the old host never
++ * fetched left tx_busy set forever, and ud_configure() skipped the new
++ * SET_CONFIGURATION, so after a replug nothing was sent or re-armed.
++ * Returns whether it was configured.
++ */
++static bool
++ud_data_stop(void)
++{
++	lck_mtx_lock(ud.lock);
++	bool was = ud.configured;
++	ud.configured = false;
++	ud_end_xfer(EP_RX);
++	ud_end_xfer(EP_TX);
++	ud_end_xfer(EP_INT);
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	ud.tx_busy = false;
++	for (; ud.txq_count > 0; ud.txq_count--) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++	}
++	lck_mtx_unlock(ud.lock);
++	ud.data_alt = 0;
++	if (was) {
++		ud_link_event(false);
++	}
++	return was;
++}
++
+ /* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+ static void
+ ud_configure(void)
+@@ -526,7 +578,8 @@
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: config 1: ECM endpoints configured, bulk OUT %s\n",
++	    ud.xfer[EP_RX] ? "armed" : "NOT armed");
+ }
+ 
+ static void
+@@ -559,6 +612,7 @@
+ 		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
+ 		printf("SWEET USB: address %u\n", value & 0x7f);
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
++		ud_data_stop();
+ 		if (value == 1) {
+ 			ud_configure();
+ 		}
+@@ -573,6 +627,8 @@
+ 			if (value == 1 && ud.configured) {
+ 				ud_notify_connected();
+ 				ud_link_event(true);
++				printf("SWEET USB: ECM alt 1: NETWORK_CONNECTION %s, link up\n",
++				    ud.xfer[EP_INT] ? "queued" : "NOT queued");
+ 			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+@@ -822,9 +878,21 @@
+ {
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
+-		if (type == 1) {        /* USB reset */
+-			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++		if (type == 0 || type == 1) {   /* disconnect, USB reset */
++			bool was = ud_data_stop();
++			/* A control transfer cut off mid-way (Linux dwc3_ep0_reset_state) */
++			bool ep0 = ud.state != EP0_SETUP;
++			if (ep0) {
++				ud_end_xfer(0);
++				ud_end_xfer(1);
++				ud_stall();
++			}
++			if (type == 1) {
++				dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			}
++			printf("SWEET USB: %s: endpoints stopped, TX queue dropped%s%s\n",
++			    type ? "bus reset" : "disconnect", was ? ", link down" : "",
++			    ep0 ? ", ep0 restarted" : "");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -833,8 +901,6 @@
+ 			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+-		} else if (type == 0) {
+-			printf("SWEET USB: disconnect\n");
+ 		}
+ 		return;
+ 	}
+@@ -842,12 +908,18 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep != EP_TX && ep < sizeof(ud.xfer)) {
++		ud.xfer[ep] = false;    /* EP_TX: under ud.lock, like its start */
++	}
+ 	if (ep == EP_RX && type == 1) {
+-		ud_rx_done();
++		if (ud.configured) {
++			ud_rx_done();
++		}
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+ 		lck_mtx_lock(ud.lock);
++		ud.xfer[EP_TX] = false;
+ 		ud.tx_busy = false;
+ 		ud_tx_kick_locked();
+ 		lck_mtx_unlock(ud.lock);
