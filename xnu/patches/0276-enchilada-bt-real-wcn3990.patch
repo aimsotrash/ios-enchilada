@@ -1,0 +1,1239 @@
+enchilada: BT: real WCN3990 on QUP SE6 UART, staged behind btreal=1/2/3 (probe, power + version, firmware)
+
+PLAN-ENCHILADA.md §8 steps 3-6. New bsd/dev/sweet_btq.c, started from sweet_bt_init() (btfake is
+unchanged: the iOS stack keeps the fake controller), only with rpmhrsc=0x179e0000; a kernel thread
+waits 30 s, then each stage ends in "SWEET BTQ: stage N: ..." and anything unexpected in "stage N:
+STOP ...". btreal=1 only reads: GCC 0x5200c and the wrap_0 m/s-AHB + wrap0_s6 CBCRs, the s6 RCG
+0x17754 (DFS enable and levels), GPLL0, TLMM gpio45-48 (EAST), cmd-db ldoa5/7/17/25/23 + rfclka2
+(new read-only sweet_rpmh_addr), and the SE6 (0x898000) / QUP0 registers only if their clocks
+already run. btreal=2 writes, in Linux's order: gpio45-48 to qup6 with the sdm845.dtsi
+qup_uart6_4pin bias, GCC vote bits 6/7/16 (read-modify-write) and the RCG to 7.3728 MHz
+(GPLL0_OUT_EVEN M/N 384/15625 as clk_rcg2 shared set_rate, or a DFS level through CLK_SEL), the SE
+as qcom_geni_serial port_setup (FIFO, polled, SE_IRQ_EN 0), the WCN3990 rails and RF_CLK2 through
+0267's sweet_rpmh_wlan_power() (Linux's DT voltages), power pulses 0xC0 @2400 and 0xFC @115200 with
+flow control off, port reopen, then EDL 0x19 on 0xfc00, logging product/SoC/ROM/patch (hci_qca.c,
+btqca.c). btreal=3 reads crbtfw21.tlv and crnv21.bin from bluetooth_a (UFS LUN 4 via 0260; offsets,
+sizes and crc32 in the FAT16 image sha256 fe481f68...), sends 0xfc48 0x11 and moves the host to
+3.2 Mbaud (102.4 MHz / 1), sends both files as 243-byte EDL 0x1e segments (NVM tags as btqca.c sets
+them, already so in this file), HCI_Reset and Read_Local_Version (manufacturer 29). Rails and
+clocks are never voted off; at the end RX stops and RFR is held not ready.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -392,6 +392,7 @@
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/sweet_amfi.c			standard
+ bsd/dev/sweet_bt.c			standard
++bsd/dev/sweet_btq.c			standard
+ 
+ # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
+ bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -47,6 +47,7 @@
+ #include <libkern/libkern.h>
+ 
+ void sweet_bt_init(void);
++extern void sweet_btq_init(void);
+ 
+ #define BT_CTL_NAME     "com.apple.uart.bluetooth"
+ #define BT_LOG_BYTES    64
+@@ -484,6 +485,7 @@
+ 	int major;
+ 	errno_t e;
+ 
++	sweet_btq_init();       /* 0278: boot-arg btreal=N, the real WCN3990 (bsd/dev/sweet_btq.c) */
+ 	if (!PE_parse_boot_argn("btfake", &bt_mode, sizeof(bt_mode)) || bt_mode == 0) {
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -16,6 +16,7 @@
+ int sweet_rpmh_ddr_vote(void);
+ int sweet_rpmh_arc_vote(const char *res, int corner, unsigned *sent);
+ int sweet_rpmh_wlan_power(void);
++int sweet_rpmh_addr(const char *res, uint32_t *addr);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u     /* sweet (SM7150) default */
+@@ -653,4 +654,23 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* 0276: the cmd-db address of a VRM resource (a regulator or XO clock); nothing is sent. */
++int
++sweet_rpmh_addr(const char *res, uint32_t *addr)
++{
++	int error = EIO;
++
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (!rh_poisoned) {
++		error = rh_map();
++	}
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, addr, NULL, NULL);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_btq.c
+@@ -0,0 +1,1154 @@
++/*
++ * 0276: the OnePlus 6's real Bluetooth controller, a WCN3990 on QUP GENI SE6 as a UART
++ * (sdm845.dtsi uart6 = serial@898000, wrapper qupv3_id_0), PLAN-ENCHILADA.md §8 steps 3-6.
++ * Boot-arg btreal=N; absent or 0 = nothing runs. Needs rpmhrsc=0x179e0000 (SDM845) and leaves
++ * btfake alone: the iOS stack still talks to the fake controller (bsd/dev/sweet_bt.c). One kernel
++ * thread, BQ_DELAY_S after boot (a hang lands after the persistent log is up). Each stage is a
++ * prefix of the next and ends in one "SWEET BTQ: stage N: ..." line; anything unexpected ends in
++ * "SWEET BTQ: stage N: STOP ..." and nothing further is written.
++ *
++ *  1  Read only. GCC: the 0x5200c votes and CBCRs of wrap_0 m/s-AHB and wrap0_s6, the s6 RCG
++ *     (CFG, M/N/D, DFS enable and its 8 levels), GPLL0 (is GPLL0_OUT_EVEN 300 MHz); TLMM
++ *     gpio45-48 (EAST tile); cmd-db ldoa5/7/17/25/23 and rfclka2. The SE (FW revision =
++ *     protocol, FIFO disable, FIFO geometry, status, IOS) and the QUP version only when all
++ *     three CBCRs already run: an SE access with its clocks off can hang the bus.
++ *  2  Power and UART at 115200, in Linux's order: the pins (qup_uart6_4pin, applied at serial
++ *     probe), the clocks (vote + RCG, as clk-rcg2 shared ops), the SE as qcom_geni_serial
++ *     port_setup (8N1, RTS/CTS), the rails (qca_regulator_enable: ldoa7 1800 mV, ldoa17 1304 mV,
++ *     ldoa25 3300 mV, vddio = S4A always on) and rfclka2 through 0267's sweet_rpmh_wlan_power()
++ *     (which also votes ldoa5 800 mV and ldoa23 3300 mV, the &wifi supplies of the same
++ *     chip), then qca_regulator_init: 0xC0 at
++ *     2400 baud, 115200, 0xFC, 100 ms, port reopen; then qca_read_soc_version (EDL 0x19 on
++ *     0xfc00, answered by a vendor event). Logs product/SoC/ROM/patch and the firmware name.
++ *  3  Firmware, as qca_setup + qca_uart_setup: 0xfc48 0x11 (3.2 Mbaud, the DT max-speed), host
++ *     to 3.2 Mbaud, crbtfw21.tlv then crnv21.bin in 243-byte EDL 0x1e segments (NVM tags as
++ *     btqca.c sets them), HCI_Reset, then Read_Local_Version (manufacturer 29 = Qualcomm).
++ *     Both files come from the bluetooth_a partition (UFS LUN 4, read only through 0260), at the
++ *     offsets of bq_fw[] (FAT16 image, files contiguous), checked by size and crc32.
++ *
++ * Sources (Linux v6.12): sdm845.dtsi, sdm845-oneplus-common.dtsi (&uart6, max-speed 3200000,
++ * rails), pinctrl-sdm845.c, gcc-sdm845.c, clk-rcg2.c, clk-alpha-pll.c, clk-rpmh.c,
++ * qcom-geni-se.c, qcom_geni_serial.c, hci_qca.c, btqca.c.
++ * Deviations: FIFO mode, polled, SE_IRQ_EN = 0 (no GIC handler, as touch does) where Linux's
++ * qcom,geni-uart uses DMA and SPI 607; ACTIVE-only RPMh votes, never dropped (Wi-Fi shares the
++ * rails); the Wi-Fi set of rails and rfclka2 are voted as Linux's ath10k does for the same chip
++ * (hci_qca alone votes three LDOs and no clock on this board); the Read_BD_ADDR check of
++ * qca_uart_setup is skipped (no address is logged).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_wlan_power(void);
++extern int sweet_rpmh_addr(const char *res, uint32_t *addr);
++extern int sweet_ufs_read_part(unsigned lun, const char *name, uint64_t off, void *dst, uint32_t len);
++void sweet_btq_init(void);
++
++#define BQ_DELAY_S      30u
++#define BQ_LUN          4u              /* bluetooth_a = /dev/block/sde5 (backup/by-name.txt) */
++#define BQ_PART         "bluetooth_a"
++
++#define GCC_PA          0x00100000u
++#define GCC_VOTE        0x5200cu        /* gcc-sdm845.c enable_reg of the three branches */
++#define GCC_VOTE_BITS   ((1u << 6) | (1u << 7) | (1u << 16))    /* wrap_0 m_ahb, s_ahb, wrap0_s6 */
++#define GCC_M_AHB_CBCR  0x17004u
++#define GCC_S_AHB_CBCR  0x17008u
++#define GCC_S6_CBCR     0x17750u
++#define CBCR_OFF        (1u << 31)
++#define RCG             0x17754u        /* gcc_qupv3_wrap0_s6_clk_src: mnd_width 16, hid_width 5 */
++#define RCG_UPDATE      (1u << 0)
++#define RCG_ROOT_EN     (1u << 1)
++#define RCG_ROOT_OFF    (1u << 31)
++#define RCG_CFG         (RCG + 0x04u)
++#define RCG_M           (RCG + 0x08u)
++#define RCG_N           (RCG + 0x0cu)
++#define RCG_D           (RCG + 0x10u)
++#define RCG_DFSR        (RCG + 0x14u)
++#define RCG_PERF(l)     (RCG + 0x1cu + 4u * (l))
++#define RCG_PERF_M(l)   (RCG + 0x5cu + 4u * (l))
++#define RCG_PERF_N(l)   (RCG + 0x9cu + 4u * (l))
++#define GPLL0_MODE      0x00u           /* fabia: L_VAL 0x04, USER_CTL 0x0c, FRAC 0x38 */
++#define GPLL0_L         0x04u
++#define GPLL0_USER      0x0cu
++#define GPLL0_FRAC      0x38u
++#define XO_HZ           19200000ull
++
++#define TLMM_PA         0x03500000u     /* tlmm 0x3400000 + EAST 0x100000: gpio45-48 are EAST */
++#define TLMM_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define TLMM_IO(n)      (TLMM_CFG(n) + 4u)
++#define SE_PA           0x00898000u
++#define QUP_PA          0x008c0000u     /* qupv3_id_0; QUP_HW_VER_REG at +4 */
++
++/* geni-se.h, qcom-geni-se.c, qcom_geni_serial.c */
++#define GENI_FORCE_DEFAULT      0x020u
++#define GENI_OUTPUT_CTRL        0x024u
++#define GENI_CGC_CTRL           0x028u
++#define SE_GENI_STATUS          0x040u
++#define GENI_SER_M_CLK_CFG      0x048u
++#define GENI_SER_S_CLK_CFG      0x04cu
++#define GENI_IF_DISABLE_RO      0x064u
++#define GENI_FW_REVISION_RO     0x068u
++#define SE_GENI_CLK_SEL         0x07cu
++#define SE_UART_LOOPBACK_CFG    0x22cu
++#define SE_GENI_BYTE_GRAN       0x254u
++#define SE_GENI_DMA_MODE_EN     0x258u
++#define SE_UART_TX_TRANS_CFG    0x25cu
++#define SE_GENI_TX_PACKING_CFG0 0x260u
++#define SE_GENI_TX_PACKING_CFG1 0x264u
++#define SE_UART_TX_WORD_LEN     0x268u
++#define SE_UART_TX_STOP_BIT_LEN 0x26cu
++#define SE_UART_TX_TRANS_LEN    0x270u
++#define SE_UART_RX_TRANS_CFG    0x280u
++#define SE_GENI_RX_PACKING_CFG0 0x284u
++#define SE_GENI_RX_PACKING_CFG1 0x288u
++#define SE_UART_RX_WORD_LEN     0x28cu
++#define SE_UART_RX_STALE_CNT    0x294u
++#define SE_UART_TX_PARITY_CFG   0x2a4u
++#define SE_UART_RX_PARITY_CFG   0x2a8u
++#define SE_UART_MANUAL_RFR      0x2acu
++#define SE_GENI_M_CMD0          0x600u
++#define SE_GENI_M_CMD_CTRL      0x604u
++#define SE_GENI_M_IRQ_STATUS    0x610u
++#define SE_GENI_M_IRQ_EN        0x614u
++#define SE_GENI_M_IRQ_CLEAR     0x618u
++#define SE_GENI_S_CMD0          0x630u
++#define SE_GENI_S_CMD_CTRL      0x634u
++#define SE_GENI_S_IRQ_STATUS    0x640u
++#define SE_GENI_S_IRQ_EN        0x644u
++#define SE_GENI_S_IRQ_CLEAR     0x648u
++#define SE_GENI_TX_FIFOn        0x700u
++#define SE_GENI_RX_FIFOn        0x780u
++#define SE_GENI_TX_FIFO_STATUS  0x800u
++#define SE_GENI_RX_FIFO_STATUS  0x804u
++#define SE_GENI_TX_WATERMARK    0x80cu
++#define SE_GENI_RX_WATERMARK    0x810u
++#define SE_GENI_RX_RFR_WATERMARK 0x814u
++#define SE_GENI_IOS             0x908u
++#define SE_DMA_TX_IRQ_CLR       0xc44u
++#define SE_DMA_RX_IRQ_CLR       0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++
++#define GENI_SE_UART            2u
++#define M_CMD_ACTIVE            (1u << 0)       /* SE_GENI_STATUS */
++#define S_CMD_ACTIVE            (1u << 12)
++#define CMD_CANCEL              (1u << 2)       /* M/S_CMD_CTRL */
++#define CMD_ABORT               (1u << 1)
++#define M_CMD_DONE              (1u << 0)       /* M_IRQ */
++#define M_CMD_CANCEL            (1u << 4)
++#define M_CMD_ABORT             (1u << 5)
++#define M_RX_WM                 (1u << 26)
++#define M_RX_LAST               (1u << 27)
++#define M_COMMON                (0x7eu | (0xfu << 22) | (3u << 28))     /* M_COMMON_GENI_M_IRQ_EN */
++#define M_ERRORS                (0xeu | (3u << 28))     /* overrun, illegal, failure, TX FIFO rd/wr */
++#define S_CMD_CANCEL            (1u << 4)       /* S_IRQ */
++#define S_CMD_ABORT             (1u << 5)
++#define S_CMD_DONE              (1u << 0)
++#define S_PARITY                (1u << 9)       /* S_GP_IRQ_0 (qcom_geni_serial_isr) */
++#define S_BREAK                 (3u << 11)      /* S_GP_IRQ_2/3 */
++#define S_RX_OVERFLOW           (1u << 25)      /* S_RX_FIFO_WR_ERR */
++#define S_RX_WM                 (1u << 26)
++#define S_RX_LAST               (1u << 27)
++#define S_COMMON                (0x3eu | 0x3e00u | (3u << 24))          /* S_COMMON_GENI_S_IRQ_EN */
++#define UART_START              1u              /* UART_START_TX / UART_START_READ, opcode << 27 */
++#define UART_CTS_MASK           (1u << 1)
++#define UART_MANUAL_RFR_EN      (1u << 31)
++#define UART_RFR_NOT_READY      (1u << 1)
++#define RX_WC                   0x1ffffffu
++#define RX_LAST                 (1u << 31)
++#define IO2_DATA_IN             (1u << 1)       /* IOS: CTS line; low = asserted */
++/* geni_se_config_packing(se, 8, 4, false, true, true): start 0/8/16/24, LSB first, len 8 */
++#define PACK0                   0x0004380eu
++#define PACK1                   0x000c3e0eu
++
++/* btqca.h */
++#define EDL_PATCH_OP            0xfc00u
++#define EDL_PATCH_VER_REQ_CMD   0x19u
++#define EDL_PATCH_TLV_REQ_CMD   0x1eu
++#define EDL_APP_VER_RES_EVT     0x02u
++#define EDL_TVL_DNLD_RES_EVT    0x04u
++#define QCA_BAUD_OP             0xfc48u
++#define QCA_BAUDRATE_3200000    0x11u
++#define MAX_TLV_SEGMENT         243u
++#define BQ_OPER_BAUD            3200000u
++#define ANY_VENDOR_EVENT        (-1)
++
++struct bq_clk { uint32_t rate; uint16_t m, n; };
++/* ftbl_gcc_qupv3_wrap0_s0_clk_src rows used here: GPLL0_OUT_EVEN (src 6), pre_div 1 */
++static const struct bq_clk bq_ftbl[] = {
++	{ 7372800, 384, 15625 },        /* 2400 baud / 96, 115200 / 2 */
++	{ 102400000, 128, 375 },        /* 3200000 / 1 */
++};
++
++/* bluetooth_a.img (sha256 fe481f68... = sde5), FAT16: byte offset, size, crc32 (zlib) */
++static const struct bq_fw { const char *name; uint32_t off, size, crc; } bq_fw[] = {
++	{ "crbtfw21.tlv", 0x77000, 0x3524c, 0x3763e53d },
++	{ "crnv21.bin", 0xb7000, 0x120b, 0x4b497d4f },
++};
++
++static struct {
++	vm_offset_t gcc, tlmm, se, qup;
++	unsigned want, stage;
++	bool se_up;             /* this driver configured the SE */
++	bool dfs, gpll0_ok;
++	uint32_t tx_depth, rx_depth, sampling, baud, rate;
++	uint32_t rx_have, rx_drop, s_seen, ibs[3], stray;
++	uint8_t rx[1024];
++	uint8_t rom;            /* rom_ver byte of the firmware names (crbtfw%02x) */
++} bq;
++static int bq_chan;
++
++#define BQ_STOP(fmt, ...) \
++	(printf("SWEET BTQ: stage %u: STOP " fmt "\n", bq.stage, ##__VA_ARGS__), false)
++
++static uint32_t
++bq_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bq_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++bq_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned t = 0;; t += 10) {
++		if ((bq_rd(base, off) & mask) == want) {
++			return true;
++		}
++		if (t >= us) {
++			return false;
++		}
++		delay(10);
++	}
++}
++
++static void
++bq_sleep(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bq_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++bq_le32(const uint8_t *p)
++{
++	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint16_t
++bq_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++/* --------------------------------------------------------------------------- clocks */
++
++/* GPLL0 (fabia, fixed): XO * (L + FRAC / 2^16); GPLL0_OUT_EVEN divides by post_div_table_fabia_even. */
++static uint64_t
++bq_gpll0(uint64_t *even)
++{
++	uint32_t l = bq_rd(bq.gcc, GPLL0_L) & 0xffffu, frac = bq_rd(bq.gcc, GPLL0_FRAC) & 0xffffu;
++	uint32_t user = bq_rd(bq.gcc, GPLL0_USER), pd = (user >> 8) & 0xfu;
++	uint64_t pll = XO_HZ * l + ((XO_HZ * frac) >> 16);
++
++	*even = (pd == 0 || pd == 1 || pd == 3 || pd == 7) ? pll / (pd + 1) : 0;
++	return pll;
++}
++
++/* gcc_parent_map_0: 0 = bi_tcxo, 1 = GPLL0, 6 = GPLL0_OUT_EVEN; 0 = unknown or not proven */
++static uint64_t
++bq_parent(unsigned src)
++{
++	uint64_t even, pll = bq_gpll0(&even);
++
++	if (src == 0) {
++		return XO_HZ;
++	}
++	if (!bq.gpll0_ok) {
++		return 0;
++	}
++	return src == 1 ? pll : src == 6 ? even : 0;
++}
++
++/* clk_rcg2_dfs_populate_freq() and calc_rate(): the rate of one DFS performance level */
++static uint64_t
++bq_dfs_rate(unsigned l)
++{
++	uint32_t cfg = bq_rd(bq.gcc, RCG_PERF(l)), hid = cfg & 0x1fu;
++	uint64_t r = bq_parent((cfg >> 8) & 7u);
++
++	if (hid) {
++		r = r * 2 / (hid + 1);
++	}
++	if ((cfg >> 12) & 3u) {
++		uint32_t m = bq_rd(bq.gcc, RCG_PERF_M(l)) & 0xffffu;
++		uint32_t n = ((~bq_rd(bq.gcc, RCG_PERF_N(l))) & 0xffffu) + m;
++		r = n ? r * m / n : 0;
++	}
++	return r;
++}
++
++/*
++ * The source rate and SE divider for a baud: Linux's get_clk_div_rate() picks, for the bauds
++ * used here, the first table rate that is an exact multiple of baud x oversampling (verified for
++ * 2400, 115200, 3200000 at 32x and 16x). With DFS the levels are the table (the SE's CLK_SEL
++ * picks one, as spi-geni-qcom does).
++ */
++static bool
++bq_clk_pick(uint32_t baud, uint32_t *rate, uint32_t *div, int *level)
++{
++	uint64_t want = (uint64_t)baud * bq.sampling;
++
++	*level = -1;
++	for (unsigned i = 0; i < (bq.dfs ? 8u : sizeof(bq_ftbl) / sizeof(bq_ftbl[0])); i++) {
++		uint64_t r = bq.dfs ? bq_dfs_rate(i) : bq_ftbl[i].rate;
++		if (r && r % want == 0 && r / want <= 0xfffu) {
++			*rate = (uint32_t)r;
++			*div = (uint32_t)(r / want);
++			*level = (int)i;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* clk_rcg2_shared_ops set_rate on a running RCG (force enable, M/N/D, CFG, update, clear) */
++static bool
++bq_rcg_set(const struct bq_clk *c)
++{
++	uint32_t d = c->n, nm2 = 2u * (uint32_t)(c->n - c->m);
++	uint32_t cfg;
++
++	if (d < c->m) {
++		d = c->m;
++	}
++	if (d > nm2) {
++		d = nm2;
++	}
++	bq_wr(bq.gcc, RCG, bq_rd(bq.gcc, RCG) | RCG_ROOT_EN);
++	if (!bq_poll(bq.gcc, RCG, RCG_ROOT_OFF, 0, 500)) {
++		return BQ_STOP("s6 RCG stays off after force enable (cmd %#x)", bq_rd(bq.gcc, RCG));
++	}
++	bq_wr(bq.gcc, RCG_M, (bq_rd(bq.gcc, RCG_M) & ~0xffffu) | c->m);
++	bq_wr(bq.gcc, RCG_N, (bq_rd(bq.gcc, RCG_N) & ~0xffffu) | (~(uint32_t)(c->n - c->m) & 0xffffu));
++	bq_wr(bq.gcc, RCG_D, (bq_rd(bq.gcc, RCG_D) & ~0xffffu) | (~d & 0xffffu));
++	cfg = bq_rd(bq.gcc, RCG_CFG) & ~(0x1fu | (7u << 8) | (3u << 12) | (1u << 20));
++	bq_wr(bq.gcc, RCG_CFG, cfg | 1u | (6u << 8) | (2u << 12));     /* pre_div 1, GPLL0_OUT_EVEN, dual edge */
++	bq_wr(bq.gcc, RCG, bq_rd(bq.gcc, RCG) | RCG_UPDATE);
++	bool ok = bq_poll(bq.gcc, RCG, RCG_UPDATE, 0, 500);
++	bq_wr(bq.gcc, RCG, bq_rd(bq.gcc, RCG) & ~RCG_ROOT_EN);
++	if (!ok) {
++		return BQ_STOP("s6 RCG update not taken (cmd %#x cfg %#x)", bq_rd(bq.gcc, RCG), bq_rd(bq.gcc, RCG_CFG));
++	}
++	return true;
++}
++
++/* ------------------------------------------------------------------------ UART (SE6) */
++
++static void
++bq_rx_poll(void)
++{
++	uint32_t st = bq_rd(bq.se, SE_GENI_RX_FIFO_STATUS), wc = st & RX_WC;
++	uint32_t s = bq_rd(bq.se, SE_GENI_S_IRQ_STATUS);
++
++	bq.s_seen |= s;
++	/* qcom_geni_serial_handle_rx_fifo(): the last word holds RX_LAST_BYTE_VALID bytes */
++	for (uint32_t i = 0; i < wc && i < bq.rx_depth; i++) {
++		uint32_t w = bq_rd(bq.se, SE_GENI_RX_FIFOn), k = 4;
++		if (i + 1 == wc && (st & RX_LAST) && ((st >> 28) & 7u)) {
++			k = (st >> 28) & 7u;
++		}
++		for (uint32_t j = 0; j < k && j < 4; j++) {
++			if (bq.rx_have < sizeof(bq.rx)) {
++				bq.rx[bq.rx_have++] = (uint8_t)(w >> (8 * j));
++			} else {
++				bq.rx_drop++;
++			}
++		}
++	}
++	bq_wr(bq.se, SE_GENI_S_IRQ_CLEAR, s);
++	bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, bq_rd(bq.se, SE_GENI_M_IRQ_STATUS) & (M_RX_WM | M_RX_LAST));
++}
++
++/* qcom_geni_serial_start_rx_fifo() */
++static void
++bq_rx_start(void)
++{
++	bq_wr(bq.se, SE_GENI_S_CMD0, UART_START << 27);
++	bq_wr(bq.se, SE_GENI_S_IRQ_EN, bq_rd(bq.se, SE_GENI_S_IRQ_EN) | S_RX_WM | S_RX_LAST);
++	bq_wr(bq.se, SE_GENI_M_IRQ_EN, bq_rd(bq.se, SE_GENI_M_IRQ_EN) | M_RX_WM | M_RX_LAST);
++}
++
++/* qcom_geni_serial_stop_rx_fifo() + abort_rx(); what is still in the FIFO is dropped */
++static void
++bq_rx_stop(void)
++{
++	bq_wr(bq.se, SE_GENI_S_IRQ_EN, bq_rd(bq.se, SE_GENI_S_IRQ_EN) & ~(S_RX_WM | S_RX_LAST));
++	bq_wr(bq.se, SE_GENI_M_IRQ_EN, bq_rd(bq.se, SE_GENI_M_IRQ_EN) & ~(M_RX_WM | M_RX_LAST));
++	if (!(bq_rd(bq.se, SE_GENI_STATUS) & S_CMD_ACTIVE)) {
++		return;
++	}
++	bq_wr(bq.se, SE_GENI_S_CMD_CTRL, CMD_CANCEL);
++	(void)bq_poll(bq.se, SE_GENI_S_IRQ_STATUS, S_CMD_CANCEL, S_CMD_CANCEL, 20000);
++	bq_rx_poll();
++	if (bq_rd(bq.se, SE_GENI_STATUS) & S_CMD_ACTIVE) {
++		bq_wr(bq.se, SE_GENI_S_CMD_CTRL, CMD_ABORT);
++		(void)bq_poll(bq.se, SE_GENI_S_CMD_CTRL, CMD_ABORT, 0, 20000);
++		bq_wr(bq.se, SE_GENI_S_IRQ_CLEAR, S_CMD_DONE | S_CMD_ABORT);
++		bq_wr(bq.se, GENI_FORCE_DEFAULT, 1);
++	}
++}
++
++/* __qcom_geni_serial_cancel_tx_cmd() */
++static void
++bq_tx_cancel(void)
++{
++	bq_wr(bq.se, SE_GENI_M_CMD_CTRL, CMD_CANCEL);
++	if (!bq_poll(bq.se, SE_GENI_M_IRQ_STATUS, M_CMD_CANCEL, M_CMD_CANCEL, 20000)) {
++		bq_wr(bq.se, SE_GENI_M_CMD_CTRL, CMD_ABORT);
++		(void)bq_poll(bq.se, SE_GENI_M_IRQ_STATUS, M_CMD_ABORT, M_CMD_ABORT, 20000);
++		bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, M_CMD_ABORT);
++	}
++	bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, M_CMD_CANCEL);
++}
++
++/*
++ * hci_uart_set_flow_control(hu, !on) on serdev: flow control and RTS together. Off = CTS ignored
++ * (UART_CTS_MASK) and RFR held not ready; on = CTS honoured, RFR by the RX FIFO watermark.
++ */
++static void
++bq_flow(bool on)
++{
++	uint32_t tx = bq_rd(bq.se, SE_UART_TX_TRANS_CFG);
++
++	bq_wr(bq.se, SE_UART_TX_TRANS_CFG, on ? tx & ~UART_CTS_MASK : tx | UART_CTS_MASK);
++	bq_wr(bq.se, SE_UART_MANUAL_RFR, on ? 0 : UART_MANUAL_RFR_EN | UART_RFR_NOT_READY);
++}
++
++/* the clock half of qcom_geni_serial_set_termios() */
++static bool
++bq_baud(uint32_t baud)
++{
++	uint32_t rate = 0, div = 0;
++	int level;
++
++	if (!bq_clk_pick(baud, &rate, &div, &level)) {
++		return BQ_STOP("no %s gives %u baud x %u", bq.dfs ? "DFS level" : "s6 clock", baud, bq.sampling);
++	}
++	if (bq.dfs) {
++		bq_wr(bq.se, SE_GENI_CLK_SEL, (uint32_t)level);
++	} else if (rate != bq.rate && !bq_rcg_set(&bq_ftbl[level])) {
++		return false;
++	}
++	bq.rate = rate;
++	bq.baud = baud;
++	bq_wr(bq.se, GENI_SER_M_CLK_CFG, 1u | div << 4);        /* SER_CLK_EN | clk_div << CLK_DIV_SHFT */
++	bq_wr(bq.se, GENI_SER_S_CLK_CFG, 1u | div << 4);
++	printf("SWEET BTQ: stage %u: uart %u baud = %u Hz / %u / %u%s\n", bq.stage, baud, rate, div,
++	    bq.sampling, bq.dfs ? " (DFS level)" : "");
++	return true;
++}
++
++/* serdev_device_write_buf + wait_until_sent: one UART_START_TX command for n bytes */
++static bool
++bq_tx(const uint8_t *p, uint32_t n)
++{
++	uint32_t i = 0, us = 0, irq;
++	uint32_t limit = 20000u + (uint32_t)((uint64_t)n * 20000000u / bq.baud);     /* 20 ms + 2x wire time */
++
++	if (bq_rd(bq.se, SE_GENI_STATUS) & M_CMD_ACTIVE) {
++		return BQ_STOP("TX engine busy before a write (status %#x)", bq_rd(bq.se, SE_GENI_STATUS));
++	}
++	bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, M_CMD_DONE | M_ERRORS);
++	bq_wr(bq.se, SE_UART_TX_TRANS_LEN, n);
++	bq_wr(bq.se, SE_GENI_M_CMD0, UART_START << 27);
++	while (i < n || !(bq_rd(bq.se, SE_GENI_M_IRQ_STATUS) & M_CMD_DONE)) {
++		if (i < n && (bq_rd(bq.se, SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) < bq.tx_depth) {
++			uint32_t w = 0;
++			for (unsigned k = 0; k < 4 && i < n; k++, i++) {
++				w |= (uint32_t)p[i] << (8 * k);
++			}
++			bq_wr(bq.se, SE_GENI_TX_FIFOn, w);
++			continue;
++		}
++		bq_rx_poll();
++		if (us >= limit) {
++			irq = bq_rd(bq.se, SE_GENI_M_IRQ_STATUS);
++			bq_tx_cancel();
++			return BQ_STOP("TX of %u bytes not done in %u us (%u in FIFO, m_irq %#x, CTS %s)", n, us, i,
++			           irq, (bq_rd(bq.se, SE_GENI_IOS) & IO2_DATA_IN) ? "deasserted" : "asserted");
++		}
++		delay(10);
++		us += 10;
++	}
++	irq = bq_rd(bq.se, SE_GENI_M_IRQ_STATUS);
++	bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, irq & (M_CMD_DONE | M_ERRORS));
++	if (irq & M_ERRORS) {
++		return BQ_STOP("TX error m_irq %#x", irq);
++	}
++	return true;
++}
++
++static bool
++bq_cmd(uint16_t op, const uint8_t *par, uint8_t plen)
++{
++	uint8_t pkt[4 + 255] = { 0x01, (uint8_t)op, (uint8_t)(op >> 8), plen };
++
++	memcpy(pkt + 4, par, plen);
++	return bq_tx(pkt, 4u + plen);
++}
++
++static void
++bq_consume(uint32_t n)
++{
++	memmove(bq.rx, bq.rx + n, bq.rx_have - n);
++	bq.rx_have -= n;
++}
++
++/*
++ * One complete H4 event from bq.rx[] into ev (code, length, parameters), or 0. In-band sleep
++ * bytes (hci_qca.c HCI_IBS_WAKE_ACK 0xfc, WAKE_IND 0xfd, SLEEP_IND 0xfe) and stray bytes are
++ * counted and dropped, as qca_recv does while QCA_IBS_DISABLED.
++ */
++static uint32_t
++bq_take_event(uint8_t *ev)
++{
++	while (bq.rx_have > 0 && bq.rx[0] != 0x04) {
++		if (bq.rx[0] >= 0xfc && bq.rx[0] <= 0xfe) {
++			bq.ibs[bq.rx[0] - 0xfc]++;
++		} else {
++			bq.stray++;
++		}
++		bq_consume(1);
++	}
++	if (bq.rx_have < 3 || bq.rx_have < 3u + bq.rx[2]) {
++		return 0;
++	}
++	uint32_t n = 2u + bq.rx[2];
++	memcpy(ev, bq.rx + 1, n);
++	bq_consume(n + 1);
++	return n;
++}
++
++static void
++bq_log_event(const char *what, const uint8_t *ev, uint32_t n)
++{
++	char s[2 * 16 + 1];
++	static const char hex[] = "0123456789abcdef";
++	uint32_t k = MIN(n, 16u);
++
++	for (uint32_t i = 0; i < k; i++) {
++		s[2 * i] = hex[ev[i] >> 4];
++		s[2 * i + 1] = hex[ev[i] & 15];
++	}
++	s[2 * k] = '\0';
++	printf("SWEET BTQ: stage %u: %s event %s%s (%u bytes)\n", bq.stage, what, s, n > k ? "..." : "", n);
++}
++
++/*
++ * Events until the one asked for: Command Complete (0x0e) for op, or a vendor event (0xff) with
++ * EDL header cresp 0 and rtype (btqca.c), or any vendor event (ANY_VENDOR_EVENT). Others are
++ * logged and dropped; a failed Command Status for op, a lost RX byte, a parity error or a
++ * timeout end the wait with 0.
++ */
++static uint32_t
++bq_wait(uint8_t code, uint16_t op, int rtype, uint8_t *ev, unsigned ms)
++{
++	for (unsigned us = 0;; us += 10) {
++		uint32_t n;
++
++		bq_rx_poll();
++		while ((n = bq_take_event(ev)) > 0) {
++			if (code == 0x0e && ev[0] == 0x0e && n >= 6 && bq_le16(ev + 3) == op) {
++				return n;
++			}
++			if (code == 0xff && ev[0] == 0xff &&
++			    (rtype == ANY_VENDOR_EVENT || (n >= 4 && ev[2] == 0 && ev[3] == rtype))) {
++				return n;
++			}
++			if (ev[0] == 0x0f && n >= 6 && bq_le16(ev + 4) == op && ev[2] != 0) {
++				bq_log_event("failed Command Status", ev, n);
++				return 0;
++			}
++			bq_log_event("ignored", ev, n);
++		}
++		if (bq.rx_drop || (bq.s_seen & (S_RX_OVERFLOW | S_PARITY))) {
++			printf("SWEET BTQ: stage %u: RX lost bytes (dropped %u, s_irq %#x)\n", bq.stage, bq.rx_drop, bq.s_seen);
++			return 0;
++		}
++		if (us >= ms * 1000u) {
++			printf("SWEET BTQ: stage %u: no event %#x for %#x within %u ms (%u bytes pending, ibs %u/%u/%u, "
++			    "stray %u, CTS %s)\n", bq.stage, code, op, ms, bq.rx_have, bq.ibs[0], bq.ibs[1], bq.ibs[2],
++			    bq.stray, (bq_rd(bq.se, SE_GENI_IOS) & IO2_DATA_IN) ? "deasserted" : "asserted");
++			return 0;
++		}
++		delay(10);
++	}
++}
++
++/* qca_port_reopen(): serdev close + open, i.e. stop RX, drop what came in, start RX, flow on */
++static void
++bq_reopen(void)
++{
++	bq_rx_stop();
++	bq.rx_have = 0;
++	bq.s_seen = 0;
++	bq.stray = 0;
++	bq_rx_start();
++	bq_flow(true);
++}
++
++/* qca_send_power_pulse(): one byte with flow control off, then the controller's settle time */
++static bool
++bq_pulse(uint8_t b)
++{
++	bq_flow(false);
++	if (!bq_tx(&b, 1)) {
++		return false;
++	}
++	delay(20000000u / bq.baud);     /* two character times: the byte has left the shifter */
++	bq_flow(true);
++	bq_sleep(b == 0xfc ? 100 : 10); /* msleep(100) on, usleep_range(1000, 10000) off */
++	return true;
++}
++
++/* -------------------------------------------------------------------------- stage 1 */
++
++static void
++bq_pin_log(unsigned pin)
++{
++	uint32_t cfg = bq_rd(bq.tlmm, TLMM_CFG(pin));
++
++	printf("SWEET BTQ: stage 1: gpio%u cfg %#x (func %u, pull %u, %u mA, oe %u) in %u\n", pin, cfg,
++	    (cfg >> 2) & 0xfu, cfg & 3u, 2u * (((cfg >> 6) & 7u) + 1u), (cfg >> 9) & 1u,
++	    bq_rd(bq.tlmm, TLMM_IO(pin)) & 1u);
++}
++
++static bool
++bq_clocks_running(void)
++{
++	return !(bq_rd(bq.gcc, GCC_M_AHB_CBCR) & CBCR_OFF) && !(bq_rd(bq.gcc, GCC_S_AHB_CBCR) & CBCR_OFF) &&
++	       !(bq_rd(bq.gcc, GCC_S6_CBCR) & CBCR_OFF);
++}
++
++/* The SE's identity; stage 1 calls it only with the clocks already running. */
++static bool
++bq_se_identity(void)
++{
++	uint32_t fw = bq_rd(bq.se, GENI_FW_REVISION_RO), hw0 = bq_rd(bq.se, SE_HW_PARAM_0);
++	uint32_t hw1 = bq_rd(bq.se, SE_HW_PARAM_1), ios = bq_rd(bq.se, SE_GENI_IOS);
++	uint32_t ver = bq_rd(bq.qup, 4);
++
++	bq.tx_depth = (hw0 >> 16) & 0x3fu;
++	bq.rx_depth = (hw1 >> 16) & 0x3fu;
++	bq.sampling = ver >= 0x20050000u ? 16 : 32;     /* qcom_geni_serial: halved from QUP 2.5 */
++	printf("SWEET BTQ: stage %u: se6 fw %#x (protocol %u) if-disable %#x status %#x ios %#x (CTS %s, RX %u) "
++	    "hw0 %#x hw1 %#x (tx %u x %u bit, rx %u) clk m %#x s %#x sel %#x dma %#x qup %#x (%ux)\n", bq.stage,
++	    fw, (fw >> 8) & 0xffu, bq_rd(bq.se, GENI_IF_DISABLE_RO), bq_rd(bq.se, SE_GENI_STATUS), ios,
++	    (ios & IO2_DATA_IN) ? "deasserted" : "asserted", ios & 1u, hw0, hw1, bq.tx_depth, (hw0 >> 24) & 0x3fu,
++	    bq.rx_depth, bq_rd(bq.se, GENI_SER_M_CLK_CFG), bq_rd(bq.se, GENI_SER_S_CLK_CFG),
++	    bq_rd(bq.se, SE_GENI_CLK_SEL), bq_rd(bq.se, SE_GENI_DMA_MODE_EN), ver, bq.sampling);
++	if (((fw >> 8) & 0xffu) != GENI_SE_UART) {
++		return BQ_STOP("SE6 runs protocol %u, not UART: no UART firmware was loaded into it", (fw >> 8) & 0xffu);
++	}
++	if (bq_rd(bq.se, GENI_IF_DISABLE_RO) & 1u) {
++		return BQ_STOP("SE6 FIFO interface disabled (DMA/GSI only)");
++	}
++	if (((hw0 >> 24) & 0x3fu) != 32 || bq.tx_depth < 4 || bq.rx_depth < 4) {
++		return BQ_STOP("SE6 FIFO geometry not 32-bit x >= 4 words");
++	}
++	return true;
++}
++
++static bool
++bq_probe(void)
++{
++	static const char *const res[] = { "ldoa5", "ldoa7", "ldoa17", "ldoa25", "ldoa23", "rfclka2" };
++	uint32_t vote, cmd, dfsr;
++	uint64_t even, pll;
++	bool ok = true;
++
++	printf("SWEET BTQ: stage 1: mapping gcc %#x tlmm %#x se6 %#x qup0 %#x\n", GCC_PA, TLMM_PA, SE_PA, QUP_PA);
++	bq.gcc = ml_io_map(GCC_PA, 0x60000);
++	bq.tlmm = ml_io_map(TLMM_PA, TLMM_CFG(49));
++	bq.se = ml_io_map(SE_PA, 0x4000);
++	bq.qup = ml_io_map(QUP_PA, 0x1000);
++	if (!bq.gcc || !bq.tlmm || !bq.se || !bq.qup) {
++		return BQ_STOP("MMIO mapping failed");
++	}
++	vote = bq_rd(bq.gcc, GCC_VOTE);
++	printf("SWEET BTQ: stage 1: gcc vote %#x (m_ahb %u s_ahb %u s6 %u) cbcr m_ahb %#x s_ahb %#x s6 %#x\n", vote,
++	    (vote >> 6) & 1u, (vote >> 7) & 1u, (vote >> 16) & 1u, bq_rd(bq.gcc, GCC_M_AHB_CBCR),
++	    bq_rd(bq.gcc, GCC_S_AHB_CBCR), bq_rd(bq.gcc, GCC_S6_CBCR));
++	cmd = bq_rd(bq.gcc, RCG);
++	dfsr = bq_rd(bq.gcc, RCG_DFSR);
++	bq.dfs = dfsr & 1u;
++	printf("SWEET BTQ: stage 1: s6 rcg cmd %#x cfg %#x m %#x n %#x d %#x dfsr %#x (DFS %s)\n", cmd,
++	    bq_rd(bq.gcc, RCG_CFG), bq_rd(bq.gcc, RCG_M), bq_rd(bq.gcc, RCG_N), bq_rd(bq.gcc, RCG_D), dfsr,
++	    bq.dfs ? "on" : "off");
++	pll = bq_gpll0(&even);
++	bq.gpll0_ok = (bq_rd(bq.gcc, GPLL0_MODE) & (1u << 31)) && pll == 600000000ull && even == 300000000ull;
++	printf("SWEET BTQ: stage 1: gpll0 mode %#x l %#x frac %#x user %#x = %llu Hz, out_even %llu Hz (%s)\n",
++	    bq_rd(bq.gcc, GPLL0_MODE), bq_rd(bq.gcc, GPLL0_L), bq_rd(bq.gcc, GPLL0_FRAC), bq_rd(bq.gcc, GPLL0_USER),
++	    (unsigned long long)pll, (unsigned long long)even, bq.gpll0_ok ? "locked, as gcc-sdm845 expects" : "NOT usable");
++	for (unsigned l = 0; bq.dfs && l < 8; l++) {
++		printf("SWEET BTQ: stage 1: dfs level %u cfg %#x m %#x n %#x = %llu Hz\n", l, bq_rd(bq.gcc, RCG_PERF(l)),
++		    bq_rd(bq.gcc, RCG_PERF_M(l)), bq_rd(bq.gcc, RCG_PERF_N(l)), (unsigned long long)bq_dfs_rate(l));
++	}
++	for (unsigned pin = 45; pin <= 48; pin++) {
++		bq_pin_log(pin);
++	}
++	for (unsigned i = 0; i < sizeof(res) / sizeof(res[0]); i++) {
++		uint32_t a = 0;
++		int e = sweet_rpmh_addr(res[i], &a);
++		printf("SWEET BTQ: stage 1: cmd-db %s = %#x (errno %d)\n", res[i], a, e);
++		ok &= e == 0;
++	}
++	if (!ok) {
++		return BQ_STOP("a rail or rfclka2 is missing from cmd-db");
++	}
++	if (!bq.dfs && !bq.gpll0_ok) {
++		return BQ_STOP("no DFS and GPLL0_OUT_EVEN is not 300 MHz: the M/N table does not apply");
++	}
++	if (bq_clocks_running()) {
++		printf("SWEET BTQ: stage 1: reading se6 (its clocks run)\n");
++		if (!bq_se_identity()) {
++			return false;
++		}
++	} else {
++		printf("SWEET BTQ: stage 1: se6 not read: a clock is off (stage 2 votes them first)\n");
++	}
++	printf("SWEET BTQ: stage 1: ok (DFS %s, GPLL0 %s)\n", bq.dfs ? "on" : "off", bq.gpll0_ok ? "ok" : "unproven");
++	return true;
++}
++
++/* -------------------------------------------------------------------------- stage 2 */
++
++/* sdm845.dtsi qup_uart6_4pin: function qup6 (1); cts pull-down, rts/tx 2 mA no bias, rx pull-up */
++static void
++bq_pin(unsigned pin, unsigned pull)
++{
++	uint32_t cfg = bq_rd(bq.tlmm, TLMM_CFG(pin)) & ~0x1ffu;   /* msm_pinmux_set_mux + config: bits 8:0 */
++
++	bq_wr(bq.tlmm, TLMM_CFG(pin), cfg | (1u << 2) | pull);   /* drive 0 = 2 mA (default for cts/rx) */
++}
++
++/* qcom_geni_serial_port_setup() + geni_se_init(se, UART_RX_WM, depth - 2) + FIFO mode */
++static bool
++bq_se_setup(void)
++{
++	uint32_t st = bq_rd(bq.se, SE_GENI_STATUS);
++
++	if (st & M_CMD_ACTIVE) {
++		return BQ_STOP("SE6 TX engine already active (status %#x): someone else owns it", st);
++	}
++	bq_rx_stop();
++	bq_wr(bq.se, SE_UART_RX_STALE_CNT, 10u * 16u);  /* DEFAULT_BITS_PER_CHAR * STALE_TIMEOUT */
++	bq_wr(bq.se, SE_GENI_TX_PACKING_CFG0, PACK0);
++	bq_wr(bq.se, SE_GENI_TX_PACKING_CFG1, PACK1);
++	bq_wr(bq.se, SE_GENI_RX_PACKING_CFG0, PACK0);
++	bq_wr(bq.se, SE_GENI_RX_PACKING_CFG1, PACK1);
++	bq_wr(bq.se, SE_GENI_BYTE_GRAN, 0);
++	/* geni_se_irq_clear(); SE_IRQ_EN stays 0 (Linux: all on): no GIC line, status is polled */
++	bq_wr(bq.se, SE_GSI_EVENT_EN, 0);
++	bq_wr(bq.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	bq_wr(bq.se, SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
++	bq_wr(bq.se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++	bq_wr(bq.se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++	bq_wr(bq.se, SE_IRQ_EN, 0);
++	/* geni_se_io_init(), geni_se_io_set_mode() */
++	bq_wr(bq.se, GENI_CGC_CTRL, bq_rd(bq.se, GENI_CGC_CTRL) | 0x7fu);
++	bq_wr(bq.se, SE_DMA_GENERAL_CFG, bq_rd(bq.se, SE_DMA_GENERAL_CFG) | 0xfu);
++	bq_wr(bq.se, GENI_OUTPUT_CTRL, 0x7fu);
++	bq_wr(bq.se, GENI_FORCE_DEFAULT, 1);
++	bq_wr(bq.se, SE_GENI_DMA_MODE_EN, bq_rd(bq.se, SE_GENI_DMA_MODE_EN) & ~1u);
++	bq_wr(bq.se, SE_GENI_RX_WATERMARK, 2);
++	bq_wr(bq.se, SE_GENI_RX_RFR_WATERMARK, bq.rx_depth - 2);
++	bq_wr(bq.se, SE_GENI_M_IRQ_EN, bq_rd(bq.se, SE_GENI_M_IRQ_EN) | M_COMMON | M_CMD_DONE);
++	bq_wr(bq.se, SE_GENI_S_IRQ_EN, bq_rd(bq.se, SE_GENI_S_IRQ_EN) | S_COMMON);
++	bq_wr(bq.se, SE_GENI_TX_WATERMARK, 0);
++	/* qcom_geni_serial_set_termios(): 8N1, CRTSCTS, no loopback */
++	bq_wr(bq.se, SE_UART_LOOPBACK_CFG, 0);
++	bq_wr(bq.se, SE_UART_TX_TRANS_CFG, bq_rd(bq.se, SE_UART_TX_TRANS_CFG) & ~(1u | UART_CTS_MASK));
++	bq_wr(bq.se, SE_UART_TX_PARITY_CFG, bq_rd(bq.se, SE_UART_TX_PARITY_CFG) & ~1u);
++	bq_wr(bq.se, SE_UART_RX_TRANS_CFG, bq_rd(bq.se, SE_UART_RX_TRANS_CFG) & ~(1u << 3));
++	bq_wr(bq.se, SE_UART_RX_PARITY_CFG, bq_rd(bq.se, SE_UART_RX_PARITY_CFG) & ~1u);
++	bq_wr(bq.se, SE_UART_TX_WORD_LEN, 8);
++	bq_wr(bq.se, SE_UART_RX_WORD_LEN, 8);
++	bq_wr(bq.se, SE_UART_TX_STOP_BIT_LEN, 0);
++	bq_wr(bq.se, SE_UART_MANUAL_RFR, 0);
++	bq.se_up = true;
++	if (bq_rd(bq.se, SE_GENI_TX_PACKING_CFG0) != PACK0 || bq_rd(bq.se, SE_GENI_RX_PACKING_CFG1) != PACK1) {
++		return BQ_STOP("SE6 packing readback %#x/%#x", bq_rd(bq.se, SE_GENI_TX_PACKING_CFG0),
++		           bq_rd(bq.se, SE_GENI_RX_PACKING_CFG1));
++	}
++	return bq_baud(115200);
++}
++
++static bool
++bq_power(void)
++{
++	int e;
++
++	printf("SWEET BTQ: stage 2: gpio45-48 -> qup6 (cts pull-down, rts/tx no bias, rx pull-up, 2 mA)\n");
++	bq_pin(45, 1);
++	bq_pin(46, 0);
++	bq_pin(47, 0);
++	bq_pin(48, 3);
++	for (unsigned pin = 45; pin <= 48; pin++) {
++		bq_pin_log(pin);
++	}
++	/*
++	 * ponytail: read-modify-write of the shared vote register without touch's lock (0277 keeps
++	 * sweet_gcc_lock static in sweet_touch.c); one write per boot, 10 s after touch's. Exporting
++	 * its gcc_vote() and calling it here closes the window.
++	 */
++	bq_wr(bq.gcc, GCC_VOTE, bq_rd(bq.gcc, GCC_VOTE) | GCC_VOTE_BITS);
++	if (!bq_poll(bq.gcc, GCC_M_AHB_CBCR, CBCR_OFF, 0, 1000) || !bq_poll(bq.gcc, GCC_S_AHB_CBCR, CBCR_OFF, 0, 1000) ||
++	    !bq_poll(bq.gcc, GCC_S6_CBCR, CBCR_OFF, 0, 1000)) {
++		return BQ_STOP("a branch stays halted: cbcr m_ahb %#x s_ahb %#x s6 %#x (vote %#x)",
++		           bq_rd(bq.gcc, GCC_M_AHB_CBCR), bq_rd(bq.gcc, GCC_S_AHB_CBCR), bq_rd(bq.gcc, GCC_S6_CBCR),
++		           bq_rd(bq.gcc, GCC_VOTE));
++	}
++	printf("SWEET BTQ: stage 2: clocks voted (vote %#x)\n", bq_rd(bq.gcc, GCC_VOTE));
++	if (!bq_se_identity() || !bq_se_setup()) {
++		return false;
++	}
++	/* qca_regulator_init(): port closed while the regulators come up */
++	printf("SWEET BTQ: stage 2: vddio = vreg_s4a_1p8 (always on, nothing sent)\n");
++	/* ldoa5 800, ldoa7 1800, ldoa17 1304, ldoa25 3300, ldoa23 3300 mV HPM, then rfclka2 */
++	e = EBUSY;
++	for (unsigned i = 0; i < 20 && e == EBUSY; i++) {
++		if ((e = sweet_rpmh_wlan_power()) == EBUSY) {
++			bq_sleep(50);   /* touch or the modem holds the RPMh helper */
++		}
++	}
++	printf("SWEET BTQ: stage 2: WCN3990 rails + rfclka2 (sweet_rpmh_wlan_power) -> %d\n", e);
++	if (e) {
++		return BQ_STOP("rail/rfclka2 vote failed (%d); see the SWEET RPMH lines", e);
++	}
++	bq_rx_start();
++	bq_flow(true);
++	/* force the wcn399x into boot mode: power-off pulse at 2400, power-on pulse at 115200 */
++	if (!bq_baud(2400) || !bq_pulse(0xc0) || !bq_baud(115200) || !bq_pulse(0xfc)) {
++		return false;
++	}
++	bq_reopen();
++	printf("SWEET BTQ: stage 2: pulses 0xc0 @2400, 0xfc @115200 sent; ios %#x (CTS %s)\n",
++	    bq_rd(bq.se, SE_GENI_IOS), (bq_rd(bq.se, SE_GENI_IOS) & IO2_DATA_IN) ? "deasserted" : "asserted");
++	return true;
++}
++
++/* qca_read_soc_version() for WCN3990 (< WCN3991): the answer is a VSE of 2 + 12 bytes */
++static bool
++bq_version(void)
++{
++	uint8_t c = EDL_PATCH_VER_REQ_CMD, ev[2 + 255];
++	uint32_t n;
++
++	if (!bq_cmd(EDL_PATCH_OP, &c, 1)) {
++		return false;
++	}
++	n = bq_wait(0xff, EDL_PATCH_OP, EDL_APP_VER_RES_EVT, ev, 2000);
++	if (n == 0 || ev[1] != 14) {
++		return BQ_STOP("no version VSE (got %u bytes, length %u)", n, n ? ev[1] : 0);
++	}
++	uint32_t product = bq_le32(ev + 4), soc = bq_le32(ev + 12);
++	uint16_t patch = bq_le16(ev + 8), rom = bq_le16(ev + 10);
++	uint32_t soc_ver = soc << 16 | rom;
++	bq.rom = (uint8_t)(((soc_ver & 0xf00u) >> 4) | (soc_ver & 0xfu));
++	printf("SWEET BTQ: stage 2: QCA product %#010x SoC %#010x ROM %#06x patch %#06x: controller version %#010x, "
++	    "firmware crbtfw%02x.tlv / crnv%02x.bin\n", product, soc, rom, patch, soc_ver, bq.rom, bq.rom);
++	if (soc == 0 || rom == 0) {
++		return BQ_STOP("SoC or ROM version 0 (btqca.c: -EILSEQ)");
++	}
++	return true;
++}
++
++/* -------------------------------------------------------------------------- stage 3 */
++
++/*
++ * btqca.c qca_tlv_check_data(), TLV_TYPE_NVM for a WCN3990: skip an enclosing type-4 header, walk
++ * the first type-2 tag set; HCI tag 17: in-band sleep bit (data[0] |= 0x80) and UART baud
++ * (data[2]); deep-sleep tag 27: data[0] |= 1. Returns the bytes changed, -1 if malformed. The BD
++ * address tag (2) is only length-checked and never printed.
++ */
++static int
++bq_nvm_patch(uint8_t *d, uint32_t size, uint8_t baud)
++{
++	uint32_t off = 0, tl, len;
++	int changed = 0;
++
++	if (size < 4) {
++		return -1;
++	}
++	tl = bq_le32(d);
++	if ((tl & 0xffu) == 4) {
++		if (size < 8) {
++			return -1;
++		}
++		off = 4;
++		tl = bq_le32(d + 4);
++	}
++	if ((tl & 0xffu) != 2) {
++		return 0;               /* Linux sends other types unparsed */
++	}
++	len = tl >> 8;
++	if (len < 12 || size < off + 4 + len) {
++		return -1;
++	}
++	uint8_t *t = d + off + 4;
++	for (uint32_t i = 0; i < len - 12;) {
++		uint16_t id = bq_le16(t + i), tlen = bq_le16(t + i + 2);
++		uint8_t *v = t + i + 12;
++		if (len < i + 12 + tlen) {
++			return -1;
++		}
++		if ((id == 2 && tlen != 6) || (id == 17 && tlen < 3) || (id == 27 && tlen < 1)) {
++			return -1;
++		}
++		if (id == 17) {
++			changed += !(v[0] & 0x80) + (v[2] != baud);
++			v[0] |= 0x80;
++			v[2] = baud;
++		} else if (id == 27) {
++			changed += !(v[0] & 1);
++			v[0] |= 1;
++		}
++		i += 12 + tlen;
++	}
++	return changed;
++}
++
++/* TLV_TYPE_PATCH header (struct tlv_type_patch after the type word): download_mode, or -1 */
++static int
++bq_patch_mode(const uint8_t *d, uint32_t size)
++{
++	if (size < 4 + 24 || (bq_le32(d) & 0xffu) != 1) {
++		return -1;
++	}
++	return d[4 + 10];
++}
++
++/*
++ * qca_download_firmware() / qca_tlv_send_segment(): 243-byte segments as EDL_PATCH_TLV_REQ_CMD
++ * on 0xfc00. With download mode 1 or 3 (QCA_SKIP_EVT_VSE[_CC]) only the last (or a short) segment
++ * waits for its VSE; otherwise every one does. A VSE must report result 0 (Linux only logs it).
++ */
++static bool
++bq_download(const char *name, const uint8_t *d, uint32_t size, int mode)
++{
++	uint8_t seg[2 + MAX_TLV_SEGMENT], ev[2 + 255];
++	uint32_t segs = 0, acks = 0, n;
++
++	for (uint32_t done = 0; done < size; segs++) {
++		uint32_t k = MIN(size - done, MAX_TLV_SEGMENT);
++		bool ack = done + k == size || k < MAX_TLV_SEGMENT || (mode != 1 && mode != 3);
++		seg[0] = EDL_PATCH_TLV_REQ_CMD;
++		seg[1] = (uint8_t)k;
++		memcpy(seg + 2, d + done, k);
++		if (!bq_cmd(EDL_PATCH_OP, seg, (uint8_t)(k + 2))) {
++			return false;
++		}
++		done += k;
++		if (ack) {
++			n = bq_wait(0xff, EDL_PATCH_OP, EDL_TVL_DNLD_RES_EVT, ev, 2000);
++			if (n != 5 || ev[4] != 0) {
++				return BQ_STOP("%s segment %u: no clean VSE (%u bytes, result %#x)", name, segs, n, n == 5 ? ev[4] : 0);
++			}
++			acks++;
++		} else if ((n = bq_take_event(ev)) > 0) {
++			bq_log_event("unexpected", ev, n);
++			return BQ_STOP("%s segment %u: event while none is due", name, segs);
++		}
++	}
++	printf("SWEET BTQ: stage 3: %s: %u segments sent, %u acknowledged (download mode %d)\n", name, segs, acks, mode);
++	return true;
++}
++
++static uint8_t *
++bq_fw_read(const struct bq_fw *f)
++{
++	uint8_t *p = kalloc_data(f->size, Z_WAITOK);
++	int e = EAGAIN;
++
++	for (unsigned i = 0; p && i < 60 && e == EAGAIN; i++) {
++		if ((e = sweet_ufs_read_part(BQ_LUN, BQ_PART, f->off, p, f->size)) == EAGAIN) {
++			bq_sleep(1000); /* UFS not up yet */
++		}
++	}
++	uint32_t crc = p && !e ? crc32(0, p, f->size) : 0;
++	printf("SWEET BTQ: stage 3: %s: %u bytes at %#x of %s (LUN %u): errno %d crc32 %#010x%s\n", f->name, f->size,
++	    f->off, BQ_PART, BQ_LUN, p ? e : ENOMEM, crc, crc == f->crc ? "" : " MISMATCH");
++	if (p && (e || crc != f->crc)) {
++		kfree_data(p, f->size);
++		p = NULL;
++	}
++	return p;
++}
++
++static bool
++bq_firmware(void)
++{
++	uint8_t *tlv = NULL, *nvm = NULL, c = QCA_BAUDRATE_3200000, ev[2 + 255];
++	int mode, changed;
++	bool ok = false;
++
++	if (bq.rom != 0x21) {
++		return BQ_STOP("ROM %#x: only the rom 0x21 files (crbtfw21.tlv, crnv21.bin) are in the table", bq.rom);
++	}
++	tlv = bq_fw_read(&bq_fw[0]);
++	nvm = tlv ? bq_fw_read(&bq_fw[1]) : NULL;
++	if (!tlv || !nvm) {
++		(void)BQ_STOP("firmware not read");
++		goto out;
++	}
++	mode = bq_patch_mode(tlv, bq_fw[0].size);
++	changed = bq_nvm_patch(nvm, bq_fw[1].size, QCA_BAUDRATE_3200000);
++	printf("SWEET BTQ: stage 3: rampatch download mode %d; NVM tags: %d bytes set as btqca.c does\n", mode, changed);
++	if (mode < 0 || changed < 0) {
++		(void)BQ_STOP("malformed TLV (rampatch mode %d, NVM %d)", mode, changed);
++		goto out;
++	}
++	/* qca_set_speed(QCA_OPER_SPEED): flow off, 0xfc48, host baud, flow on, wait for the VSE */
++	bq_flow(false);
++	if (!bq_cmd(QCA_BAUD_OP, &c, 1)) {
++		goto out;
++	}
++	bq_sleep(10);                   /* usleep_range(1000, 10000) */
++	if (!bq_baud(BQ_OPER_BAUD)) {
++		goto out;
++	}
++	bq_rx_poll();                   /* whatever came in at the old rate is noise: a stray 0x04 */
++	bq.rx_have = 0;                 /* would swallow the VSE as the body of a bogus event */
++	bq.s_seen = 0;
++	bq_flow(true);
++	if (bq_wait(0xff, QCA_BAUD_OP, ANY_VENDOR_EVENT, ev, 100) == 0) {
++		(void)BQ_STOP("controller did not confirm 3.2 Mbaud (hci_qca: Failed to change controller baudrate)");
++		goto out;
++	}
++	if (!bq_download(bq_fw[0].name, tlv, bq_fw[0].size, mode)) {
++		goto out;
++	}
++	bq_sleep(10);                   /* "Give the controller some time to get ready to receive the NVM" */
++	if (!bq_download(bq_fw[1].name, nvm, bq_fw[1].size, 0)) {
++		goto out;
++	}
++	if (!bq_cmd(0x0c03, NULL, 0)) {
++		goto out;
++	}
++	uint32_t n = bq_wait(0x0e, 0x0c03, 0, ev, 5000);
++	if (n < 6 || ev[5] != 0) {
++		(void)BQ_STOP("HCI_Reset: %s (status %#x)", n ? "failed" : "no Command Complete", n >= 6 ? ev[5] : 0);
++		goto out;
++	}
++	printf("SWEET BTQ: stage 3: HCI_Reset status 0\n");
++	if (!bq_cmd(0x1001, NULL, 0)) {
++		goto out;
++	}
++	n = bq_wait(0x0e, 0x1001, 0, ev, 2000);
++	if (n < 14 || ev[5] != 0) {
++		(void)BQ_STOP("Read_Local_Version: %u bytes, status %#x", n, n >= 6 ? ev[5] : 0);
++		goto out;
++	}
++	uint16_t manufacturer = bq_le16(ev + 10);
++	printf("SWEET BTQ: stage 3: Read_Local_Version: HCI %u rev %#x, LMP %u subversion %#x, manufacturer %u%s "
++	    "(ibs %u/%u/%u, stray %u)\n", ev[6], bq_le16(ev + 7), ev[9], bq_le16(ev + 12), manufacturer,
++	    manufacturer == 29 ? " (Qualcomm)" : "", bq.ibs[0], bq.ibs[1], bq.ibs[2], bq.stray);
++	ok = manufacturer == 29 || BQ_STOP("manufacturer %u, not 29", manufacturer);
++out:
++	if (tlv) {
++		kfree_data(tlv, bq_fw[0].size);
++	}
++	if (nvm) {
++		kfree_data(nvm, bq_fw[1].size);
++	}
++	return ok;
++}
++
++/* ------------------------------------------------------------------------------- run */
++
++static void
++bq_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool ok;
++
++	bq_sleep(BQ_DELAY_S * 1000u);
++	bq.stage = 1;
++	ok = bq_probe();
++	if (ok && bq.want >= 2) {
++		bq.stage = 2;
++		ok = bq_power() && bq_version();
++		if (ok) {
++			printf("SWEET BTQ: stage 2: ok\n");
++		}
++	}
++	if (ok && bq.want >= 3) {
++		bq.stage = 3;
++		ok = bq_firmware();
++		if (ok) {
++			printf("SWEET BTQ: stage 3: ok\n");
++		}
++	}
++	if (bq.se_up) {
++		/* leave the line quiet: no reader from here on, RFR not ready, TX idle */
++		bq_rx_stop();
++		bq_wr(bq.se, SE_UART_MANUAL_RFR, UART_MANUAL_RFR_EN | UART_RFR_NOT_READY);
++	}
++	printf("SWEET BTQ: finished at stage %u of %u (%s); rails and clocks stay voted\n", bq.stage, bq.want,
++	    ok ? "ok" : "stopped");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_btq_init(void)
++{
++	uint32_t rsc = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("btreal", &bq.want, sizeof(bq.want)) || bq.want == 0) {
++		return;
++	}
++	if (!PE_parse_boot_argn("rpmhrsc", &rsc, sizeof(rsc)) || rsc != 0x179e0000u) {
++		printf("SWEET BTQ: btreal=%u needs SDM845 (rpmhrsc=0x179e0000); not started\n", bq.want);
++		return;
++	}
++	if (bq.want > 3) {
++		bq.want = 3;
++	}
++	bq.sampling = 32;
++	bq.baud = 115200;
++	if (kernel_thread_start(bq_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET BTQ: kernel_thread_start failed\n");
++		return;
++	}
++	thread_deallocate(thread);
++	printf("SWEET BTQ: btreal=%u: WCN3990 bring-up starts in %u s\n", bq.want, BQ_DELAY_S);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
