@@ -1,0 +1,298 @@
+enchilada: GL: CoreAnimation's display surfaces drawn by the GPU in place, kernel-maintained
+
+With 0198 the GPU never touched a cacheable IOSurface: eagl.c rendered each 1125x2436 frame into a
+texture of its own and glReadPixels'd it into the surface (~72 ms a frame, gl-run-20), and refilled
+a display-sized source texture from its surface (10809 KB, ~20 ms a frame). Those surfaces are
+wired IOBufferMemoryDescriptor pages with a cacheable kernel alias, so they can be kept coherent
+like 0197's arena BOs, by kernel address instead of a pa: dc civac by VA reaches every alias of a
+page (the data cache is physically tagged). SURFACE_BO now maps such a surface (one plane, not
+client memory) and marks the BO zero-copy; SUBMIT cleans its pixels before the GPU runs and
+records the fence on the surface (gpuDirty, gpuFence: the surface, not the BO, since the panel
+copy and other tasks see the surface); CPU_PREP, WAIT_FENCE and BO_SYNC drop its lines once the GPU
+is done; CPU_FINI and BO_SYNC clean. The panel copy and the IOSurface lock trap call
+sweet_surface_gpu_settle(): if the GPU used the surface since its lines were last dropped, wait
+(at most 100 ms, then read it as it is) for that submission and clean+invalidate, so it is done
+once per GPU use and costs nothing (no lock) otherwise. clientMemoryForType() gives such a BO
+copyback: left to the libdrm stand-in's write-combined request, mapping it would re-type the
+surface's VM object, the panel copy's alias with it. Client memory (wrapped task ranges) and planar
+surfaces are still refused, the client copies them. One line per kind of surface says which path
+it took; boot-arg glzc0=1 refuses every cacheable surface again (0198's behaviour; the client copies).
+
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -41,11 +41,16 @@
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: pixel start inside its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
++	/* 0220: a cacheable surface the GPU uses in place (SweetAdreno.cpp; gAdrenoLock) */
++	bool                      gpuDirty;     /* submitted since the CPU's lines were last dropped */
++	uint32_t                  gpuFence;     /* last submission that used it */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE
+ 	{
+ 		wrapDelta = 0;
+ 		wrapped = false;
++		gpuDirty = false;
++		gpuFence = 0;
+ 		return OSObject::init();
+ 	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -54,6 +59,13 @@
+ 	uintptr_t kernelAddress();
+ };
+ 
++/*
++ * 0220 (SweetAdreno.cpp): before the CPU reads or writes a surface the GPU used in place, wait
++ * (bounded) for those submissions and drop the CPU's stale lines of it. Nothing to do (no lock
++ * taken) for a surface the GPU has not used since.
++ */
++void sweet_surface_gpu_settle(SweetSurface *s);
++
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1002,6 +1002,7 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	sweet_surface_gpu_settle(s);    /* 0220: a lock waits for the GPU's use of the surface, as on iOS */
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -115,6 +115,71 @@
+ 	}
+ }
+ 
++/*
++ * 0220: cacheable IOSurfaces of wired kernel pages (CoreAnimation's display surfaces) are mapped
++ * for the GPU in place and kept coherent as 0197 keeps arena BOs, by the surface's kernel address
++ * instead of a pa (dc civac by VA reaches every alias of the page: the data cache is physically
++ * tagged). Cleaned at SUBMIT; dropped once the GPU is done with them at CPU_PREP, WAIT_FENCE, an
++ * IOSurface lock and the panel copy (sweet_surface_gpu_settle). glzc0=1: refused as with 0198.
++ */
++#define SETTLE_PATIENCE_MS      100u
++static int gSurfZc = -1;
++
++static bool
++surfZc(void)
++{
++	if (gSurfZc < 0) {
++		uint32_t off = 0;
++		(void)PE_parse_boot_argn("glzc0", &off, sizeof(off));
++		gSurfZc = off == 0;
++		IOLog("SWEET GPU: cacheable IOSurfaces %s (glzc0=%u)\n",
++		    gSurfZc ? "used by the GPU in place, kernel-maintained" : "not mapped for the GPU, the client copies", off);
++	}
++	return gSurfZc != 0;
++}
++
++/* Clean+invalidate the pixels of a zero-copy surface (one plane: offset + rows) by kernel address. */
++static void
++surfFlush(SweetSurface *s)
++{
++	flush_dcache64((addr64_t)s->kernelAddress(), (unsigned)((uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height), FALSE);
++}
++
++/* Lock held: once the submissions that used it are done, drop the CPU's lines of it. */
++static bool
++surfSettle(SweetSurface *s)
++{
++	if (s->gpuDirty && (!sweet_gpu_ready() || sweet_gpu_fence_done(s->gpuFence))) {
++		surfFlush(s);
++		s->gpuDirty = false;
++	}
++	return !s->gpuDirty;
++}
++
++void
++sweet_surface_gpu_settle(SweetSurface *s)
++{
++	/* A look without the lock first: only SUBMIT sets the flag. */
++	if (s == NULL || !s->gpuDirty || gAdrenoLock == NULL) {
++		return;
++	}
++	IOLockLock(gAdrenoLock);
++	for (uint32_t ms = 0; !surfSettle(s) && ms < SETTLE_PATIENCE_MS; ms++) {
++		IOLockUnlock(gAdrenoLock);
++		IOSleep(1);
++		IOLockLock(gAdrenoLock);
++	}
++	if (s->gpuDirty) {
++		static uint32_t told;
++		surfFlush(s);   /* what is in memory now rather than older lines; still dirty for the next look */
++		if (told++ < 4) {
++			IOLog("SWEET GPU: surface %u still in use by the GPU after %u ms (fence %u, last done %s): read as it is\n",
++			    s->id, SETTLE_PATIENCE_MS, s->gpuFence, sweet_gpu_fence_done(s->gpuFence) ? "yes" : "no");
++		}
++	}
++	IOLockUnlock(gAdrenoLock);
++}
++
+ static bool
+ adrenoLog(uint32_t *seen)
+ {
+@@ -140,6 +205,7 @@
+ 	uint32_t                  lastWrite;    /* last one that wrote it */
+ 	bool                      submitted;    /* SET_IOVA is refused after the first submit */
+ 	bool                      gpuDirty;     /* 0197: submitted since the CPU's lines were last dropped */
++	bool                      zc;           /* 0220: a cacheable surface used in place (surface->gpuDirty) */
+ };
+ 
+ class SweetAdreno630 : public IOService {
+@@ -603,6 +669,9 @@
+ 			boFlush(g->pa, g->size);
+ 			g->gpuDirty = g->lastFence != 0 && !sweet_gpu_fence_done(g->lastFence);
+ 		}
++		if (ret == kIOReturnSuccess && g->zc) {
++			(void)surfSettle(g->surface);   /* 0220 */
++		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;
+@@ -716,6 +785,11 @@
+ 		 */
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			boFlush(objs[i]->pa, objs[i]->size);
++			if (objs[i]->zc) {
++				/* 0220: by its kernel address (no pa). ponytail: every submit, CPU-written or not;
++				 * track CPU writes (unlock, CPU_FINI) if ~ms per 11 MB surface shows in the frame. */
++				surfFlush(objs[i]->surface);
++			}
+ 		}
+ 		/* validated: patch, then submit */
+ 		at = 0;
+@@ -768,6 +842,10 @@
+ 			objs[i]->lastFence = fence;
+ 			objs[i]->submitted = true;
+ 			objs[i]->gpuDirty = true;       /* every BO: freedreno's fence BO is not always flagged WRITE */
++			if (objs[i]->zc) {
++				objs[i]->surface->gpuDirty = true;      /* 0220: read or written, the panel copy waits */
++				objs[i]->surface->gpuFence = fence;
++			}
+ 			if (bos[i].flags & SWEET_MSM_SUBMIT_BO_WRITE) {
+ 				objs[i]->lastWrite = fence;
+ 			}
+@@ -817,9 +895,12 @@
+ 		 * 0197: Mesa may read a BO without CPU_PREP once its own fence word (a BO the CP writes)
+ 		 * says idle, so every BO whose submissions are all done drops its CPU lines here.
+ 		 */
+-		for (uint32_t i = 0; ret == kIOReturnSuccess && i < GEM_MAX && boCached(); i++) {
++		for (uint32_t i = 0; ret == kIOReturnSuccess && i < GEM_MAX; i++) {
+ 			struct sweet_gem *g = &fGems[i];
+-			if (g->md != NULL && g->gpuDirty && g->pa != 0 &&
++			if (g->md != NULL && g->zc) {
++				(void)surfSettle(g->surface);   /* 0220 */
++			}
++			if (boCached() && g->md != NULL && g->gpuDirty && g->pa != 0 &&
+ 			    (g->lastFence == 0 || sweet_gpu_fence_done(g->lastFence))) {
+ 				boFlush(g->pa, g->size);
+ 				g->gpuDirty = false;
+@@ -881,20 +962,32 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 	/*
+-	 * 0198: the GPU does not snoop the CPU's caches, and nothing keeps a surface BO coherent:
+-	 * boFlush() needs an arena pa (surface BOs have none) and sweet_gpu_cache_sync() is a barrier.
+-	 * A cacheable surface (IOBufferMemoryDescriptor or client memory) shared with the GPU would
+-	 * show stale lines both ways (the panel copy reading old frames, CPU-drawn pictures not yet
+-	 * in DRAM). Only uncached ones (the panel) are mapped; the client copies the rest.
++	 * 0198: the GPU does not snoop the CPU's caches, so a cacheable surface needs the kernel's
++	 * maintenance. 0220: one of wired kernel pages (IOBufferMemoryDescriptor, one plane: what
++	 * CoreAnimation draws the display into) gets it by kernel address (surfFlush) and is mapped as
++	 * it is. Client memory (a wrapped task range) and planar ones are still refused, and with
++	 * glzc0=1 every cacheable one: the client copies. Uncached ones (the panel) need nothing.
++	 * One line for each kind, the first time.
+ 	 */
+-	if (s->mapCache != kIOMapWriteCombineCache) {
+-		static uint32_t told;
+-		if (told++ < 4) {
+-			IOLog("SWEET GPU: surface %u (%ux%u fmt 0x%x) is cacheable: no GPU mapping, the client copies\n",
+-			    s->id, s->width, s->height, s->pixelFormat);
++	bool zc = s->mapCache != kIOMapWriteCombineCache && surfZc() && !s->wrapped &&
++	    OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL && s->planeCount == 0 && s->elementHeight == 1;
++	{
++		static bool told[4];
++		int kind = s->mapCache == kIOMapWriteCombineCache ? 0 : zc ? 1 : !surfZc() ? 2 : 3;
++		static const char *const path[4] = {
++			"uncached: mapped for the GPU",
++			"cacheable: used by the GPU in place, kernel-maintained",
++			"cacheable: no GPU mapping (glzc0=1), the client copies",
++			"cacheable client memory or planar: no GPU mapping, the client copies",
++		};
++		if (!told[kind]) {
++			told[kind] = true;
++			IOLog("SWEET GPU: surface %u (%ux%u fmt 0x%x) %s\n", s->id, s->width, s->height, s->pixelFormat, path[kind]);
++		}
++		if (kind >= 2) {
++			s->release();
++			return kIOReturnUnsupported;
+ 		}
+-		s->release();
+-		return kIOReturnUnsupported;
+ 	}
+ 	if (size == 0 || size > GEM_SIZE_MAX) {
+ 		s->release();
+@@ -915,6 +1008,7 @@
+ 				g->surface = s;         /* our reference moves into the slot on success */
+ 				g->kva = (uint8_t *)s->kernelAddress();
+ 				g->size = size;
++				g->zc = zc;
+ 				ret = mapGem(g, 0, &r->handle, 0);
+ 				if (ret != kIOReturnSuccess) {
+ 					g->md->release();
+@@ -943,7 +1037,15 @@
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (g != NULL) {
+-		if (g->pa != 0 && boCached()) {
++		if (g->zc) {
++			/* 0220: the whole of it, by kernel address; once the GPU is done, the panel copy need not again */
++			SweetSurface *s = g->surface;
++			surfFlush(s);
++			if (s->gpuDirty && sweet_gpu_fence_done(s->gpuFence)) {
++				s->gpuDirty = false;
++			}
++			ret = kIOReturnSuccess;
++		} else if (g->pa != 0 && boCached()) {
+ 			/* 0197: the client's alias is cacheable: clean+invalidate the range by physical address */
+ 			if (r->offset > g->size || r->size > g->size - r->offset) {
+ 				ret = kIOReturnBadArgument;
+@@ -975,8 +1077,12 @@
+ 	if (g != NULL) {
+ 		g->md->retain();
+ 		*memory = g->md;
+-		/* 0197: arena BOs copyback (0197 makes IOUserClient keep a driver-chosen cache mode) */
+-		*options = g->pa != 0 && boCached() ? kIOMapCopybackCache : 0;
++		/*
++		 * 0197: arena BOs copyback (0197 makes IOUserClient keep a driver-chosen cache mode). 0220: a
++		 * zero-copy surface too; left to the client's write-combined request, the mapping would re-type
++		 * the surface's VM object (memoryReferenceMap), every other mapping of it with it.
++		 */
++		*options = (g->pa != 0 && boCached()) || g->zc ? kIOMapCopybackCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+@@ -1070,6 +1176,9 @@
+ 			if (g != NULL && g->pa != 0 && boCached()) {
+ 				boFlush(g->pa, g->size);    /* 0197: the CPU's stores reach memory before the GPU reads */
+ 			}
++			if (g != NULL && g->zc) {
++				surfFlush(g->surface);      /* 0220 */
++			}
+ 		}
+ 		IOLockUnlock(gAdrenoLock);
+ 		__asm__ volatile ("dsb sy" ::: "memory");       /* CPU stores through the WC mapping reach memory */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -466,6 +466,7 @@
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		sweet_surface_gpu_settle(s);    /* 0220: drawn in place by the GPU: done, and no stale lines */
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
