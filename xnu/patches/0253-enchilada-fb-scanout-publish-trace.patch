@@ -1,0 +1,249 @@
+enchilada: display: publish scanout-pool surfaces, trace swaps, idempotent MDP restore
+
+Boot 26 (sweetzc=1 sweetfb_fit=1, software rendering): both pool surfaces were made ("in the
+scanout pool at 0x9dd68000 / 0x9eab4000") but logged "create id 0": 0251's pool branch set
+s->memory and so skipped the IOBufferMemoryDescriptor branch, which is where a surface gets
+published. Every swap then named surface 0, which the copy path skips (copy avg 0-1 us) and
+zcFlip treated as "nothing to show" without a word, so the screen froze/black; IOSurface.framework
+also takes all id-0 surfaces for one, a likely source of the panic at reboot. Pool surfaces are now
+published like the rest (table full: the create fails and free() returns the slot); the copy path
+needs nothing else (kernelAddress() gives the copyback alias, getLength() the allocSize). Every
+swap zcFlip does not scan in place is counted with its reason in the 10 s line, each reason is
+logged once (also "no enabled layer names a surface"), and the first 8 swaps get one trace line
+each (swap id, layer mask and surfaces, pool or not, path taken). The MDP restore only runs while
+a flip has moved the pipe away from ABL's framebuffer (set before the first write, cleared once a
+restore is taken by a frame), so display-off and panics with nothing to undo touch no register;
+it has no locks, sleeping or logging, and the panic hook is taken by one CPU (atomic exchange).
+"Taken by a frame" never used the TE/frame counters (boot 25: PP0 tear check off, internal vsync
+counter on, autorefresh every 1, 0 TE and 0 INTF1 frames counted): it waits for the CTL_FLUSH bits
+to clear, which a frame does whatever triggers it.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,6 +76,8 @@
+ /* Frame statistics, logged every 10 s while frames arrive ("SWEET FB: last 10 s ..."). */
+ static uint64_t sweet_fb_stat_swaps, sweet_fb_stat_copies, sweet_fb_stat_copy_abs, sweet_fb_stat_copy_max;
+ static uint64_t sweet_fb_stat_zc, sweet_fb_stat_zc_abs, sweet_fb_stat_zc_max;  /* 0251: frames scanned in place, latch wait */
++static uint64_t sweet_fb_stat_zcno;             /* 0253: swaps zcFlip did not scan in place */
++static const char *sweet_fb_stat_zcwhy;         /* 0253: and the last reason */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -142,6 +144,9 @@
+ 	IOLock       *fMdpLock;
+ 	SweetSurface *fZcHeld;
+ 	const char   *fZcTold[8];     /* reasons already logged */
++	const char   *fZcPath;        /* 0253: what zcFlip did with the last swap, for the swap trace */
++	uint32_t      fZcId;          /* 0253: the surface it looked at */
++	bool          fZcPool;        /* 0253: ... and whether that one lives in the scanout pool */
+ 	bool          zcArm(int mode);
+ 	bool          zcProgram(void);
+ 	bool          zcLatch(void);
+@@ -639,11 +644,12 @@
+ 		}
+ 		absolutetime_to_nanoseconds(sweet_fb_stat_zc_max, &zmax_ns);
+ 		IOLog("SWEET FB: last 10 s: %llu swaps (%llu.%llu/s), %llu panel copies, copy avg %llu us max %llu us, "
+-		    "%llu in place (wait for the frame avg %llu us max %llu us)\n",
++		    "%llu in place (wait for the frame avg %llu us max %llu us), %llu not in place (last: %s)\n",
+ 		    sweet_fb_stat_swaps, sweet_fb_stat_swaps / 10, sweet_fb_stat_swaps % 10, sweet_fb_stat_copies,
+-		    avg_ns / 1000, max_ns / 1000, sweet_fb_stat_zc, zavg_ns / 1000, zmax_ns / 1000);
++		    avg_ns / 1000, max_ns / 1000, sweet_fb_stat_zc, zavg_ns / 1000, zmax_ns / 1000,
++		    sweet_fb_stat_zcno, sweet_fb_stat_zcwhy != NULL ? sweet_fb_stat_zcwhy : "-");
+ 		sweet_fb_stat_swaps = sweet_fb_stat_copies = sweet_fb_stat_copy_abs = sweet_fb_stat_copy_max = 0;
+-		sweet_fb_stat_zc = sweet_fb_stat_zc_abs = sweet_fb_stat_zc_max = 0;
++		sweet_fb_stat_zc = sweet_fb_stat_zc_abs = sweet_fb_stat_zc_max = sweet_fb_stat_zcno = 0;
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -688,11 +694,24 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	bool shown = fZc != 0 && zcFlip(rec);  /* 0251: scanned in place (or copied) already */
++	bool shown = false;
++	const char *path = "copied by the vsync timer (in-place scanout not armed)";
++	fZcId = 0;
++	fZcPool = false;
++	if (fZc != 0) {
++		shown = zcFlip(rec);    /* 0251: scanned in place (or copied) already */
++		path = fZcPath;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = !shown;
+ 	IOLockUnlock(fLock);
++	if (sweet_fb_swap_count < 8) {
++		/* 0253: the first swaps, one line each: what was named and which path it took */
++		IOLog("SWEET FB: swap trace %llu: id %u, mask 0x%x, layer surfaces %u %u %u %u, surface %u %s -> %s\n",
++		    sweet_fb_swap_count + 1, get32(rec, 0x50), get32(rec, 0x104), get32(rec, 0x54), get32(rec, 0x58),
++		    get32(rec, 0x5c), get32(rec, 0x60), fZcId, fZcPool ? "(scanout pool)" : "(not pool)", path);
++	}
+ 	sweet_fb_stat_swaps++;
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -939,12 +958,21 @@
+ 	}
+ }
+ 
+-/* Show ABL's framebuffer 1:1 again (latched at the next frame). No locks: also the panic hook. */
++/*
++ * 0253: true from the first register write of a flip until a restore has been taken by a frame:
++ * only then is there anything to put back. Read by the panic hook too.
++ */
++static volatile bool sweet_mdp_away;
++
++/*
++ * Show ABL's framebuffer 1:1 again (latched at the next frame). Idempotent (writes the saved
++ * values, nothing read-modify-write), no locks, no sleeping, no logging: also the panic hook.
++ */
+ static void
+ sweet_mdp_boot_restore(void)
+ {
+ 	vm_offset_t m = sweet_mdp.base;
+-	if (m == 0 || sweet_mdp_boot.n == 0) {
++	if (m == 0 || sweet_mdp_boot.n == 0 || !sweet_mdp_away) {
+ 		return;
+ 	}
+ 	for (uint32_t i = 0; i < sweet_mdp_boot.n; i++) {
+@@ -1155,9 +1183,10 @@
+ void
+ AppleCLCD::zcStop(const char *why, bool forever)
+ {
+-	if (fZcOn || forever) {
++	if (sweet_mdp_away) {
+ 		sweet_mdp_boot_restore();
+ 		if (zcLatch()) {
++			sweet_mdp_away = false;
+ 			OSSafeReleaseNULL(fZcHeld);
+ 		} else {
+ 			forever = true;         /* fZcHeld may still be scanned: it stays held */
+@@ -1190,12 +1219,21 @@
+ 		}
+ 	}
+ 	if (n == 0 || fPowerOff) {
++		/* 0253: boot 26 had only id-0 layers (unpublished pool surfaces) and said nothing */
++		fZcPath = fPowerOff ? "display off: not shown" : "no enabled layer names a surface: nothing to show";
++		sweet_fb_stat_zcno++;
++		sweet_fb_stat_zcwhy = fZcPath;
++		if (!fPowerOff) {
++			zcSay(fZcPath, 0);
++		}
+ 		return false;
+ 	}
+ 	const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
+ 	int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+ 	SweetSurface *s = n == 1 ? sweet_surface_copy(id) : NULL;
+ 	const char *why = NULL;
++	fZcId = id;
++	fZcPool = s != NULL && s->scanoutPA != 0;
+ 	if (n > 1) {
+ 		why = "several layers: copied";
+ 	} else if (s == NULL || s == fSurface) {
+@@ -1213,6 +1251,9 @@
+ 	IOLockLock(fMdpLock);
+ 	if (why != NULL || fZc == 0) {
+ 		bool shown = false;
++		fZcPath = why != NULL ? why : "in-place scanout is off: copied";
++		sweet_fb_stat_zcno++;
++		sweet_fb_stat_zcwhy = fZcPath;
+ 		if (fZcOn) {
+ 			present(rec);   /* into ABL's framebuffer while the pipe still scans the surface */
+ 			zcStop(why != NULL ? why : "off", false);
+@@ -1232,6 +1273,7 @@
+ 	uint32_t pa = (uint32_t)(s->scanoutPA + s->offset), stride = fZcStride1 | s->bytesPerRow;
+ 	bool first = !fZcOn;
+ 	const char *fail = NULL;
++	sweet_mdp_away = true;          /* 0253: from the first write on, a restore has work to do */
+ 	if (first && !zcProgram()) {
+ 		fail = "a geometry register did not read back";
+ 	}
+@@ -1262,10 +1304,14 @@
+ 			present(rec);
+ 		}
+ 		zcStop(fail, true);
++		fZcPath = fail;
++		sweet_fb_stat_zcno++;
++		sweet_fb_stat_zcwhy = fail;
+ 		IOLockUnlock(fMdpLock);
+ 		s->release();
+ 		return !first;
+ 	}
++	fZcPath = "in place";
+ 	fZcOn = true;
+ 	SweetSurface *old = fZcHeld;
+ 	fZcHeld = s;            /* keeps sweet_surface_copy's reference until a later frame is latched */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -707,15 +707,20 @@
+  * splash carve-out, below 4 GiB, which the display's source pipe can scan where CoreAnimation
+  * draws it). Mapped copyback like the IOBufferMemoryDescriptor surfaces it replaces (the
+  * kernel cleans it before each scan); the kernel alias is checked to really be write-back,
+- * since a device mapping would fault CoreAnimation's unaligned stores. Any failure leaves
+- * s->memory NULL and the surface gets ordinary memory.
++ * since a device mapping would fault CoreAnimation's unaligned stores. Any mapping failure
++ * leaves s->memory NULL and the surface gets ordinary memory.
++ * 0253: and it is published like every other surface. 0251 forgot that: both pool surfaces
++ * kept id 0 ("create id 0" in boot 26), every swap then named surface 0, which neither the
++ * copy nor the flip shows, so the screen froze; IOSurface.framework also takes all id-0
++ * surfaces for one. Returns kIOReturnNoResources when the table is full (the caller's error
++ * path frees s, and free() hands the slot back).
+  */
+-static void
++static IOReturn
+ sweet_surface_use_scanout_pool(SweetSurface *s)
+ {
+ 	uint64_t pa = sweet_scanout_take(s);
+ 	if (pa == 0) {
+-		return;
++		return kIOReturnSuccess;
+ 	}
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa, s->allocSize, kIODirectionInOut);
+ 	s->scanoutPA = pa;
+@@ -729,13 +734,18 @@
+ 		OSSafeReleaseNULL(s->memory);
+ 		s->scanoutPA = 0;
+ 		sweet_scanout_give(pa);
+-		return;
++		return kIOReturnSuccess;
+ 	}
+ 	bzero((void *)kva, s->allocSize);       /* write-back: dc zva is fine here */
++	if (!sweet_surface_publish(s)) {
++		IOLog("SWEET SURF: scanout surface at 0x%llx: surface table full\n", pa);
++		return kIOReturnNoResources;
++	}
+ 	if (told++ < 8) {
+-		IOLog("SWEET SURF: %ux%u surface in the scanout pool at 0x%llx (%u bytes, copyback)\n",
+-		    s->width, s->height, pa, s->allocSize);
++		IOLog("SWEET SURF: surface %u (%ux%u) in the scanout pool at 0x%llx (%u bytes, copyback)\n",
++		    s->id, s->width, s->height, pa, s->allocSize);
+ 	}
++	return kIOReturnSuccess;
+ }
+ 
+ IOReturn
+@@ -811,7 +821,7 @@
+ 		}
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+-		sweet_surface_use_scanout_pool(s);      /* 0251: may set s->memory */
++		ret = sweet_surface_use_scanout_pool(s);        /* 0251: may set s->memory (0253: and publishes) */
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -288,9 +288,11 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+ 	if (sweet_fb_panic_hook != NULL && panic_active()) {
+-		void (*hook)(void) = sweet_fb_panic_hook;
+-		sweet_fb_panic_hook = NULL;
+-		hook();         /* the console draws into ABL's framebuffer: show it again */
++		/* 0253: one taker even when several CPUs print the panic */
++		void (*hook)(void) = __atomic_exchange_n(&sweet_fb_panic_hook, NULL, __ATOMIC_ACQ_REL);
++		if (hook != NULL) {
++			hook();         /* the console draws into ABL's framebuffer: show it again */
++		}
+ 	}
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
