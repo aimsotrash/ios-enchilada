@@ -1,0 +1,26 @@
+ci: IORPC.kernelContent, so the kernel builds with Xcode 16's iig (macos-15 runners)
+
+GitHub retired the macos-14 runner image (Xcode 15). Xcode 16's iig generates code that sets
+IORPC.kernelContent, a field newer xnu added; this xnu ignores it. IORPC only travels inside the
+kernel (user-space drivers talk Mach messages), so the extra member changes no external ABI.
+
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,7 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++	bool               kernelContent;  /* Xcode 16 iig sets it (newer xnu ABI); unused here */
+ };
+ typedef struct IORPC IORPC;
+ 
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,7 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++	bool               kernelContent;  /* Xcode 16 iig sets it (newer xnu ABI); unused here */
+ };
+ typedef struct IORPC IORPC;
+ 
