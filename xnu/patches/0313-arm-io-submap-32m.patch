@@ -1,0 +1,15 @@
+arm: io_submap 32 MiB instead of 8 MiB (ADSP probe panic)
+
+The port maps far more device memory than an iPhone (MDP, GPU, GMU, USB, UFS, TLMM, modem windows, BT, battery, touch); 0300's ADSP probe mapping SMEM partitions ran io_submap out and kmem_alloc(KMA_NOFAIL) panicked ~10 s after boot (boot55, same failure as boot45). 32 MiB is the size osfmk/i386/io_map.c uses; kernel VA is plentiful.
+
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,7 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
