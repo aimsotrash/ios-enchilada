@@ -3,10 +3,14 @@
 
   python3 -I tools/mss-fw-table.py backup/modem-fw/modem_a.img backup/modem-fw/modem_a/image
   python3 -I tools/mss-fw-table.py --tftp backup/modem-fw/modem_a.img backup/modem-fw/modem_a/image
+  python3 -I tools/mss-fw-table.py --adsp backup/modem-fw/modem_a.img backup/modem-fw/modem_a/image
 
 --tftp (xnu 0265 mss_tftp[]): every file the modem may ask the TFTP server for, i.e. all files
 under image/ except the PIL images the apps side loads (X.mdt + X.bNN, mba.mbn), as
 { path relative to image/, offset, size }. A zero-length file gets offset 0.
+
+--adsp (xnu 0300 adsp_fw[]): adsp.mdt and the adsp.bNN files of its PT_LOAD segments, in the
+mss_fw[] format (no mba.mbn).
 
 The kernel reads each file straight from the modem_a partition (UFS LUN 4) at the offset printed
 here, so a file must lie in the image as one contiguous byte run. That is checked the direct way:
@@ -24,15 +28,15 @@ import zlib
 ALIGN = 4096          # FAT16 here: 4096-byte sectors, 4 per cluster; data area sector aligned
 
 
-def wanted(image_dir):
-    mdt = open(os.path.join(image_dir, 'modem.mdt'), 'rb').read()
+def wanted(image_dir, pil='modem'):
+    mdt = open(os.path.join(image_dir, pil + '.mdt'), 'rb').read()
     phoff, = struct.unpack_from('<I', mdt, 28)
     phnum, = struct.unpack_from('<H', mdt, 44)
-    names = ['mba.mbn', 'modem.mdt']
+    names = (['mba.mbn'] if pil == 'modem' else []) + [pil + '.mdt']
     for i in range(phnum):
         p_type, _, _, _, filesz = struct.unpack_from('<5I', mdt, phoff + 32 * i)
-        if p_type == 1 and filesz:               # PT_LOAD with bytes: modem.bNN exists
-            names.append('modem.b%02d' % i)
+        if p_type == 1 and filesz:               # PT_LOAD with bytes: X.bNN exists
+            names.append('%s.b%02d' % (pil, i))
     return names
 
 
@@ -62,7 +66,8 @@ def tftp_files(image_dir):
 
 def main():
     tftp = sys.argv[1:2] == ['--tftp']
-    args = sys.argv[2:] if tftp else sys.argv[1:]
+    pil = 'adsp' if sys.argv[1:2] == ['--adsp'] else 'modem'
+    args = sys.argv[2:] if tftp or pil != 'modem' else sys.argv[1:]
     if len(args) != 2:
         sys.exit(__doc__)
     with open(args[0], 'rb') as f:
@@ -76,7 +81,7 @@ def main():
             print('\t{ "%s", %#x, %#x },' % (name, at, len(data)))
         return
     rows = []
-    for name in wanted(args[1]):
+    for name in wanted(args[1], pil):
         data = open(os.path.join(args[1], name), 'rb').read()
         at = find(img, data)
         if at < 0:

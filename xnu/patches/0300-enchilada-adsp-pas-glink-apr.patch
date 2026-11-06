@@ -1,0 +1,1704 @@
+enchilada: ADSP: boot the LPASS Q6 through SCM PAS and talk APR to it in gated stages (adsp=1..3, audio round 1)
+
+Audio on this phone runs through the ADSP: the Q6 AFE drives QUAT MI2S to the speaker amp (MAX98927
+at 0x3a on QUP SE4 per board overlay 17819/22; not a TFA98xx) and SLIMbus to the WCD9340, and the
+apps talk to it in APR over GLINK. logs/audio/plan.md has the whole chain; this is its first part,
+in a new bsd/dev/sweet_adsp.c, one attempt per boot, polled from its own thread, every stage a
+prefix of the next ending in one "SWEET ADSP: stage N: ok/FAILED: ..." line, any failure running
+the stop path (SMP2P stop request if it ran, SCM PAS shutdown, load_state adsp off).
+1: read-only probe: the adsp region (enchilada2.dtb pil_adsp_mem 0x8c500000 + 0x1a00000) against
+the kernel's RAM, SMEM v12 header + ptable, the apps<->adsp partition (hosts 0/2) and items 423
+(global), 429, 443, 478, 479, 480, GCC's audio TBU GDSC vote. LPASS itself is not read.
+2: adsp.mdt + adsp.b02..b13 from modem_a (UFS LUN 4) at the offsets of tools/mss-fw-table.py --adsp,
+every crc32 checked before anything else; the mdt checked as qcom_mdt_pas_init would (header + hash
+= the whole 7452-byte mdt, relocatable, extent 0x1a00000 = the region). Then Linux v6.12
+qcom_q6v5_pas.c adsp_start for sdm845_adsp_resource_init: SMP2P item 429 ("master-kernel"), QMP
+load_state adsp on, cx at its top corner (downstream's vdd_cx TURBO proxy vote), PAS id 1
+init_image with the metadata in its own page (0xa1090000, unmapped before the call), mem_setup,
+segments into the region (tails zeroed, windows dropped before auth), auth_and_reset, and SMP2P
+item 443 "slave-kernel" ready (bit 1) within 5 s.
+3: GLINK over SMEM to the ADSP (items 478/479/480 of partition 0/2, APCS IPC bit 8), every channel
+the ADSP opens logged, "apr_audio_svc" and "IPCRTR" opened both ways with 8 intents each; APR from
+APPS (5) to q6core (svc 3, ADSP 4): AVCS_CMD_ADSP_EVENT_GET_STATE every 100 ms until ready (3 s),
+then AVCS_CMD_GET_FWK_VERSION (AVCS_GET_VERSIONS if unsupported), framework and service versions
+logged; QRTR HELLO and the ADSP's NEW_SERVERs logged (nothing served yet); then a 30 s watch for a
+fatal (crash reason item 423) and the stop path.
+sweet_mss.c shares three things with the new thread: mss_scm() (no longer static), sweet_mss_qmp()
+(the AOSS mailbox opened once and used under a lock; MSS's own load_state messages go through it)
+and sweet_mss_smem_lock() (TCSR mutex 3 holds one value per processor, so the two apps threads
+allocating SMEM items also need a lock). sweet_adsp_probe() runs right after sweet_mss_probe().
+Host-checked against a fake SMEM/SCM/ADSP peer with the real modem_a.img (stages 1-3 and the
+fail-closed path); not yet built in CI or booted.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_mss.c			standard
++bsd/dev/sweet_adsp.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -49,6 +49,11 @@
+  * 0268:
+  *   9  + en0 and its IOKit entries (sweet_wlan.c, SweetWLAN.cpp) so wifid can list what the scans
+  *        heard (SCAN_REQ/SCAN_RESULT); the watch stays open while the WLAN path is alive
++ * 0300: sweet_adsp.c (boot-arg adsp=N) shares three things with this file, from its own thread:
++ *   mss_scm() (stateless), sweet_mss_qmp() (the one AOSS QMP mailbox, opened once, under a lock)
++ *   and sweet_mss_smem_lock() (TCSR mutex 3 holds one value per processor, so two apps threads
++ *   allocating SMEM items also need a lock of their own). Nothing else of this file is shared:
++ *   the windows here are remapped at will by the MSS thread.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -777,8 +782,11 @@
+ 	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
+ }
+ 
+-/* Returns x0 (0 = success) and x1 in *res; SCM_STUCK if TZ never completed the call. */
+-static int
++/* Returns x0 (0 = success) and x1 in *res; SCM_STUCK if TZ never completed the call. 0300: also
++ * sweet_adsp.c's (stack only, so callable from any thread). */
++int mss_scm(uint32_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
++    uint64_t *res, unsigned *resumes);
++int
+ mss_scm(uint32_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+     uint64_t *res, unsigned *resumes)
+ {
+@@ -937,6 +945,32 @@
+ 	return ok;
+ }
+ 
++/* 0300: the MSS and ADSP threads share the mailbox: opened once, one message at a time */
++static LCK_GRP_DECLARE(mss_shared_grp, "sweet_mss_shared");
++static LCK_MTX_DECLARE(mss_qmp_lock, &mss_shared_grp);
++static LCK_MTX_DECLARE(mss_smem_lock, &mss_shared_grp);
++bool sweet_mss_qmp(const char *msg);
++void sweet_mss_smem_lock(bool take);
++
++bool
++sweet_mss_qmp(const char *msg)
++{
++	lck_mtx_lock(&mss_qmp_lock);
++	bool ok = (ms.qmp_off || mss_qmp_open()) && mss_qmp_send(msg);
++	lck_mtx_unlock(&mss_qmp_lock);
++	return ok;
++}
++
++void
++sweet_mss_smem_lock(bool take)
++{
++	if (take) {
++		lck_mtx_lock(&mss_smem_lock);
++	} else {
++		lck_mtx_unlock(&mss_smem_lock);
++	}
++}
++
+ /* --- rails: rpmhpd ACTIVE votes (0261); EBUSY = the touch thread holds the apps RSC --- */
+ static bool
+ mss_arc(const char *res, int corner, bool *flag)
+@@ -1082,6 +1116,7 @@
+ 	uint32_t size = (bytes + 7) & ~7u, need = 16 + size, item = 0;
+ 	bool locked = false;
+ 
++	sweet_mss_smem_lock(true);              /* 0300: the ADSP thread allocates too */
+ 	for (unsigned i = 0; i < 1000 && !locked; i++) {
+ 		w32(TCSR_MUTEX3, 1);
+ 		locked = r32(TCSR_MUTEX3) == 1;
+@@ -1091,6 +1126,7 @@
+ 	}
+ 	if (!locked) {
+ 		printf("SWEET MSS: smem hwlock 3 held by %u\n", r32(TCSR_MUTEX3));
++		sweet_mss_smem_lock(false);
+ 		return 0;
+ 	}
+ 	uint32_t unc = smem32(p->off + 12), cac = smem32(p->off + 16), have = 0;
+@@ -1112,6 +1148,7 @@
+ 		    id, unc, cac);
+ 	}
+ 	w32(TCSR_MUTEX3, 0);
++	sweet_mss_smem_lock(false);
+ 	return mss_bad ? 0 : item;
+ }
+ 
+@@ -1232,7 +1269,7 @@
+ 		}
+ 	}
+ 	if (ms.load_state) {
+-		ms.load_state = !mss_qmp_send("{class: image, res: load_state, name: modem, val: off}");
++		ms.load_state = !sweet_mss_qmp("{class: image, res: load_state, name: modem, val: off}");
+ 	}
+ 	if (ms.arc_mss) {
+ 		(void)mss_arc("mss.lvl", 0, &ms.arc_mss);
+@@ -1425,8 +1462,7 @@
+ 	uint32_t v = 0, pbl = 0, mba = 0;
+ 	unsigned ms_waited = 0;
+ 
+-	if (!mss_qmp_open() ||
+-	    !(ms.load_state = mss_qmp_send("{class: image, res: load_state, name: modem, val: on}"))) {
++	if (!(ms.load_state = sweet_mss_qmp("{class: image, res: load_state, name: modem, val: on}"))) {
+ 		why = "qmp load_state";
+ 	} else if (!mss_arc("mx.lvl", -1, &ms.arc_mx) || !mss_arc("cx.lvl", -1, &ms.arc_cx) ||
+ 	    !mss_arc("mss.lvl", -1, &ms.arc_mss)) {
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@
+ extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_mss_probe(void);
++extern void sweet_adsp_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -726,6 +727,7 @@
+ 	sweet_gpu_probe();
+ 	sweet_usb_probe();
+ 	sweet_mss_probe();         /* boot-arg mss=1 read-only probe; mss=2..5 stages (0262) */
++	sweet_adsp_probe();        /* boot-arg adsp=1 read-only probe; adsp=2..3 stages (0300) */
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_adsp.c
+@@ -0,0 +1,1537 @@
++/*
++ * ADSP (LPASS Q6) bring-up for the OnePlus 6 (SDM845 "enchilada"), round 1 of logs/audio/plan.md.
++ * Boot-arg adsp=N; absent or 0 = nothing runs. Each stage is a prefix of the next and ends in one
++ * "SWEET ADSP: stage N: ..." line; adsp=N stops after stage N through ad_stop(), which also runs on
++ * every failure (fail closed: SMP2P stop request if it ran, SCM PAS shutdown, load_state off).
++ *   1  read-only probe: the adsp region against the kernel's RAM; SMEM header, ptable, the apps<->adsp
++ *      partition (hosts 0/2) and items 423 (global), 429, 443, 478, 479, 480; GCC's audio TBU GDSC
++ *      vote. Not read: LPASS (0x17000000+: QDSP6SS, lpasscc) and gcc_lpass_* (0x47000/0x47008),
++ *      which are protected or unclocked until TZ boots the ADSP.
++ *   2  adsp.mdt + adsp.b02..b13 from modem_a (UFS LUN 4) crc-checked against adsp_fw[]; SMP2P item 429
++ *      ("master-kernel"); QMP load_state adsp on; cx vote; SCM PAS (id 1) init_image (metadata in its
++ *      own page), mem_setup, segments into the region (tails zeroed), auth_and_reset; SMP2P item 443
++ *      "slave-kernel" ready within 5 s (qcom_q6v5_pas.c adsp_start)
++ *   3  GLINK over SMEM (items 478/479/480 of partition 0/2, doorbell APCS IPC bit 8): every channel the
++ *      ADSP opens is logged; "apr_audio_svc" and "IPCRTR" are opened both ways; APR to q6core (svc 3,
++ *      domain 4): AVCS_CMD_ADSP_EVENT_GET_STATE until ready (3 s), then AVCS_CMD_GET_FWK_VERSION
++ *      (AVCS_GET_VERSIONS if unsupported); QRTR HELLO and the ADSP's NEW_SERVERs logged; 30 s watch
++ * Sources, Linux v6.12: remoteproc/qcom_q6v5_pas.c (sdm845_adsp_resource_init: pas_id 1, load_state
++ * "adsp", crash reason 423, only "xo"), qcom_q6v5.c, soc/qcom/mdt_loader.c, firmware/qcom/qcom_scm.c
++ * (PAS: svc 2, cmds 1/2/5/6/7), soc/qcom/smem.c + smp2p.c, rpmsg/qcom_glink_smem.c +
++ * qcom_glink_native.c, soc/qcom/apr.c, sound/soc/qcom/qdsp6/q6core.c, net/qrtr; sdm845.dtsi
++ * remoteproc-adsp, smp2p-lpass (smem 443 in / 429 out, APCS bit 10, remote pid 2), glink-edge
++ * (APCS bit 8, label lpass), apr (apr_audio_svc, APR_DOMAIN_ADSP 4); enchilada2.dtb qcom,lpass@17300000
++ * (pil-tz-generic, pas-id 1, vdd_cx proxy at TURBO, xo, qcom,signal-aop, memory-region 0x8c500000
++ * + 0x1a00000). SMEM layout as sweet_mss.c (v12 partitions; this phone: 0/2 at +0x1af000, 0x30000).
++ * Shared with sweet_mss.c (0300): mss_scm(), sweet_mss_qmp(), sweet_mss_smem_lock(). Every mapping
++ * here is this file's own: the MSS thread remaps its windows at will.
++ * Deliberate differences from Linux: no XO vote (the apps CPU runs from XO); the cx vote is never
++ * dropped (as sweet_mss.c: the apps DRV's earlier vote is unknown); no interrupts, all polled.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/vm_prot.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++
++extern vm_offset_t io_map(uint64_t pa, vm_size_t size, unsigned int flags, vm_prot_t prot,
++    bool unmappable);
++extern void ml_io_unmap(vm_offset_t va, vm_size_t size);
++extern unsigned long gPhysBase, gPhysSize;
++extern int sweet_ufs_read_part(unsigned lun, const char *name, uint64_t off, void *dst, uint32_t len);
++extern int sweet_rpmh_arc_vote(const char *res, int corner, unsigned *sent);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int mss_scm(uint32_t fn, uint64_t arginfo, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
++    uint64_t *res, unsigned *resumes);
++extern bool sweet_mss_qmp(const char *msg);
++extern void sweet_mss_smem_lock(bool take);
++void sweet_adsp_probe(void);
++
++#define AD_WIMG_IO      0x7u            /* VM_WIMG_IO */
++#define AD_WIMG_WC      0x6u            /* VM_WIMG_WCOMB */
++#define SMEM_PA         0x86000000ull
++#define SMEM_SIZE       0x200000u
++#define GCC_PA          0x00100000ull
++#define TCSR_MUTEX3     0x01f43000ull   /* tcsr_mutex 0x1f40000, lock 3 */
++#define APCS_PAGE       0x17990000ull   /* apss_shared; +0xc = IPC: bit 8 glink lpass, bit 10 smp2p lpass */
++#define DB_GLINK        (1u << 8)
++#define DB_SMP2P        (1u << 10)
++#define AD_PA           0x8c500000ull   /* pil_adsp_mem = mainline adsp_mem */
++#define AD_SIZE         0x1a00000u
++#define AD_META_PA      0xa1090000ull   /* plain RAM between sweet_mss.c's SCR (+512 KiB) and WN_DMA */
++#define AD_META_MAX     0x4000u
++#define AD_WIN          0x80000u        /* 512 KiB write-combined windows, one at a time */
++#define AD_LUN          4u
++#define AD_PART         "modem_a"
++#define PAS_ADSP        1u
++#define HOST_APPS       0u
++#define HOST_ADSP       2u
++#define IT_CRASH        423
++#define IT_OUT          429             /* smp2p apps -> adsp */
++#define IT_IN           443             /* smp2p adsp -> apps */
++#define IT_DESC         478
++#define IT_TX           479
++#define IT_RX           480
++#define SK_FATAL        (1u << 0)
++#define SK_READY        (1u << 1)
++#define SK_HANDOVER     (1u << 2)
++#define SK_STOP_ACK     (1u << 3)
++#define SCM_FN(svc, cmd) (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++
++/* modem_a.img (same image as sweet_mss.c's mss_fw[]), tools/mss-fw-table.py --adsp: file byte
++ * offset in the partition, size, crc32. A file that does not match is refused. */
++static const struct ad_fw { const char *name; uint32_t off, size, crc; } adsp_fw[] = {
++	{ "adsp.mdt", 0xad9000, 0x1d1c, 0x54c5ebd4 },
++	{ "adsp.b02", 0x25000, 0x20d8, 0x3c502dfb },
++	{ "adsp.b03", 0x29000, 0x1d864, 0x71bd6302 },
++	{ "adsp.b04", 0x49000, 0x1c37a0, 0x40d650e3 },
++	{ "adsp.b05", 0x20d000, 0x11767c, 0xca5acd48 },
++	{ "adsp.b06", 0x325000, 0xb40, 0x91aad612 },
++	{ "adsp.b07", 0x329000, 0x8530, 0x070f1625 },
++	{ "adsp.b08", 0x335000, 0x4ca80, 0xff36d355 },
++	{ "adsp.b09", 0x385000, 0x54, 0xdd09f39e },
++	{ "adsp.b10", 0x389000, 0x6cd1bc, 0x92bcc42f },
++	{ "adsp.b11", 0xa59000, 0x4cbc8, 0x59005f34 },
++	{ "adsp.b12", 0xaa9000, 0xb50, 0xec10582b },
++	{ "adsp.b13", 0xaad000, 0x28fa8, 0xb665e5a2 },
++};
++#define FW_MDT  (&adsp_fw[0])
++
++static int ad_mode;
++static bool ad_bad;                     /* a refused access: the stage fails at its next check */
++static uint64_t ad_t0;
++
++static struct {
++	bool region_ours;       /* HLOS may write the region (cleared before auth_and_reset) */
++	bool load_state, arc_cx, pas_init, pas_started, running;
++	uint32_t out_off;       /* SMEM offset of our item 429 payload */
++} ad;
++
++static unsigned
++ad_now(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - ad_t0, &ns);
++	return (unsigned)(ns / 1000000);
++}
++
++/* --- SMEM: four Device mappings (header page, ptable page, global and apps<->adsp partitions) --- */
++struct ad_map { uint32_t off, len; vm_offset_t va; bool rw; };
++enum { M_HDR, M_PT, M_GLOB, M_PART, M_N };
++static struct ad_map sm[M_N];
++static struct { uint32_t lo, hi; } ours[8];   /* SMEM ranges we may store to */
++static unsigned nours;
++static bool sm_allocating;
++
++static bool
++sm_map(unsigned i, uint32_t off, uint32_t len, bool rw)
++{
++	sm[i].va = io_map(SMEM_PA + off, len, AD_WIMG_IO, rw ? (VM_PROT_READ | VM_PROT_WRITE) : VM_PROT_READ,
++	    true);
++	sm[i].off = off;
++	sm[i].len = len;
++	sm[i].rw = rw;
++	return sm[i].va != 0;
++}
++
++static volatile uint32_t *
++sm_ptr(uint32_t off, bool wr)
++{
++	for (unsigned i = 0; i < M_N; i++) {
++		if (sm[i].va && !(off & 3) && off >= sm[i].off && off + 4 <= sm[i].off + sm[i].len &&
++		    (!wr || sm[i].rw)) {
++			return (volatile uint32_t *)(sm[i].va + (off - sm[i].off));
++		}
++	}
++	printf("SWEET ADSP: refused smem %s at +%#x\n", wr ? "store" : "read", off);
++	ad_bad = true;
++	return NULL;
++}
++
++static uint32_t
++sm32(uint32_t off)
++{
++	volatile uint32_t *p = sm_ptr(off, false);
++	uint32_t v = p ? *p : 0;
++
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++sm_w32(uint32_t off, uint32_t v)
++{
++	const struct ad_map *p = &sm[M_PART];
++	bool ok = sm_allocating && off == p->off + 12;          /* free_uncached, while allocating */
++	volatile uint32_t *q;
++
++	for (unsigned i = 0; i < nours && !ok; i++) {
++		ok = off >= ours[i].lo && off + 4 <= ours[i].hi;
++	}
++	if (!ok || (q = sm_ptr(off, true)) == NULL) {
++		printf("SWEET ADSP: refused smem store at +%#x\n", off);
++		ad_bad = true;
++		return;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*q = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++sm_ours(uint32_t lo, uint32_t hi)
++{
++	if (nours < sizeof(ours) / sizeof(ours[0])) {
++		ours[nours].lo = lo;
++		ours[nours++].hi = hi;
++	}
++}
++
++/* sweet_mss.c smem_part_find on the apps<->adsp partition, or the global one; ~0 size = broken */
++static uint32_t
++sm_find(unsigned which, uint16_t item, uint32_t *size)
++{
++	const struct ad_map *p = &sm[which];
++	uint32_t free_unc = p->va ? sm32(p->off + 12) : 0;
++	uint32_t e = p->off + 32;
++
++	*size = 0;
++	if (!p->va || free_unc > p->len) {
++		*size = p->va ? ~0u : 0;
++		return 0;
++	}
++	for (unsigned n = 0; e + 16 <= p->off + free_unc && n < 1024; n++) {
++		uint32_t w0 = sm32(e), sz = sm32(e + 4), pad = sm32(e + 8);
++
++		if ((w0 & 0xffff) != 0xa5a5u || sz > p->len || e + 16 + (pad >> 16) + sz > p->off + free_unc) {
++			printf("SWEET ADSP: partition +%#x: broken entry at +%#x\n", p->off, e - p->off);
++			*size = ~0u;
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return e + 16 + (pad >> 16);
++		}
++		e += 16 + (pad >> 16) + sz;
++	}
++	return 0;
++}
++
++/* qcom_smem_alloc_private in partition 0/2 under hwspinlock 3 (and sweet_mss.c's lock); 0 = refused */
++static vm_offset_t tcsr_va, ipc_va;
++
++static uint32_t
++sm_alloc(uint16_t id, uint32_t bytes)
++{
++	const struct ad_map *p = &sm[M_PART];
++	uint32_t size = (bytes + 7) & ~7u, need = 16 + size, item = 0, have = 0;
++	bool locked = false;
++
++	if (!tcsr_va || !p->rw) {
++		return 0;
++	}
++	sweet_mss_smem_lock(true);
++	for (unsigned i = 0; i < 1000 && !locked; i++) {
++		*(volatile uint32_t *)tcsr_va = 1;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		locked = *(volatile uint32_t *)tcsr_va == 1;
++		if (!locked) {
++			delay(1000);
++		}
++	}
++	if (locked) {
++		uint32_t unc = sm32(p->off + 12), cac = sm32(p->off + 16);
++		if (sm_find(M_PART, id, &have) == 0 && have != ~0u && unc >= 32 && unc + need <= cac &&
++		    cac <= p->len) {
++			uint32_t e = p->off + unc;
++			sm_ours(e, e + need);
++			sm_allocating = true;
++			sm_w32(e, 0xa5a5u | (uint32_t)id << 16);
++			sm_w32(e + 4, size);
++			sm_w32(e + 8, size - bytes);            /* padding_data; padding_hdr 0 */
++			sm_w32(e + 12, 0);
++			for (uint32_t o = 0; o < size; o += 4) {
++				sm_w32(e + 16 + o, 0);
++			}
++			sm_w32(p->off + 12, unc + need);
++			sm_allocating = false;
++			item = e + 16;
++		} else {
++			printf("SWEET ADSP: smem: item %u present or no room (uncached %#x cached %#x)\n", id, unc, cac);
++		}
++		*(volatile uint32_t *)tcsr_va = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	} else {
++		printf("SWEET ADSP: smem hwlock 3 held by %u\n", *(volatile uint32_t *)tcsr_va);
++	}
++	sweet_mss_smem_lock(false);
++	return ad_bad ? 0 : item;
++}
++
++static void
++kick(uint32_t bit)
++{
++	if (ipc_va) {
++		__asm__ volatile ("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(ipc_va + 0xc) = bit;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
++/* --- stage 1 --- */
++static const char *
++ad_probe(char *sum, size_t n)
++{
++	uint64_t lo = gPhysBase, hi = (uint64_t)gPhysBase + gPhysSize;
++	uint32_t pt = SMEM_SIZE - 0x1000, part_off = 0, part_size = 0, glob_off = 0, glob_size = 0;
++	vm_offset_t gcc;
++
++	printf("SWEET ADSP: region adsp %#011llx-%#011llx %s (kernel RAM %#llx-%#llx), metadata page %#llx\n",
++	    AD_PA, AD_PA + AD_SIZE, AD_PA < hi && AD_PA + AD_SIZE > lo ? "OVERLAPS kernel RAM" : "outside kernel RAM",
++	    lo, hi, AD_META_PA);
++	if (AD_PA < hi && AD_PA + AD_SIZE > lo) {
++		return "region overlaps kernel RAM";
++	}
++	if ((gcc = io_map(GCC_PA + 0x7d000, 0x1000, AD_WIMG_IO, VM_PROT_READ, true)) != 0) {
++		uint32_t v = *(volatile uint32_t *)(gcc + 0x30);
++		printf("SWEET ADSP: gcc hlos1_vote_aggre_noc_mmu_audio_tbu_gdsc +0x7d030 = %#010x (pwr_on %u, "
++		    "sw_collapse %u)\n", v, v >> 31, v & 1);
++		ml_io_unmap(gcc, 0x1000);
++	}
++	if (!sm_map(M_HDR, 0, 0x1000, false) || !sm_map(M_PT, pt, 0x1000, false)) {
++		return "cannot map smem";
++	}
++	uint32_t ver = sm32(0x40 + 4 * 7) >> 16, num = sm32(pt + 8);
++	if (ver != 12 || sm32(pt) != 0x434f5424u || sm32(pt + 4) != 1 || num > (0x1000 - 32) / 48) {
++		printf("SWEET ADSP: smem version %u, ptable magic %#x\n", ver, sm32(pt));
++		return "smem not v12 with a ptable";
++	}
++	for (uint32_t i = 0; i < num; i++) {
++		uint32_t e = pt + 32 + 48 * i, off = sm32(e), size = sm32(e + 4), hosts = sm32(e + 12);
++		uint32_t h0 = hosts & 0xffff, h1 = hosts >> 16;
++
++		if (!off || !size || (uint64_t)off + size > SMEM_SIZE) {
++			continue;
++		}
++		if ((h0 == HOST_APPS && h1 == HOST_ADSP) || (h0 == HOST_ADSP && h1 == HOST_APPS)) {
++			part_off = off;
++			part_size = size;
++		} else if (h0 == 0xfffe && h1 == 0xfffe) {
++			glob_off = off;
++			glob_size = size;
++		}
++	}
++	if (!part_off || !glob_off) {
++		return "no apps<->adsp or global partition";
++	}
++	if (!sm_map(M_GLOB, glob_off, glob_size, false) || !sm_map(M_PART, part_off, part_size, ad_mode >= 2)) {
++		return "cannot map the partitions";
++	}
++	uint32_t magic = sm32(part_off), hosts = sm32(part_off + 4), psize = sm32(part_off + 8);
++	printf("SWEET ADSP: apps-adsp partition +%#x size %#x: magic %#x hosts %#x/%#x free_uncached %#x "
++	    "free_cached %#x\n", part_off, part_size, magic, hosts & 0xffff, hosts >> 16, sm32(part_off + 12),
++	    sm32(part_off + 16));
++	if (magic != 0x54525024u || psize != part_size || sm32(glob_off) != 0x54525024u) {
++		return "partition header invalid";
++	}
++	static const struct { unsigned map; uint16_t id; const char *name; } items[] = {
++		{ M_GLOB, IT_CRASH, "adsp crash reason" }, { M_PART, IT_OUT, "smp2p apps->adsp" },
++		{ M_PART, IT_IN, "smp2p adsp->apps" }, { M_PART, IT_DESC, "glink desc" },
++		{ M_PART, IT_TX, "glink apps fifo" }, { M_PART, IT_RX, "glink adsp fifo" },
++	};
++	snprintf(sum, n, "smem v12, partition 0/2 at +%#x, items", part_off);
++	for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++		uint32_t size, off = sm_find(items[i].map, items[i].id, &size);
++		if (size == ~0u) {
++			return "partition list broken";
++		}
++		printf("SWEET ADSP: item %u (%s): %s +%#x, %u bytes\n", items[i].id, items[i].name,
++		    off ? "present" : "absent", off, size);
++		strlcat(sum, off ? " +" : " -", n);
++	}
++	strlcat(sum, " (423 429 443 478 479 480)", n);
++	return NULL;
++}
++
++/* --- firmware --- */
++static uint8_t ad_buf[0x20000];         /* UFS bounce, one chunk */
++static uint8_t ad_mdt[0x2000];
++static vm_offset_t win_va;
++static uint64_t win_pa;
++
++static void
++win_drop(void)
++{
++	if (win_va) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(win_va, AD_WIN);
++		win_va = 0;
++	}
++}
++
++/* a write-combined window over the region (while it is ours) or the metadata page */
++static uint8_t *
++win(uint64_t pa)
++{
++	uint64_t base = pa & ~(uint64_t)(AD_WIN - 1);
++	bool ok = (ad.region_ours && base >= AD_PA && base < AD_PA + AD_SIZE) ||
++	    (base == (AD_META_PA & ~(uint64_t)(AD_WIN - 1)) && !ad.pas_init);
++
++	if (!ok) {
++		printf("SWEET ADSP: refused window %#llx\n", base);
++		ad_bad = true;
++		return NULL;
++	}
++	if (!win_va || base != win_pa) {
++		win_drop();
++		win_va = io_map(base, AD_WIN, AD_WIMG_WC, VM_PROT_READ | VM_PROT_WRITE, true);
++		win_pa = base;
++	}
++	return win_va ? (uint8_t *)(win_va + (vm_offset_t)(pa - base)) : NULL;
++}
++
++/* store n bytes (src NULL: zeroes) at pa; never past the region or the metadata page */
++static bool
++put(uint64_t pa, const uint8_t *src, uint32_t n)
++{
++	bool in_region = pa >= AD_PA && pa + n <= AD_PA + AD_SIZE;
++	bool in_meta = pa >= AD_META_PA && pa + n <= AD_META_PA + AD_META_MAX;
++
++	if (!in_region && !in_meta) {
++		printf("SWEET ADSP: refused store of %u bytes at %#llx\n", n, pa);
++		ad_bad = true;
++		return false;
++	}
++	while (n) {
++		uint32_t k = MIN(n, AD_WIN - (uint32_t)(pa & (AD_WIN - 1)));
++		uint8_t *d = win(pa);
++		if (d == NULL) {
++			return false;
++		}
++		if (src) {
++			memcpy(d, src, k);
++			src += k;
++		} else {
++			bzero(d, k);
++		}
++		pa += k;
++		n -= k;
++	}
++	return true;
++}
++
++/* stream one file from modem_a: crc32 checked; stored at pa if pa != 0; kept if keep != NULL */
++static bool
++load(const struct ad_fw *f, uint64_t pa, uint8_t *keep, uint32_t keep_max)
++{
++	uint32_t crc = 0;
++
++	for (uint32_t done = 0; done < f->size;) {
++		uint32_t n = MIN(f->size - done, (uint32_t)sizeof(ad_buf));
++		int err = sweet_ufs_read_part(AD_LUN, AD_PART, f->off + done, ad_buf, n);
++		if (err) {
++			printf("SWEET ADSP: %s: read of %u bytes at +%#x failed: %d\n", f->name, n, done, err);
++			return false;
++		}
++		crc = crc32(crc, ad_buf, n);
++		if (keep && done + n <= keep_max) {
++			memcpy(keep + done, ad_buf, n);
++		}
++		if (pa && !put(pa + done, ad_buf, n)) {
++			return false;
++		}
++		done += n;
++	}
++	if (crc != f->crc) {
++		printf("SWEET ADSP: %s: crc32 %#010x, expected %#010x: modem_a is not the image of the table\n",
++		    f->name, crc, f->crc);
++		return false;
++	}
++	return true;
++}
++
++struct ad_phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; };
++static unsigned ad_phnum;
++static uint32_t ad_meta_size, ad_nseg, ad_seg_bytes;
++static uint64_t ad_min, ad_max;
++
++static void
++ph(unsigned i, struct ad_phdr *p)
++{
++	memcpy(p, ad_mdt + 52 + 32 * i, sizeof(*p));
++}
++
++static bool
++ph_load(const struct ad_phdr *p)        /* mdt_phdr_valid */
++{
++	return p->type == 1 && (p->flags & (7u << 24)) != (2u << 24) && p->memsz != 0;
++}
++
++static const struct ad_fw *
++fw_find(unsigned i)
++{
++	char name[16];
++
++	snprintf(name, sizeof(name), "adsp.b%02u", i);
++	for (unsigned k = 1; k < sizeof(adsp_fw) / sizeof(adsp_fw[0]); k++) {
++		if (strcmp(adsp_fw[k].name, name) == 0) {
++			return &adsp_fw[k];
++		}
++	}
++	return NULL;
++}
++
++/* qcom_mdt_read_metadata + qcom_mdt_pas_init's extent, on the image only */
++static const char *
++check_mdt(void)
++{
++	struct ad_phdr p;
++	uint32_t phoff;
++	uint16_t phentsize, phnum;
++	unsigned hash = 0;
++	bool relocate = false;
++
++	memcpy(&phoff, ad_mdt + 28, 4);
++	memcpy(&phentsize, ad_mdt + 42, 2);
++	memcpy(&phnum, ad_mdt + 44, 2);
++	if (memcmp(ad_mdt, "\177ELF\001", 5) != 0 || phoff != 52 || phentsize != 32 || phnum < 2 ||
++	    phnum > 32 || 52 + 32u * phnum > FW_MDT->size) {
++		return "mdt: not an ELF32 header with phdrs right after it";
++	}
++	ad_phnum = phnum;
++	ph(0, &p);
++	if (p.type == 1) {
++		return "mdt: phdr 0 is PT_LOAD";
++	}
++	uint32_t ehdr_size = p.filesz;
++	for (unsigned i = 1; i < phnum && !hash; i++) {
++		ph(i, &p);
++		hash = (p.flags & (7u << 24)) == (2u << 24) ? i : 0;
++	}
++	if (!hash) {
++		return "mdt: no hash segment";
++	}
++	ph(hash, &p);
++	ad_meta_size = ehdr_size + p.filesz;
++	if (ad_meta_size != FW_MDT->size || ad_meta_size > AD_META_MAX) {
++		return "mdt: not header + hash only, or metadata over 16 KiB";
++	}
++	ad_min = ~0ull;
++	ad_max = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		ph(i, &p);
++		if (ph_load(&p)) {
++			relocate |= !!(p.flags & (1u << 27));
++			ad_min = MIN(ad_min, (uint64_t)p.paddr);
++			ad_max = MAX(ad_max, ((uint64_t)p.paddr + p.memsz + 0xfff) & ~0xfffull);
++		}
++	}
++	if (!relocate || ad_max <= ad_min || ad_max - ad_min > AD_SIZE) {
++		return "mdt: not relocatable, or larger than the region";
++	}
++	ad_nseg = ad_seg_bytes = 0;
++	for (unsigned i = 0; i < phnum; i++) {
++		ph(i, &p);
++		if (!ph_load(&p) || p.filesz == 0) {
++			continue;
++		}
++		const struct ad_fw *f = fw_find(i);
++		if (p.filesz > p.memsz || f == NULL || f->size != p.filesz) {
++			return "mdt: a segment is not an adsp.bNN file of the table";
++		}
++		ad_nseg++;
++		ad_seg_bytes += p.filesz;
++	}
++	return NULL;
++}
++
++/* --- SCM PAS (qcom_scm.c), through sweet_mss.c's mss_scm --- */
++static int
++pas(const char *what, uint32_t cmd, uint64_t arginfo, uint64_t a1, uint64_t a2)
++{
++	uint64_t res = ~0ull;
++	unsigned resumes = 0;
++	int st = mss_scm(SCM_FN(0x02, cmd), arginfo, PAS_ADSP, a1, a2, 0, &res, &resumes);
++
++	printf("SWEET ADSP: scm pas %s: status %d result %#llx (%u resumes)\n", what, st, res, resumes);
++	return st ? st : (int)res;
++}
++
++/* --- SMP2P (smp2p.c): our item 429 with "master-kernel", the ADSP's 443 "slave-kernel" --- */
++static uint32_t
++smp2p_entry(uint32_t item, const char *name)
++{
++	uint32_t key[4] = { 0, 0, 0, 0 };
++	uint32_t valid = sm32(item + 12) >> 16;
++
++	memcpy(key, name, strlen(name));
++	for (uint32_t i = 0; i < valid && i < 16; i++) {
++		uint32_t e = item + 20 + 20 * i;
++		if (sm32(e) == key[0] && sm32(e + 4) == key[1] && sm32(e + 8) == key[2] && sm32(e + 12) == key[3]) {
++			return e + 16;
++		}
++	}
++	return 0;
++}
++
++static bool
++smp2p_out(void)
++{
++	uint32_t item = sm_alloc(IT_OUT, 340);          /* struct smp2p_smem_item, 16 entries */
++	uint32_t w[4];
++
++	if (!item) {
++		return false;
++	}
++	memcpy(w, "master-kernel\0\0", 16);
++	sm_w32(item, 0x504d5324u);                      /* "$SMP" */
++	sm_w32(item + 8, HOST_APPS | (HOST_ADSP << 16));
++	sm_w32(item + 16, 0);
++	for (unsigned k = 0; k < 4; k++) {
++		sm_w32(item + 20 + 4 * k, w[k]);
++	}
++	sm_w32(item + 36, 0);
++	sm_w32(item + 12, 16 | (1u << 16));             /* 16 total, 1 valid */
++	sm_w32(item + 4, 1 | (1u << 8));                /* version 1 last; SSR_ACK */
++	kick(DB_SMP2P);
++	ad.out_off = item;
++	return !ad_bad;
++}
++
++/* the ADSP's "slave-kernel" bits, or ~0 while item 443 / the entry does not exist yet */
++static uint32_t
++slave_kernel(void)
++{
++	static uint32_t in, val;
++	uint32_t size = 0;
++
++	if (!val) {
++		if (!in && (in = sm_find(M_PART, IT_IN, &size)) != 0 && size < 20) {
++			in = 0;
++		}
++		if (!in || sm32(in) != 0x504d5324u || (sm32(in + 4) & 0xff) != 1 ||
++		    (val = smp2p_entry(in, "slave-kernel")) == 0) {
++			return ~0u;
++		}
++		printf("SWEET ADSP: t=+%u ms smp2p 443 at +%#x pids %#x, slave-kernel at +%#x\n", ad_now(), in,
++		    sm32(in + 8), val);
++	}
++	return sm32(val);
++}
++
++static void
++crash_reason(void)
++{
++	uint32_t size = 0, off = sm_find(M_GLOB, IT_CRASH, &size);
++	char why[129];
++	unsigned n = 0;
++
++	for (uint32_t i = 0; off && i < size && n < 128; i += 4) {
++		uint32_t w = sm32(off + i);
++		for (unsigned b = 0; b < 4 && n < 128 && i + b < size; b++) {
++			char c = (char)(w >> (8 * b));
++			if (c == '\0') {
++				goto done;
++			}
++			why[n++] = (c >= 0x20 && c < 0x7f) ? c : '?';
++		}
++	}
++done:
++	why[n] = '\0';
++	printf("SWEET ADSP: crash reason (item 423): \"%s\"\n", off ? why : "(none)");
++}
++
++/* --- the stop path: qcom_q6v5_request_stop, PAS shutdown, load_state off --- */
++static void
++ad_stop(const char *why)
++{
++	uint32_t sk = ~0u;
++
++	printf("SWEET ADSP: stop (%s)\n", why);
++	ad_bad = false;
++	win_drop();
++	if (ad.running && ad.out_off) {
++		uint32_t v = ad.out_off + 36;           /* "master-kernel" value */
++		sm_w32(v, sm32(v) | 1u);
++		kick(DB_SMP2P);
++		for (unsigned t = 0; t < 5000; t += 10) {
++			if ((sk = slave_kernel()) != ~0u && (sk & SK_STOP_ACK)) {
++				break;
++			}
++			delay(10000);
++		}
++		printf("SWEET ADSP: stop request: slave-kernel %#x (%s)\n", sk,
++		    sk != ~0u && (sk & SK_STOP_ACK) ? "stop-ack" : "no stop-ack");
++		sm_w32(v, sm32(v) & ~1u);
++		kick(DB_SMP2P);
++		ad.running = false;
++	}
++	if (ad.pas_init || ad.pas_started) {
++		int st = pas("shutdown", 0x06, 1, 0, 0);
++		printf("SWEET ADSP: q6 %s\n", st == 0 ? "in reset (pas shutdown ok)" : "pas shutdown FAILED");
++		ad.pas_init = ad.pas_started = false;
++	}
++	if (ad.load_state) {
++		ad.load_state = !sweet_mss_qmp("{class: image, res: load_state, name: adsp, val: off}");
++	}
++	if (ad.arc_cx) {
++		printf("SWEET ADSP: cx vote kept (the apps DRV's earlier vote is unknown)\n");
++	}
++}
++
++/* --- stage 2 --- */
++static bool
++ad_stage2(void)
++{
++	const char *why = NULL;
++	uint64_t avail = 0;
++	unsigned resumes = 0, sent = 0, t = 0;
++	uint32_t sk = ~0u, isz = 0;
++	struct ad_phdr p;
++	static const uint8_t cmds[] = { 1, 2, 5, 6, 7 };
++
++	for (unsigned i = 0; i < sizeof(cmds) && !why; i++) {
++		int st = mss_scm(SCM_FN(0x06, 0x01), 1, 0x02000000u | (0x02 << 8) | cmds[i], 0, 0, 0, &avail, &resumes);
++		why = st == 0 && avail ? NULL : "scm pas call not available";
++	}
++	if (!why && pas("is_supported", 0x07, 1, 0, 0) != 1) {
++		why = "pas id 1 not supported";
++	} else if (!why && sm_find(M_PART, IT_IN, &isz) != 0) {
++		why = "item 443 exists: the adsp is not cold";
++	} else if (!why && (!load(FW_MDT, 0, ad_mdt, sizeof(ad_mdt)) || (why = check_mdt()) != NULL)) {
++		why = why ? why : "adsp.mdt";
++	}
++	for (unsigned i = 1; !why && i < sizeof(adsp_fw) / sizeof(adsp_fw[0]); i++) {
++		why = load(&adsp_fw[i], 0, NULL, 0) ? NULL : adsp_fw[i].name;
++	}
++	if (!why) {
++		tcsr_va = io_map(TCSR_MUTEX3, 0x1000, AD_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++		ipc_va = io_map(APCS_PAGE, 0x1000, AD_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++		why = !tcsr_va || !ipc_va ? "cannot map tcsr/apcs" : !smp2p_out() ? "smp2p item 429" : NULL;
++	}
++	if (why) {
++		printf("SWEET ADSP: stage 2: FAILED: %s\n", why);
++		return false;
++	}
++	printf("SWEET ADSP: firmware ok: metadata %u bytes, %u segments %u bytes, extent %#llx-%#llx "
++	    "(relocatable) -> %#llx; smp2p 429 at +%#x\n", ad_meta_size, ad_nseg, ad_seg_bytes, ad_min, ad_max,
++	    AD_PA, ad.out_off);
++
++	/* adsp_start: load_state, proxy votes, pas init + mem_setup, segments, auth_and_reset, ready */
++	if (!(ad.load_state = sweet_mss_qmp("{class: image, res: load_state, name: adsp, val: on}"))) {
++		why = "qmp load_state adsp";
++	}
++	for (unsigned i = 0; !why && i < 50; i++) {
++		int e = sweet_rpmh_arc_vote("cx.lvl", -1, &sent);
++		if (e == 0) {
++			ad.arc_cx = true;
++			break;
++		}
++		if (e != EBUSY || i == 49) {
++			why = "cx vote";
++		}
++		delay(20000);
++	}
++	if (!why && !put(AD_META_PA, ad_mdt, ad_meta_size)) {
++		why = "metadata copy";
++	}
++	win_drop();                             /* nothing of ours mapped over what TZ is about to lock */
++	if (!why) {
++		ad.pas_init = true;             /* from here the stop path owes a shutdown */
++		if (pas("init_image", 0x01, 0x82, AD_META_PA, 0) != 0) {
++			why = "pas init_image (metadata refused)";
++		} else if (pas("mem_setup", 0x02, 3, AD_PA, ad_max - ad_min) != 0) {
++			why = "pas mem_setup";
++		}
++	}
++	ad.region_ours = !why;
++	for (unsigned i = 0; !why && i < ad_phnum; i++) {
++		ph(i, &p);
++		if (!ph_load(&p)) {
++			continue;
++		}
++		uint64_t pa = AD_PA + (p.paddr - ad_min);
++		if ((p.filesz && !load(fw_find(i), pa, NULL, 0)) ||
++		    (p.memsz > p.filesz && !put(pa + p.filesz, NULL, p.memsz - p.filesz))) {
++			why = "segment load";
++		}
++	}
++	win_drop();
++	ad.region_ours = false;                 /* never mapped again this boot */
++	if (!why && !ad_bad) {
++		ad.pas_started = true;
++		if (pas("auth_and_reset", 0x05, 1, 0, 0) != 0) {
++			why = "pas auth_and_reset";
++		}
++	}
++	for (t = 0; !why && t < 5000; t += 10) {      /* qcom_q6v5_wait_for_start */
++		if ((sk = slave_kernel()) != ~0u && (sk & (SK_READY | SK_FATAL))) {
++			break;
++		}
++		delay(10000);
++	}
++	if (!why && (sk == ~0u || !(sk & SK_READY) || (sk & SK_FATAL))) {
++		why = sk == ~0u ? "no smp2p item 443 / slave-kernel in 5 s" : (sk & SK_FATAL) ? "fatal" : "not ready in 5 s";
++	}
++	if (why || ad_bad) {
++		printf("SWEET ADSP: stage 2: FAILED: %s (slave-kernel %#x)\n", why ? why : "refused access", sk);
++		if (sk != ~0u && (sk & SK_FATAL)) {
++			crash_reason();
++		}
++		ad_stop("stage 2 failed");
++		return false;
++	}
++	ad.running = true;
++	printf("SWEET ADSP: stage 2: ok: adsp ready after %u ms (slave-kernel %#x%s), cx corner %u\n", t, sk,
++	    (sk & SK_HANDOVER) ? ", handover" : "", sent);
++	return true;
++}
++
++/* ======================================================================================== */
++/*
++ * stage 3: GLINK over SMEM to the ADSP, as sweet_mss.c's modem edge (0264) but with channels by
++ * name: "apr_audio_svc" (lcid 1) and "IPCRTR" (lcid 2) are served, every other OPEN of the ADSP is
++ * logged and left unanswered (Linux acks a remote open only once a driver binds the channel).
++ * ponytail: a second copy of the modem's GLINK code, kept separate because that one is a single
++ * static edge polled by the MSS thread; fold both into one edge struct once both are proven.
++ */
++#define GK_INTENTS      8
++#define GK_INTENT_SIZE  0x800u          /* APR replies are small; Linux apr: qcom,intents <512 20> */
++#define GK_CHUNK        0x2000u
++#define GK_MAXCH        8
++#define AD_WATCH3_MS    30000u
++
++enum { G_VERSION, G_VERSION_ACK, G_OPEN, G_CLOSE, G_OPEN_ACK, G_INTENT, G_RX_DONE, G_INTENT_REQ,
++       G_INTENT_REQ_ACK, G_TX_DATA, G_CLOSE_ACK = 11, G_TX_DATA_CONT, G_READ_NOTIF,
++       G_RX_DONE_REUSE, G_SIGNALS };
++
++struct gk_ch {
++	char name[33];
++	uint32_t lcid, rcid;
++	bool served, remote_open, open_sent, open_acked, intents_sent, intent_req;
++	struct { uint32_t id, size; bool used; } ri[32];
++	unsigned nri;
++};
++static struct {
++	uint32_t desc, tx, tx_len, rx, rx_len, tx_head, rx_tail, features, next_iid, asm_len, asm_rcid;
++	bool asm_drop;
++	const char *bad;
++	unsigned rx_msgs, tx_msgs, nch;
++	struct gk_ch ch[GK_MAXCH];
++} gk;
++static uint8_t gk_asm[GK_INTENT_SIZE];
++static uint8_t gk_msg[16 + GK_CHUNK];
++#define CH_APR  (&gk.ch[0])
++#define CH_QRTR (&gk.ch[1])
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t h = sm32(gk.desc + 12), t = gk.rx_tail;
++
++	if (h >= gk.rx_len || (h & 7)) {
++		gk.bad = "rx head out of range";
++		return 0;
++	}
++	return h >= t ? h - t : gk.rx_len - t + h;
++}
++
++static void
++rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t pos = (gk.rx_tail + off) % gk.rx_len;
++	uint8_t *d = dst;
++
++	while (n) {
++		uint32_t w = sm32(gk.rx + pos), k = MIN(n, 4u);
++		memcpy(d, &w, k);
++		d += k;
++		n -= k;
++		pos = (pos + 4) % gk.rx_len;
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	gk.rx_tail = (gk.rx_tail + ((n + 7) & ~7u)) % gk.rx_len;
++	sm_w32(gk.desc + 8, gk.rx_tail);
++}
++
++/* glink_smem_tx_write: header and data padded to 8; waits up to 1 s for room */
++static bool
++gk_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t n = (hlen + dlen + 7) & ~7u, head = gk.tx_head;
++
++	if (gk.bad || hlen + dlen > sizeof(gk_msg)) {
++		gk.bad = gk.bad ? gk.bad : "tx message too big";
++		return false;
++	}
++	for (unsigned t = 0;; t += 100) {
++		uint32_t tail = sm32(gk.desc), avail;
++		if (tail >= gk.tx_len || (tail & 7)) {
++			gk.bad = "tx tail out of range";
++			return false;
++		}
++		avail = tail <= head ? gk.tx_len - head + tail : tail - head;
++		if ((avail < 16 ? 0 : avail - 16) >= n) {
++			break;
++		}
++		if (t >= 1000000 || ad_bad) {
++			gk.bad = "tx fifo full for 1 s";
++			return false;
++		}
++		kick(DB_GLINK);
++		delay(100);
++	}
++	bzero(gk_msg, n);
++	memcpy(gk_msg, hdr, hlen);
++	if (dlen) {
++		memcpy(gk_msg + hlen, data, dlen);
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w;
++		memcpy(&w, gk_msg + i, 4);
++		sm_w32(gk.tx + head, w);
++		head = (head + 4) % gk.tx_len;
++	}
++	gk.tx_head = head;
++	sm_w32(gk.desc + 4, head);
++	kick(DB_GLINK);
++	gk.tx_msgs++;
++	return !ad_bad;
++}
++
++static void
++gk_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { cmd | (uint32_t)p1 << 16, p2 };
++
++	(void)gk_tx(m, 8, NULL, 0);
++}
++
++static void
++gk_open(struct gk_ch *c)
++{
++	uint32_t len = (uint32_t)strlen(c->name) + 1, m[2] = { G_OPEN | c->lcid << 16, len };
++
++	(void)gk_tx(m, 8, c->name, len);
++	c->open_sent = true;
++	printf("SWEET ADSP: t=+%u ms glink: OPEN \"%s\" sent (lcid %u)\n", ad_now(), c->name, c->lcid);
++}
++
++static void
++gk_intents(struct gk_ch *c, uint32_t count)
++{
++	uint32_t m[2 + 2 * GK_INTENTS] = { G_INTENT | c->lcid << 16, MIN(count, (uint32_t)GK_INTENTS) };
++
++	for (uint32_t i = 0; i < m[1]; i++) {
++		m[2 + 2 * i] = GK_INTENT_SIZE;
++		m[3 + 2 * i] = gk.next_iid++;
++	}
++	(void)gk_tx(m, 8 + 8 * m[1], NULL, 0);
++}
++
++static bool
++gk_up(const struct gk_ch *c)
++{
++	return c->remote_open && c->open_acked && !gk.bad;
++}
++
++static struct gk_ch *
++gk_by_rcid(uint32_t rcid)
++{
++	for (unsigned i = 0; i < gk.nch; i++) {
++		if (gk.ch[i].remote_open && gk.ch[i].rcid == rcid) {
++			return &gk.ch[i];
++		}
++	}
++	return NULL;
++}
++
++/* __qcom_glink_send into the smallest free intent of the ADSP; false = none yet (retry later) */
++static bool
++gk_send(struct gk_ch *c, const void *p, uint32_t len)
++{
++	unsigned best = c->nri;
++
++	if (!gk_up(c)) {
++		return false;
++	}
++	for (unsigned i = 0; i < c->nri; i++) {
++		if (!c->ri[i].used && c->ri[i].size >= len && (best == c->nri || c->ri[i].size < c->ri[best].size)) {
++			best = i;
++		}
++	}
++	if (best == c->nri) {
++		if (!c->intent_req) {
++			gk_cmd(G_INTENT_REQ, (uint16_t)c->lcid, len);
++			c->intent_req = true;
++		}
++		return false;
++	}
++	c->ri[best].used = true;
++	for (uint32_t off = 0; off < len && !gk.bad;) {
++		uint32_t k = MIN(len - off, GK_CHUNK);
++		uint32_t h[4] = { (off ? G_TX_DATA_CONT : G_TX_DATA) | c->lcid << 16, c->ri[best].id, k, len - off - k };
++		(void)gk_tx(h, 16, (const uint8_t *)p + off, k);
++		off += k;
++	}
++	return true;
++}
++
++static void apr_rx(const uint8_t *p, uint32_t len);
++static void qrtr_rx(const uint8_t *p, uint32_t len);
++
++static bool
++gk_rx_one(void)
++{
++	uint32_t avail = rx_avail(), m[4], n = 8;
++	struct gk_ch *c;
++
++	if (gk.bad || avail < 8) {
++		return false;
++	}
++	rx_peek(0, m, 8);
++	uint16_t cmd = (uint16_t)m[0], p1 = (uint16_t)(m[0] >> 16);
++	uint32_t p2 = m[1];
++
++	switch (cmd) {
++	case G_VERSION:
++		printf("SWEET ADSP: t=+%u ms glink: VERSION %u features %#x\n", ad_now(), p1, p2);
++		if (p1 == 1) {
++			gk.features &= p2;
++		}
++		if (p1 != 0) {
++			gk_cmd(G_VERSION_ACK, 1, gk.features);
++		}
++		break;
++	case G_VERSION_ACK:
++		printf("SWEET ADSP: t=+%u ms glink: VERSION_ACK %u features %#x\n", ad_now(), p1, p2);
++		if (p1 != 0 && !(p1 == 1 && p2 == gk.features)) {
++			gk.features &= (p1 == 1) ? p2 : ~0u;
++			gk_cmd(G_VERSION, 1, gk.features);
++		}
++		break;
++	case G_OPEN: {
++		char name[33];
++		n = 8 + p2;
++		if (p2 == 0 || p2 > 64 || ((n + 7) & ~7u) > gk.rx_len) {
++			gk.bad = "bad OPEN";
++			return false;
++		}
++		if (avail < ((n + 7) & ~7u)) {
++			return false;
++		}
++		bzero(name, sizeof(name));
++		rx_peek(8, name, MIN(p2, 32u));
++		c = NULL;
++		for (unsigned i = 0; i < gk.nch && !c; i++) {
++			c = strcmp(gk.ch[i].name, name) == 0 ? &gk.ch[i] : NULL;
++		}
++		if (!c && gk.nch < GK_MAXCH) {
++			c = &gk.ch[gk.nch++];
++			strlcpy(c->name, name, sizeof(c->name));
++		}
++		printf("SWEET ADSP: t=+%u ms glink: adsp opens \"%s\" (rcid %u)%s\n", ad_now(), name, p1,
++		    c && c->served ? "" : ", not served");
++		if (c) {
++			c->rcid = p1;
++			c->remote_open = true;
++			if (c->served) {
++				gk_cmd(G_OPEN_ACK, p1, 0);
++				if (!c->open_sent) {
++					gk_open(c);
++				}
++			}
++		}
++		break;
++	}
++	case G_OPEN_ACK:
++		for (unsigned i = 0; i < gk.nch; i++) {
++			if (gk.ch[i].served && gk.ch[i].lcid == p1) {
++				gk.ch[i].open_acked = true;
++				printf("SWEET ADSP: t=+%u ms glink: OPEN_ACK \"%s\"\n", ad_now(), gk.ch[i].name);
++			}
++		}
++		break;
++	case G_CLOSE:
++		printf("SWEET ADSP: t=+%u ms glink: adsp closes rcid %u\n", ad_now(), p1);
++		gk_cmd(G_CLOSE_ACK, p1, 0);
++		if ((c = gk_by_rcid(p1)) != NULL) {
++			c->remote_open = false;
++		}
++		break;
++	case G_INTENT:
++		n = 8 + 8 * p2;
++		if (p2 == 0 || p2 > 64) {
++			gk.bad = "bad INTENT";
++			return false;
++		}
++		if (avail < n) {
++			return false;
++		}
++		c = gk_by_rcid(p1);
++		for (uint32_t i = 0; i < p2; i++) {
++			uint32_t pair[2];
++			rx_peek(8 + 8 * i, pair, 8);
++			if (c && c->nri < sizeof(c->ri) / sizeof(c->ri[0])) {
++				c->ri[c->nri].size = pair[0];
++				c->ri[c->nri].id = pair[1];
++				c->ri[c->nri++].used = false;
++			}
++		}
++		if (c) {
++			c->intent_req = false;
++		}
++		break;
++	case G_RX_DONE:
++	case G_RX_DONE_REUSE:
++		if ((c = gk_by_rcid(p1)) != NULL) {
++			for (unsigned i = 0; i < c->nri; i++) {
++				if (c->ri[i].id == p2) {
++					if (cmd == G_RX_DONE_REUSE) {
++						c->ri[i].used = false;
++					} else {
++						c->ri[i] = c->ri[--c->nri];
++					}
++					break;
++				}
++			}
++		}
++		break;
++	case G_INTENT_REQ: {
++		bool ok = (c = gk_by_rcid(p1)) != NULL && c->served && p2 <= GK_INTENT_SIZE;
++		if (ok) {
++			gk_intents(c, 1);
++		}
++		gk_cmd(G_INTENT_REQ_ACK, c ? (uint16_t)c->lcid : 0, ok);
++		break;
++	}
++	case G_INTENT_REQ_ACK:
++		if (p2 == 0 && (c = gk_by_rcid(p1)) != NULL) {
++			c->intent_req = false;          /* refused: ask again on the next send */
++		}
++		break;
++	case G_CLOSE_ACK:
++	case G_SIGNALS:
++		break;
++	case G_READ_NOTIF:
++		rx_advance(8);
++		kick(DB_GLINK);
++		gk.rx_msgs++;
++		return true;
++	case G_TX_DATA:
++	case G_TX_DATA_CONT:
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(0, m, 16);              /* m[2] chunk size, m[3] bytes left after it */
++		n = 16 + m[2];
++		if (m[2] > gk.rx_len || ((n + 7) & ~7u) > gk.rx_len) {
++			gk.bad = "bad TX_DATA chunk";
++			return false;
++		}
++		if (avail < ((n + 7) & ~7u)) {
++			return false;
++		}
++		if (cmd == G_TX_DATA) {
++			gk.asm_len = 0;
++			gk.asm_drop = false;
++			gk.asm_rcid = p1;
++		}
++		if (p1 == gk.asm_rcid && gk.asm_len + m[2] <= sizeof(gk_asm)) {
++			rx_peek(16, gk_asm + gk.asm_len, m[2]);
++			gk.asm_len += m[2];
++		} else {
++			gk.asm_drop = true;     /* ponytail: one reassembly buffer; interleaved chunks drop */
++		}
++		rx_advance(n);
++		gk.rx_msgs++;
++		if (m[3] == 0) {
++			c = gk_by_rcid(p1);
++			if (c == CH_APR && gk_up(c) && !gk.asm_drop) {
++				apr_rx(gk_asm, gk.asm_len);
++			} else if (c == CH_QRTR && gk_up(c) && !gk.asm_drop) {
++				qrtr_rx(gk_asm, gk.asm_len);
++			} else {
++				printf("SWEET ADSP: t=+%u ms glink: dropped %u bytes on rcid %u\n", ad_now(), gk.asm_len, p1);
++			}
++			if (c && c->served) {
++				if (gk.features & 1) {
++					gk_cmd(G_RX_DONE_REUSE, (uint16_t)c->lcid, p2);
++				} else {
++					gk_cmd(G_RX_DONE, (uint16_t)c->lcid, p2);
++					gk_intents(c, 1);
++				}
++			}
++		}
++		return true;
++	default:
++		printf("SWEET ADSP: t=+%u ms glink: unknown command %u (%#x %#x)\n", ad_now(), cmd, p1, p2);
++		gk.bad = "unknown glink command";
++		return false;
++	}
++	rx_advance(n);
++	gk.rx_msgs++;
++	return true;
++}
++
++/* qcom_glink_smem_register: descriptor 478 (32 bytes) and our FIFO 479 (16 KiB) in partition 0/2 */
++static bool
++gk_start(void)
++{
++	uint32_t dsize = 0, tsize = 0;
++	uint32_t desc = sm_find(M_PART, IT_DESC, &dsize), tx;
++	bool dmade = false, tmade = false;
++
++	if (!desc && dsize != ~0u && (desc = sm_alloc(IT_DESC, 32)) != 0) {
++		dsize = 32;
++		dmade = true;
++	}
++	tx = desc ? sm_find(M_PART, IT_TX, &tsize) : 0;
++	if (desc && !tx && tsize != ~0u && (tx = sm_alloc(IT_TX, 0x4000)) != 0) {
++		tsize = 0x4000;
++		tmade = true;
++	}
++	printf("SWEET ADSP: glink: descriptor item 478 +%#x %u bytes (%s), tx fifo item 479 +%#x %u bytes (%s)\n",
++	    desc, dsize, dmade ? "ours" : "the adsp's", tx, tsize, tmade ? "ours" : "the adsp's");
++	if (!desc || dsize != 32 || !tx || (tsize & 7) || tsize < 0x400 || ad_bad) {
++		return false;
++	}
++	sm_ours(desc + 4, desc + 12);           /* tx head, rx tail */
++	sm_ours(tx, tx + tsize);
++	gk.desc = desc;
++	gk.tx = tx;
++	gk.tx_len = tsize;
++	gk.features = 1;                        /* GLINK_FEATURE_INTENT_REUSE */
++	gk.next_iid = 1;
++	strlcpy(CH_APR->name, "apr_audio_svc", sizeof(CH_APR->name));
++	strlcpy(CH_QRTR->name, "IPCRTR", sizeof(CH_QRTR->name));
++	CH_APR->lcid = 1;
++	CH_QRTR->lcid = 2;
++	CH_APR->served = CH_QRTR->served = true;
++	gk.nch = 2;
++	sm_w32(desc + 8, 0);
++	sm_w32(desc + 4, 0);
++	gk_cmd(G_VERSION, 1, gk.features);
++	return !gk.bad && !ad_bad;
++}
++
++/* --- APR (apr.c) to q6core (q6core.c): 20-byte header, APR_DOMAIN_APPS 5 -> APR_DOMAIN_ADSP 4 --- */
++#define APR_SVC_CORE            3u
++#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define AVCS_GET_STATE          0x0001290cu
++#define AVCS_GET_STATE_RSP      0x0001290du
++#define AVCS_GET_VERSIONS       0x00012905u
++#define AVCS_GET_VERSIONS_RSP   0x00012906u
++#define AVCS_GET_FWK            0x0001292cu
++#define AVCS_GET_FWK_RSP        0x0001292du
++#define AD_APR_READY_MS         3000u   /* ADSP_STATE_READY_TIMEOUT_MS */
++
++static struct {
++	uint32_t want;          /* opcode of the command in flight, 0 = none */
++	uint32_t token, state, polls, next, first;
++	bool ready, fwk_unsupported, done;
++} apr;
++
++static void
++apr_cmd(uint32_t opcode)
++{
++	uint16_t h[10] = { (2u << 8) | (5u << 4), 20, APR_SVC_CORE | (5u << 8), 0, APR_SVC_CORE | (4u << 8), 0 };
++	uint32_t tok = ++apr.token;
++
++	memcpy(&h[6], &tok, 4);
++	memcpy(&h[8], &opcode, 4);
++	if (gk_send(CH_APR, h, 20)) {
++		apr.want = opcode;
++	}
++}
++
++static void
++apr_rx(const uint8_t *p, uint32_t len)
++{
++	uint16_t hf, size;
++	uint32_t op, tok, w[8];
++
++	if (len < 20) {
++		printf("SWEET ADSP: apr: runt packet (%u bytes)\n", len);
++		return;
++	}
++	memcpy(&hf, p, 2);
++	memcpy(&size, p + 2, 2);
++	memcpy(&tok, p + 12, 4);
++	memcpy(&op, p + 16, 4);
++	uint32_t hl = ((hf >> 4) & 0xf) * 4u;
++	const uint8_t *pl = p + hl;
++	uint32_t pn = len > hl ? len - hl : 0;
++	bzero(w, sizeof(w));
++	memcpy(w, pl, MIN(pn, (uint32_t)sizeof(w)));
++	printf("SWEET ADSP: t=+%u ms apr: from svc %u domain %u port %u: opcode %#x token %u, %u payload bytes\n",
++	    ad_now(), p[4], p[5], p[6] | p[7] << 8, op, tok, pn);
++	switch (op) {
++	case APR_BASIC_RSP_RESULT:              /* { opcode, status } */
++		printf("SWEET ADSP: apr:   basic result for %#x: status %#x\n", w[0], w[1]);
++		if (w[0] == apr.want) {
++			apr.want = 0;
++		}
++		if (w[0] == AVCS_GET_STATE && w[1]) {
++			apr.ready = true;       /* q6core: get_state unsupported, carry on */
++		} else if (w[0] == AVCS_GET_FWK && w[1]) {
++			apr.fwk_unsupported = true;
++		} else if (w[0] == AVCS_GET_VERSIONS && w[1]) {
++			apr.done = true;
++		}
++		break;
++	case AVCS_GET_STATE_RSP:
++		apr.state = w[0];
++		apr.ready = w[0] == 1;
++		apr.want = 0;
++		printf("SWEET ADSP: apr:   adsp state %u%s\n", w[0], apr.ready ? " (ready)" : "");
++		break;
++	case AVCS_GET_FWK_RSP:                  /* major minor branch subbranch num, {id api branch}... */
++		printf("SWEET ADSP: apr:   avs framework %u.%u.%u.%u, %u services\n", w[0], w[1], w[2], w[3], w[4]);
++		for (uint32_t i = 0; i < w[4] && 20 + 12 * (i + 1) <= pn && i < 32; i++) {
++			uint32_t s[3];
++			memcpy(s, pl + 20 + 12 * i, 12);
++			printf("SWEET ADSP: apr:     service %#x api %u branch %u\n", s[0], s[1], s[2]);
++		}
++		apr.want = 0;
++		apr.done = true;
++		break;
++	case AVCS_GET_VERSIONS_RSP:             /* build_id, num, {id, version}... */
++		printf("SWEET ADSP: apr:   build id %#x, %u services\n", w[0], w[1]);
++		for (uint32_t i = 0; i < w[1] && 8 + 8 * (i + 1) <= pn && i < 32; i++) {
++			uint32_t s[2];
++			memcpy(s, pl + 8 + 8 * i, 8);
++			printf("SWEET ADSP: apr:     service %#x version %#x\n", s[0], s[1]);
++		}
++		apr.want = 0;
++		apr.done = true;
++		break;
++	default:
++		printf("SWEET ADSP: apr:   (unsolicited) %#x %#x %#x %#x\n", w[0], w[1], w[2], w[3]);
++		break;
++	}
++}
++
++/* q6core_is_adsp_ready, then the version queries; one command in flight, resent every 100 ms */
++static void
++apr_poll(unsigned t)
++{
++	if (apr.done || !gk_up(CH_APR) || !CH_APR->intents_sent || t < apr.next) {
++		return;
++	}
++	if (!apr.first) {
++		apr.first = t;
++	}
++	apr.next = t + 100;
++	if (!apr.ready && t - apr.first < AD_APR_READY_MS) {
++		apr.polls++;
++		apr_cmd(AVCS_GET_STATE);
++	} else if (!apr.fwk_unsupported) {
++		apr_cmd(AVCS_GET_FWK);
++	} else {
++		apr_cmd(AVCS_GET_VERSIONS);
++	}
++}
++
++/* --- QRTR on IPCRTR: HELLO, and what the ADSP's name service says; nothing is served yet --- */
++static struct {
++	uint32_t node;
++	bool hello_sent, hello_rx;
++	unsigned nsrv, other, data;
++} qr = { .node = 0xffffffffu };
++
++static void
++qrtr_hello(void)
++{
++	uint32_t h[13] = { 1, 2 /* HELLO */, 1, 0xfffffffeu, 0, 20, qr.node, 0xfffffffeu, 2, 0, 0, 0, 0 };
++
++	if (gk_send(CH_QRTR, h, sizeof(h))) {
++		qr.hello_sent = true;
++		printf("SWEET ADSP: t=+%u ms qrtr: HELLO sent\n", ad_now());
++	}
++}
++
++static void
++qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t h[8], c[5];
++
++	if (len < 32) {
++		return;
++	}
++	memcpy(h, p, 32);
++	if (h[1] == 1) {                        /* DATA to one of our ports: nobody listens yet */
++		uint8_t b[8] = { 0 };
++		memcpy(b, p + 32, MIN(len - 32, 8u));
++		if (qr.data++ < 20) {
++			printf("SWEET ADSP: t=+%u ms qrtr: data %u:%#x -> port %#x, %u bytes: %02x %02x %02x %02x %02x "
++			    "%02x %02x\n", ad_now(), h[2], h[3], h[7], h[5], b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
++		}
++		return;
++	}
++	bzero(c, sizeof(c));
++	memcpy(c, p + 32, MIN(len - 32, 20u));
++	if (h[1] == 2) {
++		qr.node = h[2];
++		qr.hello_rx = true;
++		printf("SWEET ADSP: t=+%u ms qrtr: HELLO from node %u\n", ad_now(), h[2]);
++	} else if (h[1] == 4) {
++		qr.nsrv++;
++		printf("SWEET ADSP: t=+%u ms qrtr: NEW_SERVER service %#x instance %#x node %u port %#x\n", ad_now(),
++		    c[1], c[2], c[3], c[4]);
++	} else if (qr.other++ < 20) {
++		printf("SWEET ADSP: t=+%u ms qrtr: control type %u from %u:%#x (%#x %#x %#x %#x)\n", ad_now(), h[1],
++		    h[2], h[3], c[1], c[2], c[3], c[4]);
++	}
++}
++
++/* --- stage 3: edge, channels, APR hello, then a watch --- */
++static bool
++ad_stage3(void)
++{
++	const char *why = NULL;
++	unsigned t = 0, next = 0, ok_at = 0;
++	uint32_t sk = ~0u, now;
++
++	ad_t0 = mach_absolute_time();
++	if (!gk_start()) {
++		why = "glink smem items";
++	}
++	while (!why && (t = ad_now()) < AD_WATCH3_MS) {
++		if (t >= next) {
++			next = t + 10;
++			if ((now = slave_kernel()) != sk) {
++				printf("SWEET ADSP: t=+%u ms slave-kernel %#x%s\n", t, now, (now & SK_FATAL) ? " FATAL" : "");
++				sk = now;
++			}
++			if (sk == ~0u || (sk & SK_FATAL)) {
++				crash_reason();
++				ad.running = false;     /* crashed: no stop request */
++				why = "adsp fatal";
++				break;
++			}
++			if (!gk.rx) {                   /* glink_smem_rx_avail: the ADSP makes item 480 */
++				uint32_t size = 0, off = sm_find(M_PART, IT_RX, &size);
++				if (off && size != ~0u) {
++					printf("SWEET ADSP: t=+%u ms glink: adsp fifo item 480 +%#x, %u bytes\n", t, off, size);
++					if ((size & 7) || size < 0x400) {
++						why = "item 480 unusable";
++						break;
++					}
++					gk.rx = off;
++					gk.rx_len = size;
++				}
++			}
++		}
++		for (unsigned i = 0; i < 64 && gk.rx && gk_rx_one(); i++) {
++		}
++		for (unsigned i = 0; i < 2; i++) {
++			struct gk_ch *c = &gk.ch[i];
++			if (gk_up(c) && !c->intents_sent) {
++				gk_intents(c, GK_INTENTS);
++				c->intents_sent = true;
++				printf("SWEET ADSP: t=+%u ms glink: \"%s\" open both ways (features %#x), %u intents of %u "
++				    "bytes\n", t, c->name, gk.features, GK_INTENTS, GK_INTENT_SIZE);
++			}
++			if (t >= 2000 && gk.rx && !c->open_sent) {
++				printf("SWEET ADSP: t=+%u ms glink: the adsp has not opened \"%s\": opening it\n", t, c->name);
++				gk_open(c);
++			}
++		}
++		if (gk_up(CH_QRTR) && CH_QRTR->intents_sent && !qr.hello_sent) {
++			qrtr_hello();
++		}
++		apr_poll(t);
++		if (apr.done && !ok_at) {
++			ok_at = t;
++			printf("SWEET ADSP: stage 3: ok: apr_audio_svc up, q6core answered (state %u after %u polls) "
++			    "at +%u ms\n", apr.state, apr.polls, t);
++		}
++		if (gk.bad || ad_bad) {
++			why = gk.bad ? gk.bad : "refused access";
++		} else if (!ok_at && t >= 10000 && !gk_up(CH_APR)) {
++			why = "apr_audio_svc not open both ways within 10 s";
++		} else if (!ok_at && t >= 15000) {
++			why = "q6core did not answer within 15 s";
++		}
++		delay(1000);
++	}
++	char chs[320] = "";
++	for (unsigned i = 0; i < gk.nch; i++) {
++		strlcat(chs, " \"", sizeof(chs));
++		strlcat(chs, gk.ch[i].name, sizeof(chs));
++		strlcat(chs, gk_up(&gk.ch[i]) ? "\" (up)" : gk.ch[i].remote_open ? "\" (adsp opened)" : "\"", sizeof(chs));
++	}
++	printf("SWEET ADSP: glink: summary: rx %u msgs, tx %u, features %#x, %u channels:%s; qrtr node %u hello %s, "
++	    "%u servers%s%s\n", gk.rx_msgs, gk.tx_msgs, gk.features, gk.nch, chs, qr.node, qr.hello_rx ? "yes" : "no",
++	    qr.nsrv, gk.bad ? ", error: " : "", gk.bad ? gk.bad : "");
++	if (!ok_at) {
++		printf("SWEET ADSP: stage 3: FAILED: %s\n", why ? why : "?");
++	} else {
++		printf("SWEET ADSP: watch: %s at +%u ms\n", why ? why : "30 s without a fatal", t);
++	}
++	ad_stop(why ? why : "adsp=3 ends here");
++	return ok_at != 0;
++}
++
++static void
++ad_thread(void *arg, __unused wait_result_t wr)
++{
++	int mode = (int)(uintptr_t)arg, reached = 1;
++
++	ad_t0 = mach_absolute_time();
++	if (ad_stage2()) {
++		reached = 2;
++		if (mode == 2) {
++			ad_stop("adsp=2 ends here");
++		} else if (ad_stage3()) {
++			reached = 3;
++		}
++	}
++	printf("SWEET ADSP: done: adsp=%d, last good stage %d%s\n", mode, reached,
++	    reached == MIN(mode, 3) ? "" : " (stopped early)");
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_adsp_probe(void)
++{
++	static bool once;
++	int mode = 0;
++	char sum[96] = "";
++	thread_t th;
++
++	if (once || !PE_parse_boot_argn("adsp", &mode, sizeof(mode)) || mode <= 0) {
++		return;
++	}
++	once = true;            /* one attempt per boot */
++	ad_mode = mode;
++	printf("SWEET ADSP: read-only probe (adsp=%d)\n", mode);
++	const char *err = ad_probe(sum, sizeof(sum));
++	if (err) {
++		printf("SWEET ADSP: stage 1: FAILED: %s\n", err);
++		return;
++	}
++	printf("SWEET ADSP: stage 1: ok: %s\n", sum);
++	if (mode < 2) {
++		return;
++	}
++	if (kernel_thread_start(ad_thread, (void *)(uintptr_t)mode, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("SWEET ADSP: stage 2: FAILED: no thread\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
