@@ -1,0 +1,65 @@
+enchilada: GPU VA free extents merge with their neighbours (backboardd crash loop)
+
+gpu_va_give() put every freed range in a slot of its own and never merged; the 32 slots were full ~110 s into a GL session and later frees were dropped ("va free table full"), so the client range leaked until Mesa allocations failed ("no room for N bytes in the client range") and backboardd crashed at every start (boot55b at 98 s, boot55c at ~18 min, sooner when opening apps). Frees now merge with the extents just below/above; 512 slots.
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -519,7 +519,7 @@
+  * in 0xc0000000..0xc001ffff came out as L2[0] of L1[2] in gpu_l3_for(), i.e. the PTE of 0x80000000.
+  */
+ #define GPU_VA_BYTES       (0x40000000ull - (GPU_VA_BASE & 0x3fffffffu))
+-#define GPU_VA_EXTENTS     32u
++#define GPU_VA_EXTENTS     512u  /* 0314: was 32; frees merge with their neighbours too */
+ #define GPU_PTE_TABLES     64u                  /* 2 MiB each: 128 MiB mappable through ml_io_map */
+ #define GPU_PTE_TABLES_MAX 511u                 /* L2[1..511] (L2[0] has its own L3): the whole range */
+ 
+@@ -1810,16 +1810,46 @@
+ 	return true;
+ }
+ 
++/*
++ * 0314: a freed range merges with the free extents just below and just above it. Without that
++ * every free took a slot of its own, the 32 slots were full ~110 s into a GL session, and from
++ * then on frees were dropped: the client range leaked until Mesa's allocations failed and
++ * backboardd crashed in a loop (boot55b/boot55c).
++ */
+ static void
+ gpu_va_give(uint64_t off, uint64_t size)
+ {
++	unsigned below = GPU_VA_EXTENTS, above = GPU_VA_EXTENTS, empty = GPU_VA_EXTENTS;
++
+ 	size += 0x1000;                 /* the guard page goes with it */
+ 	for (unsigned i = 0; i < GPU_VA_EXTENTS; i++) {
+ 		if (gpu_va_free[i].size == 0) {
+-			gpu_va_free[i].off = off;
+-			gpu_va_free[i].size = size;
+-			return;
++			if (empty == GPU_VA_EXTENTS) {
++				empty = i;
++			}
++		} else if (gpu_va_free[i].off + gpu_va_free[i].size == off) {
++			below = i;
++		} else if (gpu_va_free[i].off == off + size) {
++			above = i;
++		}
++	}
++	if (below != GPU_VA_EXTENTS) {
++		gpu_va_free[below].size += size;
++		if (above != GPU_VA_EXTENTS) {
++			gpu_va_free[below].size += gpu_va_free[above].size;
++			gpu_va_free[above].size = 0;
+ 		}
++		return;
++	}
++	if (above != GPU_VA_EXTENTS) {
++		gpu_va_free[above].off = off;
++		gpu_va_free[above].size += size;
++		return;
++	}
++	if (empty != GPU_VA_EXTENTS) {
++		gpu_va_free[empty].off = off;
++		gpu_va_free[empty].size = size;
++		return;
+ 	}
+ 	printf("SWEET GPU: va free table full, %#llx (%llu bytes) left unused\n",
+ 	    (unsigned long long)(GPU_VA_BASE + off), (unsigned long long)size);
