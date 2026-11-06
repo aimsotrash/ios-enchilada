@@ -1,0 +1,137 @@
+enchilada: GPU: arena BOs mapped write-combined into the client, no cache maintenance at SUBMIT/WAIT
+
+25 s of opening and closing apps with 0310: SUBMIT still did ~3.2 GB/s of dc civac (~15 MB a submit,
+~5 ms of CPU a frame), because 0310 cleans an arena BO at every SUBMIT once the client has mapped it
+(clientMemoryForType), and Mesa maps its ~12 MB render target and many other BOs once and keeps them.
+Linux msm maps GEM BOs write-combined (MSM_BO_WC) on a GPU that is not IO-coherent, so the CPU's
+stores go to memory and nothing needs maintenance; this does the same.
+
+- clientMemoryForType() names kIOMapWriteCombineCache for arena BOs. 0197's IOUserClient hunk makes
+  a cache mode named there win over the caller's (mapClientMemory64), so this holds whatever the
+  libdrm stand-in passes (it asks 0x401 = kIOMapAnywhere | kIOMapWriteCombineCache anyway). The
+  withPhysicalAddress() descriptor maps through a contiguous device pager; memoryReferenceMap() sets
+  the object's WIMG to VM_WIMG_WCOMB (MAP_MEM_WCOMB), vm_fault enters it with pmap_map_block_addr(...,
+  object->wimg_bits) and the arm64 pmap makes that CACHE_ATTRINDX_WRITECOMB = MAIR 0x44, Normal
+  Inner/Outer Non-cacheable. Device pager pages are fictitious, so the kernel's own aliases keep
+  their attributes. Zero-copy IOSurfaces stay copyback with 0310's seed/age rules (unchanged).
+- SUBMIT no longer cleans a BO because the client mapped it; WAIT_FENCE, CPU_PREP, CPU_FINI, BO_SYNC
+  by pa, the first-mapping invalidate and GEM_CLOSE already skip arena BOs when boCached() is false
+  (the CPU reads them uncached: fence words, query results and readbacks see memory directly).
+- The kernel keeps a cacheable alias of the arena (the static aperture past the first 1 MiB window,
+  0194). GEM_NEW now cleans+invalidates the BO once before the handle is given out (was: at its first
+  SUBMIT, i.e. after the client's WC stores, which a dirty aperture line would have overwritten), and
+  a command range is cleaned+invalidated before its relocations are stored through the aperture, so
+  no stale line is merged and written back over the client's commands (after: as before, 0197).
+- The 10 s line says how much of "left alone" was mapped by the client: "(0310; N MB of it
+  write-combined, 0316)".
+
+Boot-arg sweetgpuwc=0: copyback client mappings and 0310's maintenance, as before (sweetbocache=0/1
+still overrides). sweetgpuflush=1 implies sweetgpuwc=0: copyback and everything at every SUBMIT,
+wait, flip and lock. Costs: CPU reads of arena BOs through the mapping are uncached again (0197
+measured ~50 MB/s), which only the fallback paths read in bulk (eagl glReadPixels with glzc=0,
+glblit=0, glshow, traces).
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -96,6 +96,13 @@
+  * BO_SYNC invalidate what the GPU may have written before the CPU reads, CPU_FINI cleans, and
+  * GEM_CLOSE cleans+invalidates before the pages go back to the arena. sweetbocache=0: the client's
+  * own cache mode again (write-combined: reads at ~50 MB/s), as before 0197.
++ *
++ * 0316: arena BOs are mapped write-combined again (as Linux msm's MSM_BO_WC), named by the driver so
++ * it holds whatever the client asks: SUBMIT and WAIT_FENCE no longer touch the cache for them (0310
++ * still cleaned Mesa's mapped 12 MB render target at every SUBMIT: ~15 MB, ~5 ms of CPU a frame).
++ * The kernel's cacheable aperture alias is cleaned once at GEM_NEW, before the client or the GPU
++ * sees the BO, and a command range is invalidated before its relocations are stored through it.
++ * Boot-arg sweetgpuwc=0: copyback and 0310's maintenance; sweetgpuflush=1 implies it.
+  */
+ static int gBoCache = -1;
+ 
+@@ -103,13 +110,15 @@
+ boCached(void)
+ {
+ 	if (gBoCache < 0) {
+-		uint32_t on = 1;
++		uint32_t wc = 1, on;
++		(void)PE_parse_boot_argn("sweetgpuwc", &wc, sizeof(wc));
++		on = wc == 0;
+ 		(void)PE_parse_boot_argn("sweetbocache", &on, sizeof(on));
+ 		gBoCache = on != 0;
+-		IOLog("SWEET GPU: BO CPU mappings %s (sweetbocache=%u)\n",
+-		    gBoCache ? "cacheable, kernel-maintained" : "as the client asks (write-combined)", on);
++		IOLog("SWEET GPU: BO CPU mappings %s (sweetgpuwc=%u, sweetbocache=%u; 0316)\n",
++		    gBoCache ? "cacheable, kernel-maintained" : "write-combined", wc, on);
+ 	}
+-	return gBoCache != 0;
++	return gBoCache != 0 || sweet_gpu_flush_all();
+ }
+ 
+ /*
+@@ -117,7 +126,7 @@
+  * ("SWEET GPU: last N ms: ..."). Updated with gAdrenoLock held.
+  */
+ static struct {
+-	uint64_t since, flushAbs, flushBytes, skipBytes, waitAbs, waitMax;
++	uint64_t since, flushAbs, flushBytes, skipBytes, wcBytes, waitAbs, waitMax;
+ 	uint32_t submits, waits;
+ } gStat;
+ 
+@@ -328,9 +337,9 @@
+ 	absolutetime_to_nanoseconds(gStat.flushAbs, &fus);
+ 	absolutetime_to_nanoseconds(gStat.waits ? gStat.waitAbs / gStat.waits : 0, &wus);
+ 	absolutetime_to_nanoseconds(gStat.waitMax, &wmax);
+-	IOLog("SWEET GPU: last %llu ms: %u submits; cache maintenance %llu MB in %llu us, %llu MB left alone (0310); "
+-	    "%u fence waits, avg %llu us, max %llu us\n", ms / NSEC_PER_MSEC, gStat.submits, gStat.flushBytes >> 20,
+-	    fus / 1000, gStat.skipBytes >> 20, gStat.waits, wus / 1000, wmax / 1000);
++	IOLog("SWEET GPU: last %llu ms: %u submits; cache maintenance %llu MB in %llu us, %llu MB left alone (0310; %llu MB "
++	    "of it write-combined, 0316); %u fence waits, avg %llu us, max %llu us\n", ms / NSEC_PER_MSEC, gStat.submits,
++	    gStat.flushBytes >> 20, fus / 1000, gStat.skipBytes >> 20, gStat.wcBytes >> 20, gStat.waits, wus / 1000, wmax / 1000);
+ 	bzero(&gStat, sizeof(gStat));
+ 	gStat.since = now;
+ }
+@@ -735,6 +744,11 @@
+ 					bzero(g, sizeof(*g));
+ 				} else {
+ 					fNextGem = i + 1;
++					if (!boCached()) {
++						/* 0316: no line of the cacheable aperture may later land over WC or GPU writes */
++						boFlush(pa, size);
++						g->cleaned = true;
++					}
+ 				}
+ 				break;
+ 			}
+@@ -954,11 +968,12 @@
+ 		uint64_t now = mach_absolute_time();
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 			struct sweet_gem *g = objs[i];
+-			if (g->pa != 0 && (g->cpuMapped || !g->cleaned || sweet_gpu_flush_all())) {
++			if (g->pa != 0 && ((g->cpuMapped && boCached()) || !g->cleaned || sweet_gpu_flush_all())) {
+ 				boFlush(g->pa, g->size);        /* 0310: only what the client can have written */
+ 				g->cleaned = true;
+ 			} else if (g->pa != 0) {
+ 				gStat.skipBytes += g->size;
++				gStat.wcBytes += g->cpuMapped ? g->size : 0;    /* 0316: its stores went to memory */
+ 			}
+ 			if (g->zc && surfNeedsClean(g, now)) {
+ 				surfFlush(g->surface);          /* 0220: by its kernel address (no pa) */
+@@ -973,6 +988,10 @@
+ 		for (uint32_t i = 0; i < r->nr_cmds; i++) {
+ 			struct sweet_msm_gem_submit_cmd *c = &cmds[i];
+ 			struct sweet_gem *cb = objs[c->submit_idx];
++			if (c->nr_relocs != 0 && cb->pa != 0 && !boCached()) {
++				/* 0316: a stale aperture line (the client's WC stores bypass it) would be merged and written back */
++				boFlush(cb->pa + c->submit_offset, c->size);
++			}
+ 			for (uint32_t k = 0; k < c->nr_relocs; k++) {
+ 				struct sweet_msm_gem_submit_reloc *rl = &relocs[at + k];
+ 				uint64_t v = objs[rl->reloc_idx]->iova + rl->reloc_offset;
+@@ -1306,7 +1325,7 @@
+ 		 * zero-copy surface too; left to the client's write-combined request, the mapping would re-type
+ 		 * the surface's VM object (memoryReferenceMap), every other mapping of it with it.
+ 		 */
+-		*options = (g->pa != 0 && boCached()) || g->zc ? kIOMapCopybackCache : 0;
++		*options = (g->pa != 0 && boCached()) || g->zc ? kIOMapCopybackCache : g->pa != 0 ? kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 		if (!g->cpuMapped) {
+ 			/* 0310: unmapped BOs skipped the invalidate after waits: drop stale lines before the client reads */
