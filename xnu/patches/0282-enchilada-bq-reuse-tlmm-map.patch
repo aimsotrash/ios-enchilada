@@ -1,0 +1,19 @@
+enchilada: battery gauge reuses touch's TLMM mapping (io_submap exhaustion panic)
+
+0277 mapped TLMM NORTH (512 KiB) a second time for gpio55/56; with the other device maps io_submap (8 MiB) was full and kmem_alloc(524288) panicked at vm_kern.c:178 about 30 s after boot (boot45). bq.gpio now reuses st.gpio, which touch maps on this board, and only maps its own if touch has not.
+
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1063,7 +1063,11 @@
+ bq_open(void)
+ {
+ 	bq.gcc = ml_io_map(FJ_GCC_PA, 0x60000);
+-	bq.gpio = ml_io_map(FJ_TLMM_NORTH, 0x80000);
++	/*
++	 * 0282: reuse touch's TLMM NORTH mapping (st.gpio, fajita/enchilada path): a second 512 KiB
++	 * ml_io_map exhausted io_submap (8 MiB) -> kmem_alloc(524288) panic. Map only if touch has not.
++	 */
++	bq.gpio = st.gpio ? st.gpio : ml_io_map(FJ_TLMM_NORTH, 0x80000);
+ 	bq.se = ml_io_map(BQ_SE_PA, 0x4000);
+ 	if (!bq.gcc || !bq.gpio || !bq.se) {
+ 		printf("SWEET BATT SE10: MMIO mapping failed\n");

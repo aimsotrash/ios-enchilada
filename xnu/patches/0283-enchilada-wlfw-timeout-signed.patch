@@ -1,0 +1,16 @@
+enchilada: WLFW request timeout compares signed elapsed time
+
+wlfw_poll() gets the time t read at the top of the watch pass; a request sent later in the same pass has sent_at > t, so the unsigned t - sent_at wrapped and the request 'timed out' at once (boot45: ind_register 'no response in 10000 ms' 0 ms after sending, then the reply arrived as unexpected). Signed difference.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -3240,7 +3240,8 @@
+ static bool
+ wlfw_poll(unsigned t, bool end)
+ {
+-	if (wl.on && wl.pending && t - wl.sent_at > WLFW_TIMEOUT_MS) {
++	/* 0283: t is read before a request sent in the same pass: signed, or t - sent_at wraps to "timed out" */
++	if (wl.on && wl.pending && (int)(t - wl.sent_at) > (int)WLFW_TIMEOUT_MS) {
+ 		printf("SWEET WLFW: no response to %#x (%s) in %u ms\n", wl.pending, wl.step, WLFW_TIMEOUT_MS);
+ 		wl.pending = 0;
+ 		if (!wl.off_sent) {
