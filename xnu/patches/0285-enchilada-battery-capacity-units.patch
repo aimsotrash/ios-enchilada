@@ -1,0 +1,28 @@
+enchilada: battery gauge capacities in 2 mAh units on this pack
+
+boot48: the gauge (bq27411 map) read FCC 1612 / RM 1609 mAh against DesignCapacity 3240 (Android: FCC ~3057), so Battery Health would show ~50 %. When FCC is 35-57 % of the design capacity, FCC and RM are doubled (logged once).
+
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -540,8 +540,19 @@
+ 	fBqMa = (int16_t)ai;
+ 	fBqDeciC = (int)t - 2731;
+ 	fBqSoc = soc < 1 ? 1 : soc; /* 0 % could make powerd shut down on a glitch */
+-	fFcc = fcc;
+-	fRm = rm > fcc ? fcc : rm;
++	/*
++	 * 0285: this OnePlus pack's gauge reads capacities in 2 mAh units (boot48: FCC 1612, RM 1609 against
++	 * DesignCapacity 3240; Android showed FCC ~3057). When FCC is 35-57 % of the design capacity, scale FCC
++	 * and RM by 2. ponytail: heuristic; a pack really worn to ~50 % would read as healthy.
++	 */
++	uint32_t scale = (fDesign >= 1000 && 2u * fcc >= fDesign * 7u / 10u && 2u * fcc <= fDesign * 23u / 20u) ? 2u : 1u;
++	static bool told;
++	if (scale == 2 && !told) {
++		told = true;
++		IOLog("SWEET BATT: gauge capacities in 2 mAh units (FCC %u x2 against design %u mAh)\n", fcc, (unsigned)fDesign);
++	}
++	fFcc = fcc * scale;
++	fRm = (rm > fcc ? fcc : rm) * scale;
+ 	fCycles = cyc;
+ 	fBqFlags = flags;
+ 	return 0;

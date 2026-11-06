@@ -1,0 +1,24 @@
+enchilada: WCN3990 bring-up drops the controller's no-op Command Complete
+
+After the switch to 3.2 Mbaud the chip announced itself with a Command Complete for opcode 0x0000 (04 0e 04 01 00 00), which stage 3 took as an unexpected event and stopped (boot48). Linux's HCI core ignores opcode-0 completions; bq_take_event now drops them for every stage.
+
+--- a/bsd/dev/sweet_btq.c
++++ b/bsd/dev/sweet_btq.c
+@@ -599,6 +599,17 @@
+ 	uint32_t n;
+ 
+ 	while ((n = bq_take_packet(pkt)) > 0) {
++		/*
++		 * 0284: a Command Complete for opcode 0x0000 (04 0e 04 nn 00 00 ..) is the controller's
++		 * "ready, nn commands allowed" no-op, e.g. after the 3.2 Mbaud switch; Linux's HCI core drops it.
++		 */
++		if (pkt[0] == 0x04 && n >= 6 && pkt[1] == 0x0e && pkt[4] == 0 && pkt[5] == 0) {
++			static unsigned told;
++			if (told++ < 4) {
++				printf("SWEET BTQ: no-op Command Complete (ready, %u commands) dropped\n", pkt[3]);
++			}
++			continue;
++		}
+ 		if (pkt[0] == 0x04) {
+ 			memcpy(ev, pkt + 1, n - 1);
+ 			return n - 1;
