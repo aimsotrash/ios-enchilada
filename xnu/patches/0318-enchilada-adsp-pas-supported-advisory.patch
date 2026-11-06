@@ -1,0 +1,24 @@
+enchilada: ADSP: PAS is_supported only logged (boot58: result 0, stage 2 stopped)
+
+boot58 (0317) got through stage 1; stage 2 stopped at SCM PIL_PAS_IS_SUPPORTED(1): status 0, result 0. The call is encoded as Linux does it (0x42000207, arginfo 1, result from x1) and mainline's q6v5_pas boots this ADSP without that check, so the answer is logged and INIT_IMAGE decides (its error stops stage 2 cleanly).
+
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -708,9 +708,14 @@
+ 		int st = mss_scm(SCM_FN(0x06, 0x01), 1, 0x02000000u | (0x02 << 8) | cmds[i], 0, 0, 0, &avail, &resumes);
+ 		why = st == 0 && avail ? NULL : "scm pas call not available";
+ 	}
+-	if (!why && pas("is_supported", 0x07, 1, 0, 0) != 1) {
+-		why = "pas id 1 not supported";
+-	} else if (!why && sm_find(M_PART, IT_IN, &isz) != 0) {
++	/*
++	 * 0318: is_supported is only logged. boot58: status 0 result 0 for PAS 1 on this TZ, although
++	 * mainline's q6v5_pas (no such check) boots the ADSP on this phone; INIT_IMAGE answers for real.
++	 */
++	if (!why) {
++		(void)pas("is_supported", 0x07, 1, 0, 0);
++	}
++	if (!why && sm_find(M_PART, IT_IN, &isz) != 0) {
+ 		why = "item 443 exists: the adsp is not cold";
+ 	} else if (!why && (!load(FW_MDT, 0, ad_mdt, sizeof(ad_mdt)) || (why = check_mdt()) != NULL)) {
+ 		why = why ? why : "adsp.mdt";
