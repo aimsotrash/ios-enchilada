@@ -1,0 +1,79 @@
+sweet: BT proxy: claim Write_Default_Erroneous_Data_Reporting, answer chip-unknown commands locally, drop QCA log ACL
+
+boot51 (btfake=1 btreal=4, real WCN3990 behind the 0279 proxy): bluetoothd sends 21 commands to the
+chip and exits 1 every ~9 s. Unified log (Persist/...4a/4b), every run:
+  command supported mask is: FF FF FF 03 CE FF EF FF FF FF FF 7F F2 0F E8 FE 3F F7 83 FF 1C 00 ...
+  ... _SetDefaultPhyCB status OI_OK / LE_SetPeriodicAdvListSize
+  OI_HCICMD_WriteDefaultErroneousDataReporting
+  HCI initialization failed
+  Bluetooth error - restarting { build=release, reason=108, context="HCI initialization failed" }
+108 = OI_STATUS_INITIALIZATION_FAILED. The chip's Read_Local_Supported_Commands has octet 18 = 0x83:
+bit 3, Write_Default_Erroneous_Data_Reporting (0x0c5b), is clear, and bluetoothd's init gives up there
+instead of sending it (in the all-0xff fake runs 0x0c5b is the command after 0x0c31, where boot51's
+sessions stop). Also seen: "OI_HCIIfc_DataReceived, HCI not initialized - discarding ACL packet"
+for the chip's ACL on handle 0x2edc (Qualcomm firmware log), 2-3 per run.
+
+- the chip's Read_Local_Supported_Commands reply gets octet 18 bit 3 set before it reaches bluetoothd
+- a Command Complete from the chip with status 0x01 (Unknown HCI Command) for a non-vendor opcode is
+  replaced by the fake controller's own answer to that opcode (status 0, canned or none), logged once
+  per opcode ("chip: unknown command 0x%04x, answered locally"); this answers 0x0c5b
+- ACL packets on handle 0x2edc from the chip are dropped and counted (shown when the owner goes away)
+
+--- a/bsd/dev/sweet_bt.c	2026-11-05 20:54:47.526110306 -0800
++++ b/bsd/dev/sweet_bt.c	2026-11-05 20:55:11.713605440 -0800
+@@ -109,6 +109,8 @@
+ static uint8_t bt_addr[6];      /* /arm-io/bluetooth local-mac-address, first octet printed first */
+ static struct bt_unit *bt_owner;        /* 0279: the unit the real controller talks to */
+ static uint32_t bt_chip_drop, bt_qca_events;
++static uint32_t bt_qca_acl, bt_unknown_logged;  /* 0287 */
++static uint16_t bt_unknown_op;
+ 
+ extern bool sweet_btq_proxy_ready(void);
+ extern int sweet_btq_send(const uint8_t *p, uint32_t n);
+@@ -287,7 +289,36 @@
+ 		}
+ 	} else if (bt_owner == NULL) {
+ 		bt_chip_drop++;
++	} else if (p[0] == 0x02 && n >= 3 && ((p[1] | p[2] << 8) & 0x0fff) == 0x0edc) {
++		/* Qualcomm firmware log over ACL handle 0x2edc: no connection of bluetoothd's */
++		bt_qca_acl++;
++	} else if (p[0] == 0x04 && n >= 7 && p[1] == 0x0e && p[6] == 0x01 && ((p[4] | p[5] << 8) >> 10) != 0x3f) {
++		/*
++		 * The chip does not know a command bluetoothd sent (Unknown HCI Command): answer
++		 * it the way the fake controller would, so a Broadcom-only step does not end HCI
++		 * init. Logged once per opcode.
++		 */
++		uint16_t op = (uint16_t)(p[4] | p[5] << 8);
++		if (bt_unknown_logged < 16 && bt_unknown_op != op) {
++			bt_unknown_logged++;
++			bt_unknown_op = op;
++			printf("SWEET BT: chip: unknown command 0x%04x, answered locally\n", op);
++		}
++		bt_command(bt_owner, op, NULL, 0);
+ 	} else {
++		uint8_t q[7 + 64];
++		/*
++		 * Read_Local_Supported_Commands: also claim Write_Default_Erroneous_Data_Reporting
++		 * (octet 18 bit 3). bluetoothd's HCI init requires it (OI_HCICMD_
++		 * WriteDefaultErroneousDataReporting -> "HCI initialization failed", reason 108) and
++		 * the WCN3990 lacks it; the command itself is then answered locally (above).
++		 */
++		if (p[0] == 0x04 && n >= 7 + 64 && n <= sizeof(q) && p[1] == 0x0e && p[4] == 0x02 &&
++		    p[5] == 0x10 && p[6] == 0x00) {
++			memcpy(q, p, n);
++			q[7 + 18] |= 0x08;
++			p = q;
++		}
+ 		bt_owner->relay = true;
+ 		bt_tx(bt_owner, (uint8_t *)(uintptr_t)p, n);
+ 		bt_owner->relay = false;
+@@ -411,7 +442,8 @@
+ 	    unit, u->who, u->rx, u->tx, u->wram, u->quiet, u->proxy ? " [real controller]" : "");
+ 	if (bt_owner == u) {
+ 		bt_owner = NULL;
+-		printf("SWEET BT: real controller unowned (%u Qualcomm vendor events dropped so far)\n", bt_qca_events);
++		printf("SWEET BT: real controller unowned (%u Qualcomm vendor events, %u firmware-log ACL packets dropped so far)\n",
++		    bt_qca_events, bt_qca_acl);
+ 	}
+ 	if (u->quiet > 0 && dumps < BT_TAIL_DUMPS) {
+ 		dumps++;
