@@ -1,0 +1,14 @@
+enchilada: SweetWLAN.cpp includes IOPlatformExpert.h
+
+IOService::getPlatform() returns IOPlatformExpert *, which IOService.h only forward-declares: the ternary and the comparison with IOService * did not compile (0279a).
+
+--- a/iokit/Kernel/arm/SweetWLAN.cpp
++++ b/iokit/Kernel/arm/SweetWLAN.cpp
+@@ -24,6 +24,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>   /* IOService::getPlatform() returns IOPlatformExpert * */
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSNumber.h>
+ 

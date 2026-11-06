@@ -1,0 +1,1690 @@
+enchilada: MSS stage 10 (mss=10): join open/WPA2-PSK networks for wifid, in-kernel 4-way handshake, en0 data path (Wi-Fi round 7)
+
+mss=10 = mss=9 plus joining when wifid sends APPLE80211 ASSOCIATE (592 bytes, HakiOS layout:
+the passphrase as typed becomes the PMK here by PBKDF2-SHA1, or the 32-byte PMK as given; neither
+is ever logged). The station follows ath10k + mac80211 on WCN3990 TLV firmware, ported from
+topaz 0129/0130 and checked against Linux v6.12 mac.c, wmi-tlv.c, htt_tx.c and htt_rx.c: the
+AP is taken from the scan table (strongest with that SSID, or the BSSID asked for); its RSN
+element must offer CCMP pairwise and PSK AKM without MFP required (else refused); SCAN_CHAN_LIST
+with its channel active (the beacon hint), STA powersave off, VDEV_START -> VDEV_START_RESP,
+PEER_CREATE, open-system AUTH and ASSOC_REQ (SSID, rates, our RSN element) as host MLME frames
+through WMI MGMT_TX_SEND with retries, PEER_ASSOC (legacy rates) and VDEV_UP; then the WPA2 4-way
+handshake in this kernel (EAPOL-Key v2, PTK by PRF-SHA1, MIC/ANonce/replay checks, GTK KDE by RFC
+3394 unwrap; message 4 in the clear and completed before VDEV_INSTALL_KEY pairwise CCMP + group
+and PEER_SET_PARAM AUTHORIZE), group rekeys while joined, and teardown (VDEV_DOWN, PEER_DELETE,
+VDEV_STOP) on failure, deauth, kickout or DISASSOCIATE. Crypto is libkern's SHA-1 and AES (BearSSL
+in this kernel), checked once against the 802.11i and RFC 3394 vectors. en0's Ethernet frames go
+out as native-wifi to-DS frames through HTT TX_FRM (the 0267 fragment bank, 50-byte prefetch, HTC
+bypassed as ath10k_htt_tx_64 does, slots freed by TX_COMPL_IND); RX_IN_ORD MSDUs with a clean
+rx_attention become Ethernet frames for ifnet_input (our own echoed multicast dropped). wifid
+gets ASSOCIATE_RESULT (1 / 21 wrong key / 9 timeout / 2), APPLE80211_M_ASSOC_DONE, then
+SSID/BSSID/LINK_CHANGED; configd gets KEV_DL_LINK_ON and IFM_ACTIVE; SSID, BSSID, CHANNEL, RSSI,
+CURRENT_NETWORK, AUTH_TYPE and STATE (2 joining, 4 joined) are answered (HakiOS
+hakios.apple80211.c / hakios.net.c, APSL 2.0). No periodic scans while joining or joined. DHCP
+packets are noted in the log (first 8). mss<=9 behave as before (ASSOCIATE stays EOPNOTSUPP).
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -44,6 +44,8 @@
+  *   8  + the WLFW QMI client (ath10k qmi.c) up to WLAN mission mode, MSA regions via SCM
+  * 0267:
+  *   9  + apps-SMMU route for the WLAN, copy engines, HTC, WMI, HTT and passive scans (no TX)
++ * 0281:
++ *  10  + joining open / WPA2-PSK networks for wifid (in-kernel 4-way handshake) and en0's data path
+  * 0268:
+  *   9  + en0 and its IOKit entries (sweet_wlan.c, SweetWLAN.cpp) so wifid can list what the scans
+  *        heard (SCAN_REQ/SCAN_RESULT); the watch stays open while the WLAN path is alive
+@@ -60,6 +62,10 @@
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
++#include <sys/errno.h>
++#include <sys/random.h>
++#include <libkern/crypto/sha1.h>
++#include <libkern/crypto/aes.h>
+ #include "sweet_wlan.h"
+ 
+ /* osfmk/arm/machine_routines.h (MACH_KERNEL_PRIVATE): unmappable = from kernel_map, freeable */
+@@ -3357,6 +3363,7 @@
+ 	volatile uint32_t *hidx;
+ 	uint8_t *hbuf;
+ 	uint64_t hring_pa, hidx_pa, hbank_pa, hbuf_pa;
++	uint8_t *hbank;                         /* 0281: the fragment bank, for HTT TX_FRM */
+ 	uint32_t halloc, hmsdus;
+ 	/* scan */
+ 	bool scanning;
+@@ -3371,6 +3378,14 @@
+ 
+ static LCK_GRP_DECLARE(wn_grp, "sweet_wlan_bss");
+ static LCK_MTX_DECLARE(wn_bss_lock, &wn_grp);
++/* 0281: the station (below wn_poll) */
++static void ws_poll(unsigned t);
++static void ws_tx_compl(const uint8_t *p, uint32_t len);
++static void ws_rx_msdu(const uint8_t *buf, uint32_t mlen, bool offload, unsigned t);
++static void ws_mgmt_rx(const uint8_t *f, uint32_t len, unsigned t);
++static void ws_wmi_event(uint32_t id, const uint8_t *p, uint32_t len, unsigned t);
++static bool ws_busy(void);
++static void ws_summary(void);
+ 
+ static void
+ wn_fail(const char *why)
+@@ -3818,6 +3833,7 @@
+ 	uint8_t *r = wn_carve(WN_HTT_RING * 8 + 64, &wn.hring_pa);
+ 	uint8_t *b = r ? wn_carve(WN_MSDU_DESC * WN_EXT_DESC, &wn.hbank_pa) : NULL;
+ 
++	wn.hbank = b;
+ 	wn.hbuf = b ? wn_carve(WN_HTT_RING * WN_HTT_BUF, &wn.hbuf_pa) : NULL;
+ 	if (!wn.hbuf) {
+ 		wn_fail("htt memory");
+@@ -3892,16 +3908,21 @@
+ 		if (wn.htt_state == 1) {
+ 			wn_htt_configure(t);
+ 		}
++	} else if (len >= 4 && p[0] == 0x07) {  /* 0281: TX_COMPL_IND */
++		ws_tx_compl(p, len);
+ 	} else if (len >= 8 && p[0] == 0x12 && wn.htt_state == 2) {   /* RX_IN_ORD_PADDR_IND */
+ 		uint16_t n;
+ 		memcpy(&n, p + 6, 2);
+ 		for (uint32_t i = 0; i < n && 8 + 12 * (i + 1) <= len; i++) {
+ 			uint64_t pa;
++			uint16_t mlen;
+ 			memcpy(&pa, p + 8 + 12 * i, 8);
++			memcpy(&mlen, p + 8 + 12 * i + 8, 2);
+ 			if (pa >= wn.hbuf_pa && pa < wn.hbuf_pa + (uint64_t)WN_HTT_RING * WN_HTT_BUF &&
+ 			    (pa - wn.hbuf_pa) % WN_HTT_BUF == 0) {
+ 				wn.hmsdus++;
+-				wn_htt_post(pa);        /* recycled: data frames are for later */
++				ws_rx_msdu(wn.hbuf + (pa - wn.hbuf_pa), mlen, (p[1] & 0x20) != 0, t);   /* 0281 */
++				wn_htt_post(pa);        /* the same buffer again */
+ 			}
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -4018,6 +4039,10 @@
+ 		}
+ 		o += 4u + l;
+ 	}
++	if (hdr && f && MIN(h[4], flen) >= 24 && !(f[0] & 0x0c) && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
++		ws_mgmt_rx(f, MIN(h[4], flen), t);      /* 0281: auth, assoc response, deauth, disassoc */
++		return;
++	}
+ 	if (!hdr || !f || (flen = MIN(h[4], flen)) < 36 || (f[0] & 0x0c) || ((f[0] >> 4) != 8 && (f[0] >> 4) != 5)) {
+ 		return;                         /* beacons and probe responses only */
+ 	}
+@@ -4123,6 +4148,8 @@
+ 		}
+ 	} else if (id == 0x7001) {              /* MGMT_RX */
+ 		wn_mgmt_rx(d + 4, len - 4, t);
++	} else if (id == 0x5001 || id == 0x6001) {      /* 0281: VDEV_START_RESP, PEER_STA_KICKOUT */
++		ws_wmi_event(id, d + 4, len - 4, t);
+ 	}
+ }
+ 
+@@ -4273,6 +4300,9 @@
+ 	}
+ 	wn_ce_poll(t);
+ 	wn_wmi_pump();
++	if (wn.htt_state == 2) {
++		ws_poll(t);                     /* 0281: joins and en0's frames */
++	}
+ 	if (wn.asked && wn.scans > 0) {         /* 0268: results are there (0267 scans every 15 s) */
+ 		wn.asked = false;
+ 		sweet_wlan_scan_done();
+@@ -4280,14 +4310,1169 @@
+ 	if (wn.htt_state == 1 && t > wn.deadline) {
+ 		printf("SWEET WLAN: htt: no VERSION_CONF in %u ms, configuring anyway (topaz 0125)\n", WN_STEP_MS);
+ 		wn_htt_configure(t);
+-	} else if (!wn.scanning && wn.next_scan && t >= wn.next_scan) {
+-		wn.next_scan = 0;
++	} else if (!wn.scanning && wn.next_scan && t >= wn.next_scan && !ws_busy()) {
++		wn.next_scan = 0;               /* 0281: no scans off the channel while joining or joined */
+ 		wn_scan_req(t);
+ 	} else if (t > wn.deadline) {
+ 		wn_fail("timeout");
+ 	}
+ }
+ 
++/* ======================================================================================== */
++/*
++ * 0281: stage 10 (mss=10): joining an open or WPA2-PSK (CCMP, AKM 00-0F-AC:2) network when wifid
++ * asks (sweet_wlan.c, APPLE80211 ASSOCIATE), and the en0 data path. As ath10k + mac80211 do it on
++ * WCN3990 TLV firmware (mac.c, wmi-tlv.c, htt_tx.c, htt_rx.c), ported from topaz 0129/0130:
++ *   SCAN_CHAN_LIST again with the AP's channel active (mac80211's beacon hint), STA_POWERSAVE off,
++ *   VDEV_START on the AP's channel -> VDEV_START_RESP, PEER_CREATE, open-system AUTH and
++ *   ASSOC_REQ as host MLME frames through WMI MGMT_TX_SEND (WMI_TLV_SERVICE_MGMT_TX_WMI),
++ *   PEER_ASSOC (legacy rates) + VDEV_UP; then the WPA2 4-way handshake in this kernel (EAPOL-Key
++ *   descriptor version 2: HMAC-SHA1-128 MIC, AES key wrap; PTK from PRF-SHA1; checks of the MIC,
++ *   the ANonce and the replay counter), message 4 sent in the clear and completed before
++ *   VDEV_INSTALL_KEY (pairwise CCMP, then the GTK) and PEER_SET_PARAM AUTHORIZE; group-key
++ *   rekeys (1/2 -> 2/2) while joined. Refused (fail closed): WPA1/TKIP-only, SAE/802.1X-only
++ *   and management-frame-protection-required networks.
++ *   Data: en0's Ethernet frames go out as native-wifi to-DS frames through HTT TX_FRM (64-bit
++ *   descriptors, the fragment bank 0267 configured, 50-byte prefetch, HTC bypassed as
++ *   ath10k_htt_tx_64 does); received MSDUs (RX_IN_ORD_PADDR_IND, rx_attention checked) become
++ *   Ethernet frames for ifnet_input. Frames sent with our own source address are dropped.
++ * Crypto: libkern's SHA-1 (BearSSL in this kernel, 0020/0023) and AES-128 decryption, with HMAC,
++ * PBKDF2, the 802.11 PRF and the RFC 3394 unwrap built on them; checked against the 802.11i and
++ * RFC 3394 test vectors before the first join. Neither passphrases nor keys are ever logged.
++ */
++#define WS_TX_SLOTS             64u
++#define WS_SLOT                 2048u
++#define WS_QLEN                 32u
++enum { WS_IDLE, WS_START, WS_AUTH, WS_ASSOC, WS_4WAY, WS_KEYS, WS_UP };
++static const char *const ws_names[] = { "idle", "vdev start", "auth", "assoc", "4-way", "keys", "joined" };
++
++static struct {
++	volatile int state;
++	bool open, start_resp, keyed;
++	int32_t start_status;
++	uint8_t ssid[32], ssid_len, bssid[6], pmk[32];
++	uint32_t freq, aid, tries, deadline, desc, msg1s, msg4_slot, join_ms;
++	uint8_t rsn_ie[22], group_cipher;
++	uint8_t assoc_req[512];
++	uint32_t assoc_req_len;
++	uint8_t ptk[48], anonce[32], snonce[32];
++	uint64_t replay;
++	uint8_t gtk[32], gtk_len, gtk_idx;
++	struct sweet_wlan_bss ap;               /* the network joined (wifid's queries) */
++	uint8_t *mgmt, *txp;
++	uint64_t mgmt_pa, txp_pa, busy;
++	unsigned sent, done, fail, drop, rx_up, dhcp_said;
++	int crypto;                             /* 0 untested, 1 ok, -1 failed */
++} ws;
++
++/* what sweet_wlan.c hands over (any thread) */
++static struct {
++	bool join, leave, open;
++	uint8_t ssid[32], ssid_len, bssid[6], pmk[32];
++} ws_req;
++static struct { uint16_t len; uint8_t d[1514]; } ws_q[WS_QLEN];
++static unsigned ws_qh, ws_qt;
++static LCK_GRP_DECLARE(ws_grp, "sweet_wlan_sta");
++static LCK_SPIN_DECLARE(ws_lock, &ws_grp);
++
++/* --- crypto --- */
++static void
++ws_hmac(const uint8_t *key, size_t klen, const uint8_t *a, size_t al, const uint8_t *b, size_t bl, uint8_t out[20])
++{
++	uint8_t k[64], pad[64], inner[20];
++	SHA1_CTX c;
++
++	bzero(k, sizeof(k));
++	if (klen > 64) {
++		SHA1Init(&c);
++		SHA1Update(&c, key, klen);
++		SHA1Final(k, &c);
++	} else {
++		memcpy(k, key, klen);
++	}
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x36;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	if (al) {
++		SHA1Update(&c, a, al);
++	}
++	if (bl) {
++		SHA1Update(&c, b, bl);
++	}
++	SHA1Final(inner, &c);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x5c;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	SHA1Update(&c, inner, 20);
++	SHA1Final(out, &c);
++	bzero(k, sizeof(k));
++	bzero(pad, sizeof(pad));
++	bzero(inner, sizeof(inner));
++}
++
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 32) (802.11-2016 J.4) */
++void
++sweet_wlan_pmk(const uint8_t *pass, unsigned plen, const uint8_t *ssid, unsigned slen, uint8_t pmk[32])
++{
++	for (uint32_t blk = 1; blk <= 2; blk++) {
++		uint8_t cnt[4] = { 0, 0, 0, (uint8_t)blk }, u[20], t[20];
++		ws_hmac(pass, plen, ssid, slen, cnt, 4, u);
++		memcpy(t, u, 20);
++		for (int i = 1; i < 4096; i++) {
++			ws_hmac(pass, plen, u, 20, NULL, 0, u);
++			for (int j = 0; j < 20; j++) {
++				t[j] ^= u[j];
++			}
++		}
++		memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
++		bzero(u, sizeof(u));
++		bzero(t, sizeof(t));
++	}
++}
++
++/* PRF-SHA1(K, label, data) */
++static void
++ws_prf(const uint8_t *key, const char *label, const uint8_t *data, size_t dlen, uint8_t *out, size_t olen)
++{
++	uint8_t buf[128], h[20];
++	size_t ll = strlen(label);
++
++	for (uint8_t i = 0; olen > 0; i++) {
++		memcpy(buf, label, ll);
++		buf[ll] = 0;
++		memcpy(buf + ll + 1, data, dlen);
++		buf[ll + 1 + dlen] = i;
++		ws_hmac(key, 32, buf, ll + 2 + dlen, NULL, 0, h);
++		size_t take = MIN(olen, (size_t)20);
++		memcpy(out, h, take);
++		out += take;
++		olen -= take;
++	}
++	bzero(h, sizeof(h));
++}
++
++/* RFC 3394 unwrap with a 128-bit KEK: out gets len - 8 bytes; false if the integrity check fails */
++static bool
++ws_unwrap(const uint8_t kek[16], const uint8_t *in, size_t len, uint8_t *out)
++{
++	aes_decrypt_ctx ctx[1];
++	uint8_t a[8], b[16], o[16];
++	static const uint8_t zero[16];
++	size_t n = len / 8 - 1;
++	bool ok = true;
++
++	if (len < 24 || len % 8 || len > 264 || aes_decrypt_key128(kek, ctx) != 0) {
++		return false;
++	}
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, len - 8);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			memcpy(b, a, 8);
++			for (int k = 0; k < 8; k++) {
++				b[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			if (aes_decrypt_cbc(b, zero, 1, o, ctx) != 0) {
++				ok = false;
++			}
++			memcpy(a, o, 8);
++			memcpy(out + 8 * (i - 1), o + 8, 8);
++		}
++	}
++	for (int k = 0; k < 8; k++) {
++		ok &= a[k] == 0xa6;
++	}
++	bzero(ctx, sizeof(ctx));
++	bzero(b, sizeof(b));
++	bzero(o, sizeof(o));
++	return ok;
++}
++
++bool
++sweet_wlan_crypto_ok(void)
++{
++	static const uint8_t kek[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
++	static const uint8_t ct[24] = { 0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8,
++		0xfb, 0x5a, 0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5 };   /* RFC 3394 4.1 */
++	static const uint8_t pt[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
++		0xcc, 0xdd, 0xee, 0xff };
++	static const uint8_t psk[8] = { 0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef };      /* "password"/"IEEE" */
++	uint8_t out[16], pmk[32];
++
++	if (ws.crypto == 0) {
++		bool a = ws_unwrap(kek, ct, sizeof(ct), out) && memcmp(out, pt, 16) == 0;
++		sweet_wlan_pmk((const uint8_t *)"password", 8, (const uint8_t *)"IEEE", 4, pmk);
++		bool b = memcmp(pmk, psk, sizeof(psk)) == 0;
++		ws.crypto = a && b ? 1 : -1;
++		printf("SWEET WLAN: crypto self-test: key unwrap %s, pbkdf2 %s\n", a ? "ok" : "FAILED", b ? "ok" : "FAILED");
++	}
++	return ws.crypto > 0;
++}
++
++/* --- WMI for the join (ath10k wmi-tlv layouts) --- */
++static uint8_t *
++ws_mac(uint8_t *p, const uint8_t *m)
++{
++	bzero(p, 8);
++	memcpy(p, m, 6);
++	return p + 8;
++}
++
++static uint8_t *
++ws_chan(uint8_t *p, uint32_t f, bool passive)
++{
++	uint32_t dfs = f >= 5260 && f <= 5720;
++	uint8_t *c = wn_tlv(p, 0x50, 24);
++	c = wn_put32(c, f);
++	c = wn_put32(c, f);
++	c = wn_put32(c, 0);
++	c = wn_put32(c, (f < 4000 ? 1u : 0u) | (passive ? 1u << 7 : 0) | (1u << 11) | (f < 4000 ? 0 : 1u << 12) | (dfs << 10));
++	c = wn_put32(c, (40u << 8) | (40u << 16));
++	return wn_put32(c, 40u << 8);
++}
++
++/* ath10k_update_channel_list after a beacon hint: the AP's channel no longer passive */
++static void
++ws_chan_list(uint32_t active)
++{
++	static uint8_t m[8 + 4 + WN_NFREQ * 28];
++	uint8_t *p = wn_put32(wn_tlv(m, 0x4f, 4), WN_NFREQ);
++
++	p = wn_tlv(p, 0x12, (uint16_t)(WN_NFREQ * 28));
++	for (uint32_t i = 0; i < WN_NFREQ; i++) {
++		p = ws_chan(p, wn_freq[i], wn_freq[i] != active);
++	}
++	wn_wmi_send(0x3003, m, (uint32_t)(p - m));
++}
++
++static void
++ws_vdev_start(void)
++{
++	uint8_t m[4 + 72 + 28 + 4], *p = m;
++	uint32_t bcn = ws.ap.bintval ? ws.ap.bintval : 100, dtim = 1;
++
++	for (uint32_t o = 0; o + 2 <= ws.ap.ies_len && o + 2 + ws.ap.ies[o + 1] <= ws.ap.ies_len; o += 2u + ws.ap.ies[o + 1]) {
++		if (ws.ap.ies[o] == 5 && ws.ap.ies[o + 1] >= 2 && ws.ap.ies[o + 3]) {
++			dtim = ws.ap.ies[o + 3];        /* TIM: DTIM period */
++		}
++	}
++	bzero(m, sizeof(m));
++	p = wn_tlv(p, 0x58, 72);                /* VDEV_START_REQUEST: vdev, requestor, beacon, dtim, flags */
++	p = wn_put32(p, 0);
++	p = wn_put32(p, 0);
++	p = wn_put32(p, bcn);
++	p = wn_put32(p, dtim);
++	p = wn_put32(p, 0);
++	p += 36 + 16;                           /* ssid (none for a station), beacon rate/power, noa, hw ack */
++	p = ws_chan(p, ws.freq, false);
++	(void)wn_tlv(p, 0x12, 0);               /* no NoA descriptors */
++	wn_wmi_send(0x5003, m, sizeof(m));
++}
++
++static void
++ws_vdev(uint32_t cmd, uint16_t tag)             /* VDEV_STOP, VDEV_DOWN */
++{
++	uint8_t m[8];
++	(void)wn_put32(wn_tlv(m, tag, 4), 0);
++	wn_wmi_send(cmd, m, sizeof(m));
++}
++
++static void
++ws_peer(bool create)
++{
++	uint8_t m[20], *p = wn_tlv(m, create ? 0x61 : 0x62, create ? 16 : 12);
++	p = ws_mac(wn_put32(p, 0), ws.bssid);
++	if (create) {
++		(void)wn_put32(p, 0);           /* peer type: default */
++	}
++	wn_wmi_send(create ? 0x6001 : 0x6002, m, create ? 20 : 16);
++}
++
++static void
++ws_peer_param(uint32_t param, uint32_t value)
++{
++	uint8_t m[24], *p = wn_tlv(m, 0x64, 20);
++	p = ws_mac(wn_put32(p, 0), ws.bssid);
++	(void)wn_put32(wn_put32(p, param), value);
++	wn_wmi_send(0x6004, m, sizeof(m));
++}
++
++static uint32_t
++ws_rates(uint8_t *out)                          /* the AP's rates (elements 1 and 50), 500 kbit/s units */
++{
++	uint32_t n = 0;
++	for (uint32_t o = 0; o + 2 <= ws.ap.ies_len && o + 2 + ws.ap.ies[o + 1] <= ws.ap.ies_len; o += 2u + ws.ap.ies[o + 1]) {
++		for (uint32_t i = 0; (ws.ap.ies[o] == 1 || ws.ap.ies[o] == 50) && i < ws.ap.ies[o + 1] && n < 16; i++) {
++			out[n++] = ws.ap.ies[o + 2 + i];
++		}
++	}
++	return n;
++}
++
++/* ath10k_peer_assoc_prepare for a legacy (11a/11g) peer */
++static void
++ws_peer_assoc(uint16_t caps)
++{
++	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16], rates[16], *p = m, *r;
++	uint32_t n = ws_rates(rates), rl = (n + 3) & ~3u;
++
++	bzero(m, sizeof(m));
++	p = wn_tlv(p, 0x65, 76);
++	p = ws_mac(p, ws.bssid);
++	p = wn_put32(p, 0);                     /* vdev */
++	p = wn_put32(p, 1);                     /* new assoc */
++	p = wn_put32(p, ws.aid);
++	p = wn_put32(p, 0x1 | (ws.open ? 0 : 0x4));     /* AUTH, NEED_PTK_4_WAY */
++	p = wn_put32(p, caps);
++	p = wn_put32(p, 1);                     /* listen interval */
++	p += 16;                                /* ht caps, max mpdu, mpdu density, rate caps */
++	p = wn_put32(p, 1);                     /* nss */
++	p = wn_put32(p, 0);                     /* vht caps */
++	p = wn_put32(p, ws.freq < 4000 ? 1 : 0);        /* MODE_11G / MODE_11A */
++	p += 8;                                 /* ht info */
++	p = wn_put32(p, n);
++	p = wn_put32(p, 0);
++	r = wn_tlv(p, 0x11, (uint16_t)rl);
++	for (uint32_t i = 0; i < n; i++) {
++		uint8_t v = rates[i] & 0x7f;
++		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80) : v;     /* CCK flagged */
++	}
++	p = wn_tlv(r + rl, 0x11, 0);            /* no HT rates */
++	p = wn_tlv(p, 0x66, 16);                /* VHT rate set: none */
++	wn_wmi_send(0x6005, m, (uint32_t)(p + 16 - m));
++}
++
++static void
++ws_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, uint32_t klen)
++{
++	uint8_t m[4 + 92 + 4 + 32], *p = m;
++
++	bzero(m, sizeof(m));
++	p = wn_tlv(p, 0x60, 92);                /* VDEV_INSTALL_KEY */
++	p = ws_mac(wn_put32(p, 0), ws.bssid);
++	p = wn_put32(p, idx);
++	p = wn_put32(p, group ? 1 : 0);         /* WMI_KEY_GROUP / WMI_KEY_PAIRWISE */
++	p = wn_put32(p, cipher);                /* WMI_TLV_CIPHER_AES_CCM 4, TKIP 2 */
++	p += 3 * 8 + 16 + 16;                   /* rsc, global rsc, tsc, wpi counters */
++	p = wn_put32(p, klen);
++	p = wn_put32(p, cipher == 2 ? 8 : 0);
++	p = wn_put32(p, cipher == 2 ? 8 : 0);
++	p = wn_tlv(p, 0x11, (uint16_t)((klen + 3) & ~3u));
++	memcpy(p, key, klen);
++	wn_wmi_send(0x5009, m, 4 + 92 + 4 + ((klen + 3) & ~3u));
++	bzero(m, sizeof(m));
++}
++
++/* MGMT_TX_SEND: the frame in DMA memory, its first 64 bytes inline */
++static void
++ws_mgmt_tx(const uint8_t *f, uint32_t len)
++{
++	uint8_t m[4 + 28 + 4 + 64], *p = m;
++	uint32_t buf = (MIN(len, 64u) + 3) & ~3u;
++
++	if (len > 1024) {
++		return;
++	}
++	bzero(ws.mgmt, ((len + 3) & ~3u) + 4);
++	memcpy(ws.mgmt, f, len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bzero(m, sizeof(m));
++	p = wn_tlv(p, 0x1a6, 28);
++	p = wn_put32(p, 0);                     /* vdev */
++	p = wn_put32(p, ++ws.desc);
++	p = wn_put32(p, 0);                     /* chanfreq: the vdev's */
++	memcpy(p, &ws.mgmt_pa, 8);
++	p = wn_put32(p + 8, len);
++	p = wn_put32(p, buf);
++	p = wn_tlv(p, 0x11, (uint16_t)buf);
++	memcpy(p, ws.mgmt, buf);
++	wn_wmi_send(0x7008, m, 4 + 28 + 4 + buf);
++}
++
++static uint8_t *
++ws_hdr(uint8_t *f, uint8_t fc)
++{
++	bzero(f, 24);
++	f[0] = fc;
++	memcpy(f + 4, ws.bssid, 6);
++	memcpy(f + 10, sweet_wlan_mac, 6);
++	memcpy(f + 16, ws.bssid, 6);
++	return f + 24;
++}
++
++static void
++ws_auth(void)
++{
++	uint8_t f[30], *b = ws_hdr(f, 0xb0);
++	bzero(b, 6);
++	b[2] = 1;                               /* open system, transaction 1 */
++	ws_mgmt_tx(f, sizeof(f));
++}
++
++static void
++ws_build_assoc_req(void)
++{
++	uint8_t *f = ws.assoc_req, *p = ws_hdr(f, 0x00), rates[16];
++	uint32_t n = ws_rates(rates);
++	uint16_t cap = 0x0001 | 0x0020 | 0x0400 | (ws.open ? 0 : 0x0010);      /* ESS, short preamble/slot, privacy */
++
++	*p++ = (uint8_t)cap;
++	*p++ = (uint8_t)(cap >> 8);
++	*p++ = 10;                              /* listen interval */
++	*p++ = 0;
++	*p++ = 0;
++	*p++ = ws.ssid_len;
++	memcpy(p, ws.ssid, ws.ssid_len);
++	p += ws.ssid_len;
++	*p++ = 1;
++	*p++ = (uint8_t)MIN(n, 8u);
++	for (uint32_t k = 0; k < n && k < 8; k++) {
++		*p++ = rates[k];
++	}
++	if (n > 8) {
++		*p++ = 50;
++		*p++ = (uint8_t)(n - 8);
++		for (uint32_t k = 8; k < n; k++) {
++			*p++ = rates[k];
++		}
++	}
++	if (!ws.open) {
++		memcpy(p, ws.rsn_ie, sizeof(ws.rsn_ie));
++		p += sizeof(ws.rsn_ie);
++	}
++	ws.assoc_req_len = (uint32_t)(p - f);
++}
++
++/* --- HTT TX_FRM (ath10k_htt_tx_64, native wifi, the HTC header filled here as ath10k does) --- */
++static bool
++ws_tx_frame(const uint8_t *f, uint32_t len, bool clear, uint32_t *slot)
++{
++	uint8_t m[8 + 20 + 52];
++	uint32_t id, pf = (MIN(len, 50u) + 3) & ~3u;
++	uint16_t v;
++
++	if (!ws.txp || !wn.hbank || wn.htt_state != 2 || !wn.htt_eid || len > WS_SLOT) {
++		return false;
++	}
++	for (id = 0; id < WS_TX_SLOTS && (ws.busy & (1ull << id)); id++) {
++	}
++	if (id == WS_TX_SLOTS) {
++		ws.drop++;
++		return false;
++	}
++	uint64_t pa = ws.txp_pa + (uint64_t)id * WS_SLOT, frag = wn.hbank_pa + (uint64_t)id * WN_EXT_DESC;
++	uint32_t lo = (uint32_t)pa;
++	uint16_t hi = (uint16_t)(pa >> 32), l16 = (uint16_t)len;
++	uint8_t *ext = wn.hbank + id * WN_EXT_DESC;
++	memcpy(ws.txp + id * WS_SLOT, f, len);
++	bzero(ext, WN_EXT_DESC);
++	memcpy(ext + 24, &lo, 4);               /* frags[0]: paddr_lo, paddr_hi, len */
++	memcpy(ext + 28, &hi, 2);
++	memcpy(ext + 30, &l16, 2);
++	bzero(m, sizeof(m));
++	m[0] = wn.htt_eid;                      /* HTC header */
++	v = (uint16_t)(20 + pf);
++	memcpy(m + 2, &v, 2);
++	m[8] = 1;                               /* TX_FRM */
++	m[9] = 0x01 | (1u << 5) | (clear ? 0x04 : 0);   /* MAC_HDR_PRESENT, pkt type native wifi, NO_ENCRYPT */
++	v = (uint16_t)((16u << 6) | (1u << 11));        /* vdev 0, ext tid NON_QOS_MCAST_BCAST, POSTPONED */
++	memcpy(m + 10, &v, 2);
++	memcpy(m + 12, &l16, 2);
++	v = (uint16_t)id;
++	memcpy(m + 14, &v, 2);
++	memcpy(m + 16, &frag, 8);
++	m[24] = 0xff;                           /* peer id HTT_INVALID_PEERID, freq 0 */
++	m[25] = 0xff;
++	memcpy(m + 28, f, pf <= len ? pf : len);
++	if (!wn_ce_send(4, m, 28 + pf, 0)) {    /* transfer id 0, as ath10k_htt_tx_64 */
++		ws.drop++;
++		return false;
++	}
++	ws.busy |= 1ull << id;
++	ws.sent++;
++	if (slot) {
++		*slot = id;
++	}
++	return true;
++}
++
++static void
++ws_tx_compl(const uint8_t *p, uint32_t len)     /* HTT TX_COMPL_IND: status, count, ids */
++{
++	uint32_t n = p[2], st = p[1] & 7;
++	for (uint32_t i = 0; i < n && 4 + 2 * (i + 1) <= len; i++) {
++		uint16_t id;
++		memcpy(&id, p + 4 + 2 * i, 2);
++		if (id < WS_TX_SLOTS) {
++			ws.busy &= ~(1ull << id);
++		}
++	}
++	ws.done += n;
++	if (st) {
++		ws.fail += n;
++	}
++}
++
++/* an Ethernet frame to the AP as a to-DS native-wifi data frame */
++static bool
++ws_tx_ether(const uint8_t *e, size_t len, bool clear, uint32_t *slot)
++{
++	static uint8_t f[WS_SLOT];
++	static const uint8_t snap[6] = { 0xaa, 0xaa, 0x03, 0, 0, 0 };
++
++	if (len < 14 || len - 14 + 32 > sizeof(f)) {
++		return false;
++	}
++	bzero(f, 24);
++	f[0] = 0x08;
++	f[1] = (uint8_t)(0x01 | (ws.keyed && !clear ? 0x40 : 0));     /* to DS (+ protected once keyed) */
++	memcpy(f + 4, ws.bssid, 6);
++	memcpy(f + 10, sweet_wlan_mac, 6);
++	memcpy(f + 16, e, 6);
++	memcpy(f + 24, snap, 6);
++	memcpy(f + 30, e + 12, 2);
++	memcpy(f + 32, e + 14, len - 14);
++	return ws_tx_frame(f, (uint32_t)(len - 14 + 32), clear, slot);
++}
++
++static void
++ws_dhcp_note(const uint8_t *e, size_t len, bool out)
++{
++	size_t ihl;
++
++	if (ws.dhcp_said >= 8 || len < 14 + 20 + 8 || e[12] != 0x08 || e[13] != 0x00 || e[23] != 17) {
++		return;
++	}
++	ihl = (size_t)(e[14] & 0xf) * 4;
++	if (len < 14 + ihl + 8) {
++		return;
++	}
++	uint16_t sp = (uint16_t)(e[14 + ihl] << 8 | e[15 + ihl]), dp = (uint16_t)(e[16 + ihl] << 8 | e[17 + ihl]);
++	if ((out && dp == 67) || (!out && sp == 67)) {
++		ws.dhcp_said++;
++		printf("SWEET WLAN: dhcp: %s (%u bytes)\n", out ? "request out" : "reply in", (unsigned)len);
++	}
++}
++
++/* --- the join --- */
++static void
++ws_end(int result, unsigned t);
++
++static void
++ws_teardown(void)
++{
++	if (ws.state >= WS_START) {
++		if (ws.state >= WS_4WAY) {
++			ws_vdev(0x5007, 0x5e);  /* VDEV_DOWN */
++		}
++		if (ws.state >= WS_AUTH) {
++			ws_peer(false);
++		}
++		ws_vdev(0x5006, 0x5d);          /* VDEV_STOP */
++	}
++	if (ws.state == WS_UP) {
++		sweet_wlan_link(false);
++	}
++	ws.state = WS_IDLE;
++	ws.keyed = false;
++	bzero(ws.ptk, sizeof(ws.ptk));
++	bzero(ws.gtk, sizeof(ws.gtk));
++	bzero(ws.pmk, sizeof(ws.pmk));
++}
++
++static void
++ws_end(int result, unsigned t)
++{
++	if (result != 0) {
++		printf("SWEET WLAN: join '%.*s': FAILED in %s (%d) after %u ms\n", ws.ssid_len, ws.ssid, ws_names[ws.state],
++		    result, t - ws.join_ms);
++		ws_teardown();
++		sweet_wlan_join_done(result);
++		return;
++	}
++	ws.state = WS_UP;
++	printf("SWEET WLAN: join '%.*s': link up after %u ms\n", ws.ssid_len, ws.ssid, t - ws.join_ms);
++	if (mss_reached == 9) {
++		mss_reached = 10;
++		printf("SWEET MSS: stage 10: ok: joined (%s), en0 link up\n", ws.open ? "open" : "WPA2-PSK");
++	}
++	bzero(ws.pmk, sizeof(ws.pmk));
++	sweet_wlan_join_done(0);                /* APPLE80211_M_ASSOC_DONE, then the link */
++	sweet_wlan_link(true);
++}
++
++/* the AP's RSN element: CCMP pairwise, PSK AKM, no MFP required; else the join is refused */
++static int
++ws_rsn(const uint8_t *ie)
++{
++	uint32_t l = ie[1], o = 2;
++	bool ccmp = false, psk = false;
++
++	if (l < 2 + 4 || ie[2] != 1 || ie[3] != 0) {
++		return ENOTSUP;
++	}
++	ws.group_cipher = ie[7];                /* 00-0F-AC:x */
++	if (ie[4] || ie[5] != 0x0f || ie[6] != 0xac || (ws.group_cipher != 4 && ws.group_cipher != 2)) {
++		return ENOTSUP;
++	}
++	o = 2 + 2 + 4;
++	for (int list = 0; list < 2; list++) {
++		if (o + 2 > 2 + l) {
++			return ENOTSUP;
++		}
++		uint32_t n = ie[o] | (uint32_t)ie[o + 1] << 8;
++		o += 2;
++		for (uint32_t i = 0; i < n; i++, o += 4) {
++			if (o + 4 > 2 + l) {
++				return ENOTSUP;
++			}
++			bool ieee = ie[o] == 0 && ie[o + 1] == 0x0f && ie[o + 2] == 0xac;
++			ccmp |= list == 0 && ieee && ie[o + 3] == 4;
++			psk |= list == 1 && ieee && ie[o + 3] == 2;
++		}
++	}
++	if (o + 2 <= 2 + l && (ie[o] & 0x40)) {
++		return ENOTSUP;                 /* MFPR: management frame protection required */
++	}
++	return ccmp && psk ? 0 : ENOTSUP;
++}
++
++static void
++ws_begin(unsigned t)
++{
++	const uint8_t *rsn = NULL;
++	int best = -1, err;
++	static const uint8_t ours[18] = { 1, 0, 0, 0x0f, 0xac, 0, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2 };
++
++	lck_spin_lock(&ws_lock);
++	ws.ssid_len = ws_req.ssid_len;
++	memcpy(ws.ssid, ws_req.ssid, sizeof(ws.ssid));
++	memcpy(ws.bssid, ws_req.bssid, 6);
++	memcpy(ws.pmk, ws_req.pmk, 32);
++	ws.open = ws_req.open;
++	bzero(ws_req.pmk, sizeof(ws_req.pmk));
++	ws_req.join = false;
++	lck_spin_unlock(&ws_lock);
++	ws.join_ms = t;
++	ws.state = WS_IDLE;
++	bool want_bssid = (ws.bssid[0] | ws.bssid[1] | ws.bssid[2] | ws.bssid[3] | ws.bssid[4] | ws.bssid[5]) != 0;
++	lck_mtx_lock(&wn_bss_lock);
++	for (unsigned i = 0; i < wn.nbss; i++) {
++		struct sweet_wlan_bss *b = &wn.bss[i];
++		if (t - b->seen_ms > SWEET_WLAN_FRESH_MS || b->ssid_len != ws.ssid_len || memcmp(b->ssid, ws.ssid, ws.ssid_len) ||
++		    (want_bssid && memcmp(b->bssid, ws.bssid, 6))) {
++			continue;
++		}
++		if (best < 0 || b->rssi > wn.bss[best].rssi) {
++			best = (int)i;
++		}
++	}
++	if (best >= 0) {
++		ws.ap = wn.bss[best];
++	}
++	lck_mtx_unlock(&wn_bss_lock);
++	printf("SWEET WLAN: join '%.*s' (%s, %s access point)\n", ws.ssid_len, ws.ssid, ws.open ? "open" : "WPA2-PSK",
++	    want_bssid ? "a given" : "any");
++	if (best < 0) {
++		ws_end(ENOENT, t);              /* not heard in the last minute */
++		return;
++	}
++	memcpy(ws.bssid, ws.ap.bssid, 6);
++	ws.freq = ws.ap.chan == 14 ? 2484 : ws.ap.chan <= 14 ? 2407 + 5u * ws.ap.chan : 5000 + 5u * ws.ap.chan;
++	for (uint32_t o = 0; o + 2 <= ws.ap.ies_len && o + 2 + ws.ap.ies[o + 1] <= ws.ap.ies_len; o += 2u + ws.ap.ies[o + 1]) {
++		rsn = ws.ap.ies[o] == 48 ? ws.ap.ies + o : rsn;
++	}
++	if (ws.open != (rsn == NULL && !(ws.ap.capab & 0x0010))) {
++		printf("SWEET WLAN: join: the network is %s, the request %s a key\n", rsn ? "WPA2" : (ws.ap.capab & 0x10) ?
++		    "WEP/WPA1" : "open", ws.open ? "without" : "with");
++		ws_end(ws.open ? EAUTH : ENOTSUP, t);
++		return;
++	}
++	if (rsn && (err = ws_rsn(rsn)) != 0) {
++		printf("SWEET WLAN: join: the network's RSN element is not WPA2-PSK with CCMP (or it requires MFP)\n");
++		ws_end(err, t);
++		return;
++	}
++	if (rsn) {
++		ws.rsn_ie[0] = 48;
++		ws.rsn_ie[1] = 20;
++		memcpy(ws.rsn_ie + 2, ours, sizeof(ours));
++		ws.rsn_ie[2 + 5] = ws.group_cipher;
++		ws.rsn_ie[20] = ws.rsn_ie[21] = 0;      /* RSN capabilities */
++	}
++	if (!ws.mgmt && !(ws.mgmt = wn_carve(0x1000, &ws.mgmt_pa))) {
++		ws_end(ENOMEM, t);
++		return;
++	}
++	if (!ws.txp && !(ws.txp = wn_carve(WS_TX_SLOTS * WS_SLOT, &ws.txp_pa))) {
++		ws_end(ENOMEM, t);
++		return;
++	}
++	printf("SWEET WLAN: join '%.*s': %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm\n", ws.ssid_len, ws.ssid, ws.bssid[0],
++	    ws.bssid[1], ws.bssid[2], ws.bssid[3], ws.bssid[4], ws.bssid[5], ws.freq, ws.ap.rssi);
++	ws.msg1s = 0;
++	ws.start_resp = false;
++	ws.replay = 0;
++	ws_chan_list(ws.freq);
++	{
++		uint8_t m[12];
++		(void)wn_put32(wn_put32(wn_tlv(m, 0x6c, 8), 0), 0);     /* STA_POWERSAVE_MODE disabled */
++		wn_wmi_send(0x9001, m, sizeof(m));
++	}
++	ws_vdev_start();
++	ws.state = WS_START;
++	ws.deadline = t + 2000;
++}
++
++static void
++ws_mgmt_rx(const uint8_t *f, uint32_t len, unsigned t)
++{
++	if (len < 26 || ws.state == WS_IDLE || memcmp(f + 10, ws.bssid, 6) || memcmp(f + 4, sweet_wlan_mac, 6)) {
++		return;
++	}
++	uint16_t v = (uint16_t)(f[24] | f[25] << 8);
++	if (f[0] == 0xb0 && ws.state == WS_AUTH && len >= 30 && f[26] == 2) {
++		v = (uint16_t)(f[28] | f[29] << 8);
++		printf("SWEET WLAN: join: auth %s (status %u)\n", v ? "REFUSED" : "ok", v);
++		if (v) {
++			ws_end(ECONNREFUSED, t);
++			return;
++		}
++		ws.state = WS_ASSOC;
++		ws.tries = 1;
++		ws_build_assoc_req();
++		ws_mgmt_tx(ws.assoc_req, ws.assoc_req_len);
++		ws.deadline = t + 500;
++	} else if (f[0] == 0x10 && ws.state == WS_ASSOC && len >= 30) {
++		v = (uint16_t)(f[26] | f[27] << 8);
++		ws.aid = (uint32_t)(f[28] | f[29] << 8) & 0x3fff;
++		if (v) {
++			printf("SWEET WLAN: join: assoc REFUSED (status %u)\n", v);
++			ws_end(ECONNREFUSED, t);
++			return;
++		}
++		printf("SWEET WLAN: join: assoc ok aid %u\n", ws.aid);
++		ws_peer_assoc((uint16_t)(f[24] | f[25] << 8));
++		{
++			uint8_t m[20], *p = wn_tlv(m, 0x5c, 16);     /* VDEV_UP: vdev, aid, bssid */
++			(void)ws_mac(wn_put32(wn_put32(p, 0), ws.aid), ws.bssid);
++			wn_wmi_send(0x5005, m, sizeof(m));
++		}
++		ws.state = WS_4WAY;
++		if (ws.open) {
++			ws_peer_param(0x3, 1);          /* WMI_TLV_PEER_AUTHORIZE */
++			ws_end(0, t);
++		} else {
++			ws.deadline = t + 8000;
++		}
++	} else if (f[0] == 0xc0 || f[0] == 0xa0) {
++		printf("SWEET WLAN: join: the AP sent %s, reason %u (%s)\n", f[0] == 0xc0 ? "deauth" : "disassoc", v,
++		    ws_names[ws.state]);
++		if (ws.state == WS_UP) {
++			ws_teardown();
++		} else {
++			ws_end(ws.state >= WS_4WAY ? EAUTH : ECONNREFUSED, t);
++		}
++	}
++}
++
++static void
++ws_wmi_event(uint32_t id, const uint8_t *p, uint32_t len, unsigned t)
++{
++	uint16_t l = 0;
++	uint32_t v[4] = { 0, 0, 0, 0 };
++
++	if (len < 4) {
++		return;
++	}
++	memcpy(&l, p, 2);
++	if (len < 4u + l) {
++		return;
++	}
++	memcpy(v, p + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
++	if (id == 0x5001 && l >= 16 && ws.state == WS_START) {  /* VDEV_START_RESP: vdev, req, type, status */
++		ws.start_status = (int32_t)v[3];
++		ws.start_resp = true;
++	} else if (id == 0x6001 && ws.state == WS_UP) {         /* PEER_STA_KICKOUT */
++		printf("SWEET WLAN: link: the firmware kicked the AP out (beacons lost)\n");
++		ws_teardown();
++	}
++	(void)t;
++}
++
++/* --- EAPOL-Key (802.11-2016 12.7.2) --- */
++static void
++ws_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t dlen, uint32_t *slot)
++{
++	uint8_t e[14 + 4 + 95 + 32], *k = e + 18, mic[20];
++	uint16_t body = (uint16_t)(95 + dlen);
++
++	bzero(e, sizeof(e));
++	memcpy(e, ws.bssid, 6);
++	memcpy(e + 6, sweet_wlan_mac, 6);
++	e[12] = 0x88;
++	e[13] = 0x8e;
++	e[14] = 1;                              /* EAPOL version 802.1X-2001 */
++	e[15] = 3;                              /* key */
++	e[16] = (uint8_t)(body >> 8);
++	e[17] = (uint8_t)body;
++	k[0] = 2;                               /* RSN key descriptor */
++	k[1] = (uint8_t)(info >> 8);
++	k[2] = (uint8_t)info;
++	for (int i = 0; i < 8; i++) {
++		k[5 + i] = (uint8_t)(ws.replay >> (56 - 8 * i));
++	}
++	if (nonce) {
++		memcpy(k + 13, nonce, 32);
++	}
++	k[93] = (uint8_t)(dlen >> 8);
++	k[94] = (uint8_t)dlen;
++	if (dlen) {
++		memcpy(k + 95, data, dlen);
++	}
++	ws_hmac(ws.ptk, 16, e + 14, 4u + body, NULL, 0, mic);  /* KCK */
++	memcpy(k + 77, mic, 16);
++	(void)ws_tx_ether(e, 18u + body, true, slot);
++}
++
++static bool
++ws_eapol_mic_ok(uint8_t *eapol, size_t len)
++{
++	uint8_t want[16], got[20];
++
++	memcpy(want, eapol + 4 + 77, 16);
++	bzero(eapol + 4 + 77, 16);
++	ws_hmac(ws.ptk, 16, eapol, len, NULL, 0, got);
++	memcpy(eapol + 4 + 77, want, 16);
++	return memcmp(want, got, 16) == 0;
++}
++
++/* the GTK KDE (00-0F-AC:1) of message 3 or group message 1 */
++static bool
++ws_gtk(const uint8_t *k, uint16_t dlen)
++{
++	uint8_t plain[256];
++	bool found = false;
++
++	if (dlen < 24 || dlen > sizeof(plain) + 8 || !ws_unwrap(ws.ptk + 16, k + 95, dlen, plain)) {
++		return false;
++	}
++	for (uint32_t o = 0; o + 2 <= (uint32_t)dlen - 8 && o + 2 + plain[o + 1] <= (uint32_t)dlen - 8; o += 2u + plain[o + 1]) {
++		if (plain[o] == 0xdd && plain[o + 1] >= 6 + 16 && plain[o + 2] == 0 && plain[o + 3] == 0x0f &&
++		    plain[o + 4] == 0xac && plain[o + 5] == 1) {
++			ws.gtk_idx = plain[o + 6] & 3;
++			ws.gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
++			memcpy(ws.gtk, plain + o + 8, ws.gtk_len);
++			found = true;
++		}
++	}
++	bzero(plain, sizeof(plain));
++	return found;
++}
++
++static void
++ws_eapol_rx(const uint8_t *e, size_t elen, unsigned t)
++{
++	uint8_t fr[512], *k = fr + 4;
++	size_t len = elen - 14;
++
++	if ((ws.state != WS_4WAY && ws.state != WS_UP) || ws.open || elen < 14 + 4 + 95 || len > sizeof(fr) ||
++	    memcmp(e + 6, ws.bssid, 6)) {
++		return;
++	}
++	memcpy(fr, e + 14, len);
++	if (fr[1] != 3 || k[0] != 2 || 4 + (size_t)(fr[2] << 8 | fr[3]) > len) {
++		return;
++	}
++	len = 4 + (size_t)(fr[2] << 8 | fr[3]);         /* the EAPOL frame, without Ethernet padding */
++	uint16_t info = (uint16_t)(k[1] << 8 | k[2]), dlen = (uint16_t)(k[93] << 8 | k[94]);
++	uint64_t replay = 0;
++	for (int i = 0; i < 8; i++) {
++		replay = replay << 8 | k[5 + i];
++	}
++	if (95 + (size_t)dlen > len - 4 || (info & 7) != 2) {
++		return;                         /* only descriptor version 2 (HMAC-SHA1, AES key wrap) */
++	}
++	bool pairwise = info & 0x0008, install = info & 0x0040, ack = info & 0x0080, mic = info & 0x0100;
++	if (ws.state == WS_4WAY && pairwise && ack && !mic) {           /* message 1 */
++		uint8_t data[76];
++		if (++ws.msg1s > 3) {
++			printf("SWEET WLAN: join: 4-way: the AP repeats message 1: wrong passphrase\n");
++			ws_end(EAUTH, t);
++			return;
++		}
++		ws.replay = replay;
++		memcpy(ws.anonce, k + 13, 32);
++		read_random(ws.snonce, 32);
++		bool amin = memcmp(ws.bssid, sweet_wlan_mac, 6) < 0, nmin = memcmp(ws.anonce, ws.snonce, 32) < 0;
++		memcpy(data, amin ? ws.bssid : sweet_wlan_mac, 6);
++		memcpy(data + 6, amin ? sweet_wlan_mac : ws.bssid, 6);
++		memcpy(data + 12, nmin ? ws.anonce : ws.snonce, 32);
++		memcpy(data + 44, nmin ? ws.snonce : ws.anonce, 32);
++		ws_prf(ws.pmk, "Pairwise key expansion", data, sizeof(data), ws.ptk, 48);
++		ws_eapol_send(0x010a, ws.snonce, ws.rsn_ie, sizeof(ws.rsn_ie), NULL);
++		printf("SWEET WLAN: join: 4-way: message 1 -> message 2 sent\n");
++	} else if (ws.state == WS_4WAY && pairwise && ack && mic && install) {  /* message 3 */
++		if (replay <= ws.replay || memcmp(k + 13, ws.anonce, 32) || !ws_eapol_mic_ok(fr, len)) {
++			printf("SWEET WLAN: join: 4-way: message 3 refused (replay, ANonce or MIC): wrong passphrase?\n");
++			ws_end(EAUTH, t);
++			return;
++		}
++		ws.replay = replay;
++		ws.gtk_len = 0;
++		if (!(info & 0x1000) || !ws_gtk(k, dlen)) {
++			printf("SWEET WLAN: join: 4-way: message 3 without a usable group key\n");
++			ws_end(EAUTH, t);
++			return;
++		}
++		ws.msg4_slot = WS_TX_SLOTS;
++		ws_eapol_send(0x030a, NULL, NULL, 0, &ws.msg4_slot);
++		ws.state = WS_KEYS;
++		ws.deadline = t + 100;          /* keys after message 4 has gone out in the clear */
++		printf("SWEET WLAN: join: 4-way ok (message 4 sent)\n");
++	} else if (ws.state == WS_UP && !pairwise && ack && mic && (info & 0x1000)) {   /* group key 1/2 */
++		if (replay <= ws.replay || !ws_eapol_mic_ok(fr, len) || !ws_gtk(k, dlen)) {
++			printf("SWEET WLAN: link: group rekey refused\n");
++			return;
++		}
++		ws.replay = replay;
++		ws_eapol_send(0x0302, NULL, NULL, 0, NULL);
++		ws_install_key(true, ws.gtk_idx, ws.group_cipher == 2 ? 2 : 4, ws.gtk, ws.gtk_len);
++		bzero(ws.gtk, sizeof(ws.gtk));
++		printf("SWEET WLAN: link: group key renewed (index %u)\n", ws.gtk_idx);
++	}
++}
++
++/* a received MSDU (native wifi: 802.11 header without QoS, LLC/SNAP) */
++static void
++ws_rx_native(const uint8_t *f, uint32_t len, unsigned t)
++{
++	static uint8_t e[14 + 2048];
++	uint32_t hl = ((f[1] & 3) == 3) ? 30 : 24, plen;
++
++	if (ws.state < WS_4WAY || len < 24 + 8 || (f[0] & 0x0c) != 0x08 || (f[1] & 3) != 2 || memcmp(f + 10, ws.bssid, 6)) {
++		return;                         /* data from our AP, from DS */
++	}
++	const uint8_t *llc = f + hl;
++	if (len < hl + 8 || llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 0x03 || (plen = len - hl - 8) > 2048) {
++		return;
++	}
++	if (memcmp(f + 16, sweet_wlan_mac, 6) == 0) {
++		return;                         /* our own multicast, echoed by the AP */
++	}
++	memcpy(e, f + 4, 6);                    /* destination */
++	memcpy(e + 6, f + 16, 6);               /* source: addr3 when from DS */
++	memcpy(e + 12, llc + 6, 2);
++	memcpy(e + 14, llc + 8, plen);
++	if (e[12] == 0x88 && e[13] == 0x8e) {
++		ws_eapol_rx(e, 14 + plen, t);
++	} else if (ws.state == WS_UP) {
++		ws.rx_up++;
++		ws_dhcp_note(e, 14 + plen, false);
++		sweet_wlan_input(e, 14 + plen);
++	}
++}
++
++/* from wn_htt_rx: one MSDU of an in-order indication (buffer = htt_rx_desc_v2 + payload) */
++static void
++ws_rx_msdu(const uint8_t *buf, uint32_t mlen, bool offload, unsigned t)
++{
++	uint32_t att;
++
++	memcpy(&att, buf + 4, 4);
++	if (offload || !(att & (1u << 31)) || (att & (0xfu << 27)) || (att & (3u << 16)) || mlen > WN_HTT_BUF - 360) {
++		return;                         /* not done, or FCS/decrypt/MIC/length errors */
++	}
++	ws_rx_native(buf + 360, mlen, t);
++}
++
++static void
++ws_pump(void)
++{
++	static uint8_t one[1514];
++
++	for (unsigned n = 0; n < 16 && ws_qh != ws_qt; n++) {
++		uint16_t len;
++		lck_spin_lock(&ws_lock);
++		len = ws_q[ws_qh % WS_QLEN].len;
++		memcpy(one, ws_q[ws_qh % WS_QLEN].d, len);
++		lck_spin_unlock(&ws_lock);
++		if (ws.state == WS_UP && !ws_tx_ether(one, len, false, NULL)) {
++			break;                  /* no slot: again next pass */
++		}
++		if (ws.state == WS_UP) {
++			ws_dhcp_note(one, len, true);
++		}
++		lck_spin_lock(&ws_lock);
++		ws_qh++;
++		lck_spin_unlock(&ws_lock);
++	}
++}
++
++/* from wn_poll, every millisecond once the data path is up (mss>=10) */
++static void
++ws_poll(unsigned t)
++{
++	if (mss_mode < 10) {
++		return;
++	}
++	if (ws_busy() && !wn.scanning) {
++		wn.deadline = t + 3600000;      /* the scan step's timeout does not apply while joining or joined */
++	}
++	if (ws_req.leave) {
++		ws_req.leave = false;
++		if (ws.state != WS_IDLE) {
++			printf("SWEET WLAN: leave '%.*s' (asked)\n", ws.ssid_len, ws.ssid);
++			bool joining = ws.state != WS_UP;
++			ws_teardown();
++			if (joining) {
++				sweet_wlan_join_done(ECANCELED);
++			}
++		}
++	}
++	if (ws_req.join && !wn.scanning) {
++		if (ws.state != WS_IDLE) {
++			bool joining = ws.state != WS_UP;
++			ws_teardown();
++			if (joining) {
++				sweet_wlan_join_done(ECANCELED);
++			}
++		}
++		ws_begin(t);
++		return;
++	}
++	if (ws.state == WS_START) {
++		if (ws.start_resp) {
++			if (ws.start_status) {
++				printf("SWEET WLAN: join: vdev start REFUSED (status %d)\n", ws.start_status);
++				ws_end(EIO, t);
++				return;
++			}
++			ws.state = WS_AUTH;
++			ws.tries = 1;
++			ws_peer(true);
++			ws_auth();
++			ws.deadline = t + 500;
++		} else if (t > ws.deadline) {
++			ws_end(ETIMEDOUT, t);
++		}
++	} else if ((ws.state == WS_AUTH || ws.state == WS_ASSOC) && t > ws.deadline) {
++		if (ws.tries >= 4) {
++			printf("SWEET WLAN: join: no %s reply in 4 tries\n", ws_names[ws.state]);
++			ws_end(ETIMEDOUT, t);
++			return;
++		}
++		ws.tries++;
++		if (ws.state == WS_AUTH) {
++			ws_auth();
++		} else {
++			ws_mgmt_tx(ws.assoc_req, ws.assoc_req_len);
++		}
++		ws.deadline = t + 500;
++	} else if (ws.state == WS_4WAY && t > ws.deadline) {
++		printf("SWEET WLAN: join: no 4-way handshake (%u message 1s)\n", ws.msg1s);
++		ws_end(ws.msg1s ? EAUTH : ETIMEDOUT, t);
++	} else if (ws.state == WS_KEYS && (t > ws.deadline ||
++	    (ws.msg4_slot < WS_TX_SLOTS && !(ws.busy & (1ull << ws.msg4_slot))))) {
++		ws_install_key(false, 0, 4, ws.ptk + 32, 16);                   /* TK, pairwise CCMP */
++		ws_install_key(true, ws.gtk_idx, ws.group_cipher == 2 ? 2 : 4, ws.gtk, ws.gtk_len);
++		ws_peer_param(0x3, 1);                                          /* WMI_TLV_PEER_AUTHORIZE */
++		ws.keyed = true;
++		bzero(ws.gtk, sizeof(ws.gtk));
++		printf("SWEET WLAN: join: keys installed (pairwise CCMP, group %s index %u)\n",
++		    ws.group_cipher == 2 ? "TKIP" : "CCMP", ws.gtk_idx);
++		ws_end(0, t);
++	}
++	ws_pump();
++}
++
++/* --- for sweet_wlan.c (any thread) --- */
++int
++sweet_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t bssid[6], const uint8_t *pmk)
++{
++	if (mss_mode < 10) {
++		return EOPNOTSUPP;
++	}
++	if (!sweet_wlan_ready()) {
++		return EBUSY;
++	}
++	if (ssid_len == 0 || ssid_len > 32) {
++		return EINVAL;
++	}
++	lck_spin_lock(&ws_lock);
++	bzero(ws_req.ssid, sizeof(ws_req.ssid));
++	memcpy(ws_req.ssid, ssid, ssid_len);
++	ws_req.ssid_len = (uint8_t)ssid_len;
++	memcpy(ws_req.bssid, bssid, 6);
++	ws_req.open = pmk == NULL;
++	if (pmk) {
++		memcpy(ws_req.pmk, pmk, 32);
++	} else {
++		bzero(ws_req.pmk, 32);
++	}
++	ws_req.join = true;
++	lck_spin_unlock(&ws_lock);
++	return 0;
++}
++
++void
++sweet_wlan_leave(void)
++{
++	ws_req.leave = true;
++}
++
++bool
++sweet_wlan_tx(const uint8_t *frame, size_t len)
++{
++	bool ok = false;
++
++	if (ws.state != WS_UP || len < 14 || len > 1514) {
++		return false;
++	}
++	lck_spin_lock(&ws_lock);
++	if (ws_qt - ws_qh < WS_QLEN) {
++		ws_q[ws_qt % WS_QLEN].len = (uint16_t)len;
++		memcpy(ws_q[ws_qt % WS_QLEN].d, frame, len);
++		ws_qt++;
++		ok = true;
++	}
++	lck_spin_unlock(&ws_lock);
++	return ok;
++}
++
++/* 0 not joined, 2 joining, 4 joined (APPLE80211_S_*); out: the network when joined */
++int
++sweet_wlan_station(struct sweet_wlan_bss *out)
++{
++	int s = ws.state;
++
++	if (s == WS_UP && out) {
++		*out = ws.ap;
++	}
++	return s == WS_UP ? 4 : s == WS_IDLE ? 0 : 2;
++}
++
++static void
++ws_summary(void)
++{
++	if (mss_mode >= 10) {
++		printf("SWEET WLAN: station: %s, tx %u sent %u done %u failed %u dropped, rx %u to en0\n", ws_names[ws.state],
++		    ws.sent, ws.done, ws.fail, ws.drop, ws.rx_up);
++	}
++}
++
++static bool
++ws_busy(void)
++{
++	return ws.state != WS_IDLE || ws_req.join;
++}
++
+ /* --- 0268: for sweet_wlan.c (wifid's ioctls, any thread) --- */
+ bool
+ sweet_wlan_ready(void)
+@@ -4770,6 +5955,7 @@
+ 	}
+ 	if (mss_mode >= 9) {
+ 		wn_summary();
++		ws_summary();                   /* 0281 */
+ 	}
+ 	if (!up) {
+ 		printf("SWEET MSS: stage 6: FAILED: %s\n", why ? why : "?");
+@@ -4937,7 +6123,7 @@
+ 		mss_win_va = 0;
+ 	}
+ 	printf("SWEET MSS: done: mss=%d, last good stage %d%s\n", mode, reached,
+-	    reached == (mode > 9 ? 9 : mode) ? "" : " (stopped early)");
++	    reached == (mode > 10 ? 10 : mode) ? "" : " (stopped early)");
+ 	mss_efs_free();
+ 	(void)thread_terminate(current_thread());
+ }
+--- a/bsd/dev/sweet_wlan.c
++++ b/bsd/dev/sweet_wlan.c
+@@ -8,6 +8,11 @@
+  * drivers/wifi/hakios.wlan.cpp (iokit/Kernel/arm/SweetWLAN.cpp here). Cut down to what our
+  * passive scan (sweet_mss.c, 0267) can answer: power, card capabilities, channels, SCAN_REQ and
+  * SCAN_RESULT, state. What is asked about a joined network answers ENXIO; ASSOCIATE is refused.
++ * 0281 (mss>=10): ASSOCIATE joins (sweet_mss.c does the station and the WPA2 handshake; a
++ * passphrase becomes the PMK here and is never logged), ASSOCIATE_RESULT, DISASSOCIATE, the joined
++ * network's SSID/BSSID/channel/RSSI/auth type/state, APPLE80211_M_ASSOC_DONE, SSID/BSSID/LINK_CHANGED,
++ * KEV_DL_LINK_ON/OFF and IFM_ACTIVE for configd, and en0's frames both ways (HakiOS
++ * hakios.apple80211.c set_join and the link event, hakios.net.c input).
+  *
+  * How the requests get here: IO80211.framework finds no user client on the interface's IOKit
+  * service, logs "Falling back to IOCTL path" (the same string is in 16.7.16's dyld cache) and
+@@ -121,8 +126,38 @@
+     offsetof(struct apple80211_scan_result, age_ms) == 0x84 &&
+     offsetof(struct apple80211_scan_result, elements) == 0x8c, "a scan's result as 16.5 has it");
+ 
++/* ASSOCIATE (20): 592 bytes (HakiOS, 16.5); what follows the key is not used */
++struct apple80211_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;   /* cipher 10: the passphrase as typed; 6: the PMK */
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++
++/* APPLE80211_M_LINK_CHANGED's data (32 bytes or the framework drops it) */
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
++    "the association request as 16.5 has it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "the link event as 16.5 reads it");
++
+ /* APPLE80211_M_* */
+-enum { EVENT_POWER_CHANGED = 1, EVENT_SCAN_DONE = 10 };
++enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4,
++       EVENT_ASSOC_DONE = 9, EVENT_SCAN_DONE = 10 };
+ 
+ uint8_t sweet_wlan_mac[6] = { 0x02, 0x00, 0x00, 0x53, 0x57, 0x54 };     /* unless /arm-io/wlan has one */
+ 
+@@ -134,6 +169,9 @@
+ static unsigned wl_said;
+ static uint16_t wl_seen[2][256];                /* requests per (set, type), for the log */
+ static uint64_t wl_dropped;
++static uint32_t wl_join_result;                 /* 0281: ASSOCIATE_RESULT; 0 while a join runs */
++static volatile bool wl_link, wl_leaving;       /* 0281 */
++static uint64_t wl_in_dropped;
+ 
+ static const char *
+ wl_type_name(int32_t type)
+@@ -292,6 +330,104 @@
+ 	return error;
+ }
+ 
++/* 0281: about the network joined (HakiOS hakios.apple80211.c) */
++static int
++wl_get_joined(struct apple80211req *r)
++{
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++	int error = ENXIO;
++
++	if (b == NULL) {
++		return ENOMEM;
++	}
++	if (sweet_wlan_station(b) == 4) {
++		switch (r->req_type) {
++		case 1:                         /* SSID; its length goes back in the request */
++			if ((error = wl_give(r, b->ssid, b->ssid_len)) == 0) {
++				r->req_len = b->ssid_len;
++			}
++			break;
++		case 9:
++			error = wl_give(r, b->bssid, 6);
++			break;
++		case 4: {
++			struct {
++				uint32_t version;
++				struct apple80211_channel channel;
++			} a = { .version = 1 };
++			wl_channel(&a.channel, wl_freq(b->chan));
++			error = wl_give(r, &a, sizeof(a));
++			break;
++		}
++		case 16: {
++			struct {
++				uint32_t version, radios, unit;
++				int32_t each[4], all, each_ext[4], all_ext;
++			} a = { .version = 1, .radios = 1, .each = { b->rssi }, .all = b->rssi, .each_ext = { b->rssi },
++				.all_ext = b->rssi };
++			error = wl_give(r, &a, sizeof(a));
++			break;
++		}
++		case 103:
++			error = wl_give_bss(r, b, 0);
++			break;
++		case 2: {                       /* open system; WPA2-PSK when the network is private */
++			struct {
++				uint32_t version, lower, upper, extended;
++			} a = { .version = 1, .lower = 1, .upper = (b->capab & 0x10) ? 8 : 0 };
++			error = wl_give(r, &a, sizeof(a));
++			break;
++		}
++		}
++	}
++	kfree_data(b, sizeof(*b));
++	return error;
++}
++
++/* 0281: ASSOCIATE; answered at once, the outcome comes as APPLE80211_M_ASSOC_DONE */
++static int
++wl_join(const struct apple80211req *r)
++{
++	struct apple80211_assoc *a;
++	uint8_t pmk[32];
++	int error;
++
++	if (r->req_len < offsetof(struct apple80211_assoc, rest) || r->req_data == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	if ((a = kalloc_data(sizeof(*a), Z_WAITOK | Z_ZERO)) == NULL) {
++		return ENOMEM;
++	}
++	if ((error = copyin(r->req_data, a, offsetof(struct apple80211_assoc, rest))) == 0) {
++		/* lengths and kinds only: the name, the access point and the key stay out of the log */
++		printf("SWEET A80211: join asked: a name of %u bytes, %s access point, auth %#x/%#x, a key of %u bytes "
++		    "of kind %u\n", a->ssid_length, (a->bssid[0] | a->bssid[1] | a->bssid[2] | a->bssid[3] | a->bssid[4] |
++		    a->bssid[5]) ? "a given" : "any", a->auth_lower, a->auth_upper, a->key_length, a->key_cipher);
++		lck_mtx_lock(&wl_lock);
++		wl_join_result = 0;
++		lck_mtx_unlock(&wl_lock);
++		wl_leaving = false;
++		if (a->ssid_length == 0 || a->ssid_length > sizeof(a->ssid)) {
++			error = EINVAL;
++		} else if (a->key_length == 0) {
++			error = sweet_wlan_join(a->ssid, a->ssid_length, a->bssid, NULL);
++		} else if (!sweet_wlan_crypto_ok()) {
++			error = EIO;
++		} else if (a->key_cipher == 10 && a->key_length >= 8 && a->key_length <= 63) {
++			sweet_wlan_pmk(a->key, a->key_length, a->ssid, a->ssid_length, pmk);
++			error = sweet_wlan_join(a->ssid, a->ssid_length, a->bssid, pmk);
++		} else if (a->key_cipher == 6 && a->key_length == 32) {
++			error = sweet_wlan_join(a->ssid, a->ssid_length, a->bssid, a->key);
++		} else {
++			error = EINVAL;
++		}
++	}
++	bzero(pmk, sizeof(pmk));
++	bzero(a, sizeof(*a));
++	kfree_data(a, sizeof(*a));
++	return error;
++}
++
+ static int
+ wl_get(struct apple80211req *r)
+ {
+@@ -326,8 +462,8 @@
+ 	case 15:                                /* op mode: station (APPLE80211_M_STA) */
+ 		r->req_val = 1;
+ 		return 0;
+-	case 13:                                /* state: APPLE80211_S_INIT (not associated) */
+-		r->req_val = 0;
++	case 13:                                /* state: INIT 0, AUTH 2 (joining), RUN 4 (0281) */
++		r->req_val = sweet_wlan_station(NULL);
+ 		return 0;
+ 	case 27:
+ 	case 254:
+@@ -348,13 +484,18 @@
+ 		kfree_data(b, sizeof(*b));
+ 		return error;
+ 	}
++	case 21:                                /* 0281: how the last join went (0: not over) */
++		lck_mtx_lock(&wl_lock);
++		r->req_val = (int32_t)wl_join_result;
++		lck_mtx_unlock(&wl_lock);
++		return 0;
+ 	case 1:
+ 	case 2:
+ 	case 4:
+ 	case 9:
+ 	case 16:
+ 	case 103:
+-		return ENXIO;                   /* about a joined network: there is none */
++		return wl_get_joined(r);        /* 0281: ENXIO unless joined */
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -392,10 +533,14 @@
+ 		wl_post(EVENT_POWER_CHANGED, NULL, 0);
+ 		return 0;
+ 	}
+-	case 22:                                /* leave the network: there is none */
++	case 20:                                /* 0281: join (mss>=10; EOPNOTSUPP below) */
++		return wl_join(r);
++	case 22:                                /* leave the network */
++		wl_leaving = true;
++		sweet_wlan_leave();
+ 		return 0;
+ 	default:
+-		return EOPNOTSUPP;              /* ASSOCIATE (20) among them: no join yet */
++		return EOPNOTSUPP;
+ 	}
+ }
+ 
+@@ -420,15 +565,112 @@
+ 
+ /* ---- en0 ---- */
+ 
++/* 0281: a frame from the stack goes to the station's queue (flat, at most 1514 bytes) */
+ static errno_t
+ wl_output(ifnet_t ifp, mbuf_t m)
+ {
+-	wl_dropped++;                           /* no transmit path yet */
+-	ifnet_stat_increment_out(ifp, 0, 0, 1);
++	size_t len = mbuf_pkthdr_len(m);
++	uint8_t *buf = NULL;
++	bool sent = wl_link && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN - ETHER_CRC_LEN &&
++	    (buf = kalloc_data(len, Z_NOWAIT)) != NULL && mbuf_copydata(m, 0, len, buf) == 0 && sweet_wlan_tx(buf, len);
++
++	if (buf != NULL) {
++		kfree_data(buf, len);
++	}
++	if (sent) {
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	} else {
++		wl_dropped++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
+ 	mbuf_freem(m);
+ 	return 0;
+ }
+ 
++/* 0281: an Ethernet frame from the station (the modem thread), as an Ethernet driver hands it up */
++void
++sweet_wlan_input(const uint8_t *frame, size_t length)
++{
++	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
++	unsigned int chunks = 1;
++	mbuf_t pkt = NULL;
++	char *hdr;
++
++	if (wl_ifp == NULL || !wl_link || length < ETHER_HDR_LEN || length > ETHER_MAX_LEN - ETHER_CRC_LEN ||
++	    mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &pkt) != 0) {
++		wl_in_dropped++;
++		return;
++	}
++	if (mbuf_copyback(pkt, 0, length, frame, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(pkt);
++		wl_in_dropped++;
++		return;
++	}
++	hdr = mbuf_data(pkt);
++	mbuf_pkthdr_setrcvif(pkt, wl_ifp);
++	mbuf_pkthdr_setheader(pkt, hdr);
++	mbuf_pkthdr_adjustlen(pkt, -ETHER_HDR_LEN);
++	mbuf_setdata(pkt, hdr + ETHER_HDR_LEN, length - ETHER_HDR_LEN);
++	ifnet_input(wl_ifp, pkt, &stats);
++}
++
++/* 0281: KEV_DL_LINK_ON/OFF, which configd waits for before DHCP (HakiOS net_link_event) */
++static void
++wl_link_event(uint32_t code)
++{
++	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct net_event_data)] = { 0 };
++	struct kern_event_msg *header = (struct kern_event_msg *)message;
++	struct net_event_data *about = (struct net_event_data *)(header + 1);
++
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = code;
++	about->if_family = ifnet_family(wl_ifp);
++	about->if_unit = ifnet_unit(wl_ifp);
++	strlcpy(about->if_name, ifnet_name(wl_ifp), IFNAMSIZ);
++	ifnet_event(wl_ifp, header);
++}
++
++void
++sweet_wlan_join_done(int status)
++{
++	uint32_t result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
++
++	lck_mtx_lock(&wl_lock);
++	wl_join_result = result;
++	lck_mtx_unlock(&wl_lock);
++	printf("SWEET A80211: join over (%d): ASSOCIATE_RESULT %u, ASSOC_DONE posted\n", status, result);
++	wl_post(EVENT_ASSOC_DONE, NULL, 0);
++}
++
++void
++sweet_wlan_link(bool up)
++{
++	struct apple80211_link_changed link = { .down = !up, .involuntary = !up && !wl_leaving,
++		                                .reason = !up && !wl_leaving ? 4 : 0 };
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++
++	if (wl_ifp == NULL) {
++		if (b != NULL) {
++			kfree_data(b, sizeof(*b));
++		}
++		return;
++	}
++	if (b != NULL) {
++		link.rssi = up && sweet_wlan_station(b) == 4 ? b->rssi : 0;
++		kfree_data(b, sizeof(*b));
++	}
++	wl_link = up;
++	wl_link_event(up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
++	wl_post(EVENT_SSID_CHANGED, NULL, 0);
++	wl_post(EVENT_BSSID_CHANGED, NULL, 0);
++	wl_post(EVENT_LINK_CHANGED, &link, sizeof(link));
++	printf("SWEET WLAN: en0 link %s%s (in %llu dropped, out %llu dropped so far)\n", up ? "up" : "down",
++	    !up && !wl_leaving ? " (not asked)" : "", wl_in_dropped, wl_dropped);
++}
++
+ static errno_t
+ wl_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ {
+@@ -453,7 +695,7 @@
+ 
+ 		ifmr->ifm_current = ifmr->ifm_active = media;
+ 		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID;  /* not associated: no IFM_ACTIVE */
++		ifmr->ifm_status = IFM_AVALID | (wl_link ? IFM_ACTIVE : 0);  /* 0281: active when joined */
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+ 			error = copyout(&media, list, sizeof(media));
+ 		}
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -6,6 +6,7 @@
+ #define _SWEET_WLAN_H_
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ #define SWEET_WLAN_IES          512u    /* information elements kept per network (whole elements only) */
+ #define SWEET_WLAN_FRESH_MS     60000u  /* a network not heard for this long is not reported */
+@@ -27,7 +28,18 @@
+ void sweet_wlan_scan_ask(void);                         /* answered by sweet_wlan_scan_done() */
+ const uint16_t *sweet_wlan_freqs(unsigned *n);          /* the channels scanned (MHz), all passive */
+ 
++/* sweet_mss.c, 0281 (mss>=10): the station */
++int sweet_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t bssid[6], const uint8_t *pmk);  /* pmk NULL: open */
++void sweet_wlan_leave(void);
++bool sweet_wlan_tx(const uint8_t *frame, size_t length);        /* an Ethernet frame for the AP */
++int sweet_wlan_station(struct sweet_wlan_bss *out);             /* 0 / 2 joining / 4 joined (+ the network) */
++void sweet_wlan_pmk(const uint8_t *pass, unsigned pass_len, const uint8_t *ssid, unsigned ssid_len, uint8_t pmk[32]);
++bool sweet_wlan_crypto_ok(void);                                /* the self-test, once */
++
+ /* sweet_wlan.c */
++void sweet_wlan_join_done(int status);                          /* 0 or an errno (EAUTH: wrong key) */
++void sweet_wlan_link(bool up);
++void sweet_wlan_input(const uint8_t *frame, size_t length);     /* an Ethernet frame for en0 */
+ extern uint8_t sweet_wlan_mac[6];                       /* en0's address, also the station vdev's */
+ void sweet_wlan_attach(void);                           /* en0 and its IOKit entries, once (mss>=9) */
+ void sweet_wlan_scan_done(void);                        /* posts APPLE80211_M_SCAN_DONE */
