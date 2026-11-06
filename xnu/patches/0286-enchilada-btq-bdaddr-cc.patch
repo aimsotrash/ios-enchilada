@@ -1,0 +1,17 @@
+enchilada: WCN3990 address write waits for a Command Complete
+
+boot50: stage 3 passed (firmware + NVM, HCI_Reset 0, Read_Local_Version HCI 9 manufacturer 29) but stage 4 waited for a vendor event after EDL_WRITE_BD_ADDR (0xfc14) while the chip answered with a Command Complete, status 0 (Linux's WCN399x qca_set_bdaddr expects exactly that).
+
+--- a/bsd/dev/sweet_btq.c
++++ b/bsd/dev/sweet_btq.c
+@@ -1181,7 +1181,9 @@
+ 	if (!sweet_bt_addr(a)) {
+ 		return BQ_STOP("no BD address: btfake=1 and the ADT /arm-io/bluetooth local-mac-address are needed");
+ 	}
+-	if (!bq_cmd(EDL_WRITE_BD_ADDR_OP, a, 6) || bq_wait(0xff, EDL_WRITE_BD_ADDR_OP, ANY_VENDOR_EVENT, ev, 2000) == 0) {
++	/* 0286: the WCN3990 answers 0xfc14 with a Command Complete (boot50: 0e 04 01 14 fc 00), as Linux's
++	 * WCN399x qca_set_bdaddr() expects; the vendor-event wait timed out. */
++	if (!bq_cmd(EDL_WRITE_BD_ADDR_OP, a, 6) || (n = bq_wait(0x0e, EDL_WRITE_BD_ADDR_OP, 0, ev, 2000)) < 6 || ev[5] != 0) {
+ 		return BQ_STOP("EDL_WRITE_BD_ADDR not answered");
+ 	}
+ 	if (!bq_cmd(0x1009, NULL, 0) || (n = bq_wait(0x0e, 0x1009, 0, ev, 2000)) < 12 || ev[5] != 0) {
