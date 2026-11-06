@@ -1,0 +1,83 @@
+enchilada: SwapWait busy for the swap still on the panel (CoreAnimation triple-buffers); scanout slots for backboardd only
+
+QuartzCore (16.7.16) has a fixed ring of 3 swaps (CA::WindowServer::AppleDisplay, [this+0x360] = 3) and reuses a display buffer once IOMobileFramebufferSwapWait(swap, 0x80000000) (selector 6, a poll) returns 0 for its swap (IOMFBDisplay::can_update_). AppleCLCD answered 0 at once, so CA drew into the buffer still on the panel: 2 buffers, and the IOSurface write lock waited ~6 ms for the next TE on about half the frames (boot58, app switching). SwapWait now settles a flip a frame has taken and answers kIOReturnBusy for the swap on the panel (fZcHeld) or with its flip pending (fZcPend), from swap ids kept in zcFlip/zcSettle; every other call stays done, so CA cannot stall. The third buffer needs sweetzc_slots=3, and the scanout pool now only takes backboardd's surfaces (SpringBoard's full-screen snapshots held the third slot).
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -171,6 +171,7 @@
+ 	 */
+ 	SweetSurface *fZcPend;
+ 	uint64_t      fZcPendT;       /* when its flush was written */
++	uint32_t      fZcHeldSwap, fZcPendSwap;     /* 0319: their swap ids, for SwapWait */
+ 	int           fZcAsync;
+ 	uint32_t      fZcStreak;      /* in-place swaps in a row whose surface was write-locked since last shown */
+ 	volatile bool fZcRedraw;      /* an async flip failed: the vsync tick copies the latest frame */
+@@ -1057,6 +1058,15 @@
+ 	    s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->allocSize > size) {
+ 		return 0;
+ 	}
++	/*
++	 * 0319: the slots are for CoreAnimation's display buffers (backboardd); SpringBoard's
++	 * full-screen snapshots took the third one and are never scanned out.
++	 */
++	char who[32];
++	proc_selfname(who, sizeof(who));
++	if (strcmp(who, "backboardd") != 0) {
++		return 0;
++	}
+ 	uint64_t pa = 0;
+ 	IOLockLock(sweet_pool_lock);
+ 	for (uint32_t i = 0; i < sweet_scanout_n && pa == 0; i++) {
+@@ -1439,6 +1449,7 @@
+ 	}
+ 	SweetSurface *old = fZcHeld;
+ 	fZcHeld = fZcPend;
++	fZcHeldSwap = fZcPendSwap;
+ 	fZcPend = NULL;
+ 	OSSafeReleaseNULL(old);
+ 	return NULL;
+@@ -1656,11 +1667,13 @@
+ 	SweetSurface *old = NULL;
+ 	if (async) {
+ 		fZcPend = s;    /* 0255: fZcHeld stays held until a frame takes this flip (zcSettle) */
++		fZcPendSwap = get32(rec, 0x50);
+ 		fZcPendT = t0;
+ 		sweet_fb_stat_zcasync++;
+ 	} else {
+ 		old = fZcHeld;
+ 		fZcHeld = s;    /* keeps sweet_surface_copy's reference until a later frame is latched */
++		fZcHeldSwap = get32(rec, 0x50);
+ 	}
+ 	sweet_fb_stat_zc++;
+ 	static uint32_t told;
+@@ -1859,6 +1872,30 @@
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/*
++		 * 0319: QuartzCore keeps a ring of 3 swaps and reuses a display buffer once SwapWait(swap,
++		 * 0x80000000) says its swap is done (IOMFBDisplay::can_update_, a poll: it never needs to
++		 * block). Answering done at once let CA draw into the buffer still on the panel: only two
++		 * buffers, and the write lock waited ~6 ms for the next TE on half the frames. Busy now for
++		 * the swap on the panel or with its flip pending (a flip a frame has taken is settled
++		 * first): CA allocates a third buffer (needs sweetzc_slots=3). Anything else: done.
++		 */
++		if (args->scalarInputCount >= 2 && args->scalarInput[1] == 0x80000000ull && fFB->fMdpLock != NULL) {
++			uint32_t sid = (uint32_t)args->scalarInput[0];
++			IOLockLock(fFB->fMdpLock);
++			if (fFB->fZcOn && fFB->fZcPend != NULL) {
++				const char *fail = fFB->zcSettle(false);
++				if (fail != NULL) {
++					fFB->zcFail(fail, false);
++				}
++			}
++			if (fFB->fZcOn && ((fFB->fZcHeld != NULL && sid == fFB->fZcHeldSwap) ||
++			    (fFB->fZcPend != NULL && sid == fFB->fZcPendSwap))) {
++				ret = kIOReturnBusy;
++			}
++			IOLockUnlock(fFB->fMdpLock);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
