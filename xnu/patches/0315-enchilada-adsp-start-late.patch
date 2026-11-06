@@ -1,0 +1,80 @@
+enchilada: ADSP stages start 60 s after boot (adspdelay), probe included
+
+boot55 and boot56 panicked ~10 s into boot inside the ADSP stages, before SSH was up; boot56 also skipped the panic flush of the console log (lock busy), so the panic text was lost. Everything, the read-only probe too, now runs in the ADSP thread after adspdelay seconds (default 60, 0 = at once, at most 600), so a crash comes while dmesg can be streamed.
+
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -1486,11 +1486,34 @@
+ 	return ok_at != 0;
+ }
+ 
++/*
++ * 0315: everything, the read-only probe too, runs in this thread after adspdelay seconds (default
++ * 60): boot55/boot56 panicked ~10 s into boot inside these stages, before SSH was up and with the
++ * panic flush of the console log skipped; started late, a crash comes while dmesg can be watched.
++ */
+ static void
+ ad_thread(void *arg, __unused wait_result_t wr)
+ {
+-	int mode = (int)(uintptr_t)arg, reached = 1;
++	int mode = (int)(uintptr_t)arg, reached = 0;
++	unsigned wait_s = 60;
++	char sum[96] = "";
++	const char *err;
+ 
++	(void)PE_parse_boot_argn("adspdelay", &wait_s, sizeof(wait_s));
++	printf("SWEET ADSP: starting in %u s (adsp=%d)\n", wait_s, mode);
++	if (wait_s != 0) {
++		delay((int)MIN(wait_s, 600u) * 1000000);
++	}
++	printf("SWEET ADSP: read-only probe (adsp=%d)\n", mode);
++	if ((err = ad_probe(sum, sizeof(sum))) != NULL) {
++		printf("SWEET ADSP: stage 1: FAILED: %s\n", err);
++		goto out;
++	}
++	printf("SWEET ADSP: stage 1: ok: %s\n", sum);
++	reached = 1;
++	if (mode < 2) {
++		goto out;
++	}
+ 	ad_t0 = mach_absolute_time();
+ 	if (ad_stage2()) {
+ 		reached = 2;
+@@ -1500,6 +1523,7 @@
+ 			reached = 3;
+ 		}
+ 	}
++out:
+ 	printf("SWEET ADSP: done: adsp=%d, last good stage %d%s\n", mode, reached,
+ 	    reached == MIN(mode, 3) ? "" : " (stopped early)");
+ 	(void)thread_terminate(current_thread());
+@@ -1510,7 +1534,6 @@
+ {
+ 	static bool once;
+ 	int mode = 0;
+-	char sum[96] = "";
+ 	thread_t th;
+ 
+ 	if (once || !PE_parse_boot_argn("adsp", &mode, sizeof(mode)) || mode <= 0) {
+@@ -1518,20 +1541,10 @@
+ 	}
+ 	once = true;            /* one attempt per boot */
+ 	ad_mode = mode;
+-	printf("SWEET ADSP: read-only probe (adsp=%d)\n", mode);
+-	const char *err = ad_probe(sum, sizeof(sum));
+-	if (err) {
+-		printf("SWEET ADSP: stage 1: FAILED: %s\n", err);
+-		return;
+-	}
+-	printf("SWEET ADSP: stage 1: ok: %s\n", sum);
+-	if (mode < 2) {
+-		return;
+-	}
+ 	if (kernel_thread_start(ad_thread, (void *)(uintptr_t)mode, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
+-		printf("SWEET ADSP: stage 2: FAILED: no thread\n");
++		printf("SWEET ADSP: FAILED: no thread\n");
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
