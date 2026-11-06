@@ -1,0 +1,137 @@
+enchilada: touch: 400 kHz I2C and the controller read when ATTN says so, looked at every 2 ms
+
+The RMI4 path read the F01 status every 10 ms after the previous read, at 100 kHz: an 88-byte F12
+report is ~820 bits, ~8.2 ms of busy wait, plus ~0.5 ms for the status. While a finger moved that is
+one report per ~19 ms (~50/s) and 10-20 ms from the controller's report to the HID event; idle, 300
+loops took 3.41 s (boot 5x "raw max" lines). A 50 Hz touch stream under a 60 Hz renderer moves the
+content in uneven steps however fast frames are drawn.
+
+- The SE runs at 400 kHz when sweetts=1 (mainline sdm845-oneplus-common.dtsi: i2c12 clock-frequency
+  400000; GENI divider 2, high 5, low 12, cycle 24 from Linux i2c-qcom-geni's 19.2 MHz table). The
+  Goodix/Focaltech path and the bq27541 bus keep 100 kHz.
+- The loop looks at ATTN (gpio125, EAST tile 0x0357d000, active low) every sweetts_poll ms (default
+  2) and reads the status when it is low; every 4th look reads it anyway, so a pin that never moves
+  costs pace, never touch.
+- "SWEET TS: last 10 s: N reports (R/s), status read on A ATTN + B blind looks; ATTN to event avg X us
+  max Y us (+ up to 2 ms until looked at); raw max x= y=" while there are reports (replaces the
+  "raw max" line every 300 loops).
+
+Boot-args sweetts_khz=100 sweetts_poll=10: the old pace.
+
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -55,6 +56,8 @@
+ #define FJ_GPIO_VIO      88u
+ #define FJ_VOTE_MASK     ((1u << 20) | (1u << 21) | (1u << 26))
+ #define TOUCH_MAX        10u
++#define TS_BLIND_POLLS   4u     /* 0312: every 4th look reads the status without ATTN */
++static unsigned ts_poll_ms = 2; /* 0312: boot-arg sweetts_poll */
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+@@ -102,6 +105,7 @@
+ 	vm_offset_t se, gcc, gpio, gpio_s, gpio_e;   /* north, south, east */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
++	bool fast;		/* 0312: 400 kHz SCL instead of 100 */
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -600,8 +604,14 @@
+ 	touch_wr(b->se, 0x24, 0x7f);
+ 	touch_wr(b->se, 0x20, 1);
+ 	touch_wr(b->se, SE_CLK_SEL, 0);
+-	touch_wr(b->se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(b->se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	if (b->fast) {
++		/* 0312: 400 kHz (Linux i2c-qcom-geni, 19.2 MHz source: div 2, high 5, low 12, cycle 24) */
++		touch_wr(b->se, SE_MCLK, (2u << 4) | 1u);
++		touch_wr(b->se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	} else {
++		touch_wr(b->se, SE_MCLK, (7u << 4) | 1u);
++		touch_wr(b->se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	}
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+ 	touch_wr(b->se, 0x254, 0);
+ 	touch_wr(b->se, 0x260, SE_PACK0);
+@@ -809,6 +819,19 @@
+ 
+ 	st.name = "TS";
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	/*
++	 * 0312: the bus at 400 kHz (mainline sdm845-oneplus-common.dtsi: i2c12 clock-frequency 400000)
++	 * and the controller read when ATTN (gpio125, active low) says it has a report, looked at every
++	 * TS_POLL_MS. Before: a 100 kHz bus (88-byte F12 report ~8 ms of busy wait) read every 10 ms
++	 * after the last read, ~50 reports a second at 10-20 ms from finger to event while touching.
++	 * sweetts_khz=100 and sweetts_poll=10 bring the old pace back; every TS_BLIND_POLLS-th look
++	 * reads the status even without ATTN, so a pin that never moves costs speed, not touch.
++	 */
++	unsigned khz = 400;
++	(void)PE_parse_boot_argn("sweetts_khz", &khz, sizeof(khz));
++	(void)PE_parse_boot_argn("sweetts_poll", &ts_poll_ms, sizeof(ts_poll_ms));
++	ts_poll_ms = ts_poll_ms ? ts_poll_ms : 1;
++	st.fast = khz >= 400;
+ 	/* Panel pixels come from the boot video (ADT sweet-fbcon): 1080x2340 on
+ 	 * the 6T, 1080x2280 on the OnePlus 6. The S3320 reports in panel pixels
+ 	 * on the 6T, so the raw range defaults to the panel size; sweetts_xraw and
+@@ -909,8 +932,33 @@
+ 		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+ 	}
+ 	unsigned errors = 0, ticks = 0;
++	uint64_t stat_since = mach_absolute_time(), ten;
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten);
++	struct { unsigned attn, blind, reports; uint64_t abs, max; } ts = {0};
++	printf("SWEET TS: %u kHz, ATTN looked at every %u ms (0312)\n", st.fast ? 400u : 100u, ts_poll_ms);
+ 	while (!st.dead) {
+ 		uint8_t status[2] = {0};
++		uint64_t now = mach_absolute_time();
++		if (now - stat_since >= ten) {
++			if (ts.reports != 0) {
++				uint64_t avg = 0, max = 0;
++				absolutetime_to_nanoseconds(ts.abs / ts.reports, &avg);
++				absolutetime_to_nanoseconds(ts.max, &max);
++				printf("SWEET TS: last 10 s: %u reports (%u/s), status read on %u ATTN + %u blind looks; "
++				    "ATTN to event avg %llu us max %llu us (+ up to %u ms until looked at); raw max x=%d y=%d\n",
++				    ts.reports, ts.reports / 10, ts.attn, ts.blind, avg / 1000, max / 1000, ts_poll_ms,
++				    ts_max_x, ts_max_y);
++			}
++			bzero(&ts, sizeof(ts));
++			stat_since = now;
++		}
++		bool attn = !(touch_rd(st.gpio_e, TOUCH_GPIO_IO(FJ_GPIO_ATTN)) & 1u);
++		if (!attn && (++ticks % TS_BLIND_POLLS) != 0) {
++			touch_wait(ts_poll_ms);
++			continue;
++		}
++		ts.attn += attn;
++		ts.blind += !attn;
+ 		if (rmi_read(f01_data, status, sizeof(status)) != 0) {
+ 			if (++errors == 20) {
+ 				printf("SWEET TS: F01 read keeps failing (irq=%#x)\n", st.irq_status);
+@@ -931,13 +979,14 @@
+ 			if (!rmi_frame()) {
+ 				printf("SWEET TS: F12 report read failed\n");
+ 			}
++			uint64_t dt = mach_absolute_time() - now;
++			ts.reports++;
++			ts.abs += dt;
++			ts.max = dt > ts.max ? dt : ts.max;
+ 		} else if (status[1] & 0x01) {
+ 			touch_report(0, st.x, st.y);
+ 		}
+-		if ((++ticks % 300u) == 0) {
+-			printf("SWEET TS: raw max x=%d y=%d irq=%#x\n", ts_max_x, ts_max_y, status[1]);
+-		}
+-		touch_wait(10);
++		touch_wait(ts_poll_ms);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:

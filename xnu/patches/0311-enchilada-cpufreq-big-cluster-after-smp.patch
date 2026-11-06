@@ -1,0 +1,57 @@
+enchilada: CPU clocks: ask the big cluster for its top state once cpu4-7 are up (it stayed at 825 MHz)
+
+Boot 5x (sweetcpufreq=1): "SWEET CPUFREQ: big enable 0x2 state 0 (825 MHz) of 27" and no "asked for"
+line. SweetPlatformExpert::start() runs sweet_cpu_clocks() while SweetCPU is still bringing the
+secondaries up (the lines interleave with cpu=3/cpu=4 CPU_ON): the big cluster is powered down, its
+OSM reads enable bit 0 clear, and the request is skipped. Nothing asks again, so cpu4-7 ran at their
+lowest state for the whole boot: a CPU-bound zsh loop (400k iterations) took 966-1009 ms whether run
+alone or as 8 copies at once, i.e. the A75s at 825 MHz matched the A55s at 1766 MHz.
+
+SweetCPU's start thread calls sweet_cpu_clocks() again after "N/N CPUs initialized". The function
+is idempotent (only domains whose state differs from the best full-core row are written), so l3 and
+little just log again; big should now log "asked for state 22 (2649 MHz), reads back 22". If it
+still reads "enable 0x2", the OSM is not the one granting the big cluster's clock and the next step
+is the LMh/EPSS registers, not a write here.
+
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -157,6 +157,11 @@
+  * always logs each domain's state and table (read only); boot-arg sweetcpufreq=1 asks for the
+  * fastest state whose core count is the domain's full one (the rows with fewer cores are boost
+  * states the hardware grants only to partly idle clusters), as Linux's cpufreq-hw does at "max".
++ *
++ * 0311: SweetCPU.cpp calls this again once every CPU is up. The first call runs while the big
++ * cluster (cpu4-7) is still powered down, and its OSM then reads "enable 0x2" (bit 0 clear), so it
++ * was left at state 0: boot 5x logged "big enable 0x2 state 0 (825 MHz)" and nothing after, and a
++ * CPU-bound loop took the same ~980 ms on every core, big or little.
+  */
+ #define OSM_ENABLE      0x000
+ #define OSM_LUT         0x110
+@@ -164,7 +169,8 @@
+ #define OSM_LUT_ROWS    40
+ #define OSM_PERF_STATE  0x920
+ 
+-static void
++void sweet_cpu_clocks(void);     /* 0311: also SweetCPU.cpp */
++void
+ sweet_cpu_clocks(void)
+ {
+ 	static const struct {
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++void sweet_cpu_clocks(void);     /* 0311: SweetPlatformExpert.cpp */
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -191,6 +192,7 @@
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized (%s)\n",
+ 	    topology->num_cpus, topology->num_cpus,
+ 	    smp != 0 ? "SGI1 verified" : "SMP disabled");
++	sweet_cpu_clocks();     /* 0311: again, now that the big cluster is powered (SweetPlatformExpert.cpp) */
+ 	thread_terminate(current_thread());
+ }
+ 

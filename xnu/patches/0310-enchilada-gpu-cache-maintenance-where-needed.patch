@@ -1,0 +1,351 @@
+enchilada: GPU: clean and invalidate only what the CPU wrote or will read (~50 MB of dc civac a frame)
+
+Boot 5x (2026-11-05 21:24, CoreAnimation animating at 21 swaps/s, measured over SSH): backboardd's
+render thread had 18.9 s of kernel time for ~4200 frames (~4.5 ms a frame), and eagl.c's "waiting"
+(glFinish) was 5.3 ms of a 6.9 ms frame of 8 draws and 16 triangles (12.5 ms for the 7-19 draw frames
+of a touch). Per frame SUBMIT cleaned every BO and in-place surface it named (the 11 MB display surface
+and Mesa's 12 MB render target, every texture surface), WAIT_FENCE cleaned+invalidated them again,
+and zcFlip settled and cleaned the display surface once more: ~50 MB of cache maintenance a frame.
+
+- SUBMIT cleans an arena BO only if the client mapped it (clientMemoryForType: its stores may be in
+  the cache) or it was never cleaned (the allocator zeroes through a cacheable alias). An in-place
+  surface is cleaned when this import never cleaned it, the client mapped it, its seed moved (a
+  writer unlocked it), or sweetgpuage ms (default 50) have passed: writers that never lock, the
+  fallback HakiOS's hakios.gpu.cpp keeps too. A scanout-pool surface (CoreAnimation's GL display
+  surface: once imported only the GPU draws it) is cleaned once.
+- WAIT_FENCE invalidates only BOs the client mapped; every other CPU reader settles for itself
+  (IOSurface lock, panel copy, CPU_PREP, BO_SYNC), and a BO's first mapping invalidates it.
+- zcFlip of a GPU-imported surface waits for its fence and touches no cache lines
+  (sweet_surface_gpu_wait): the MDP reads memory and the CPU never wrote the surface.
+- IOSurface lock with kIOSurfaceLockAvoidSync (0x2) skips the settle (the scanout write wait stays):
+  eagl.c (ios-op6-gpu gles-ca/eagl-lock-avoidsync.patch) locks each frame's display surface only to
+  move its seed.
+- Fence waits past 2 ms poll every 250 us instead of every 1 ms (the GPU raises no interrupt here).
+- One line every 10 s while submitting: "SWEET GPU: last N ms: S submits; cache maintenance X MB in
+  Y us, Z MB left alone (0310); W fence waits, avg A us, max M us".
+
+Boot-arg sweetgpuflush=1: everything at every SUBMIT, wait, flip and lock as before (also the
+first thing to try if pictures show stale content); sweetgpuage=0: textures cleaned at every SUBMIT.
+
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -38,6 +38,10 @@
+ #include "SweetAdrenoABI.h"
+ #include "SweetSurface.h"
+ 
++uint32_t sweet_surface_seed_value(SweetSurface *s);     /* 0310: SweetSurface.cpp */
++bool sweet_gpu_flush_all(void);                         /* 0310: also SweetFramebuffer.cpp */
++void sweet_surface_gpu_wait(SweetSurface *s);           /* 0310: SweetFramebuffer.cpp */
++
+ extern "C" {
+ /* bsd/dev/sweet_a630.c: the kept-up GPU. Not thread safe; this file holds gAdrenoLock around every call. */
+ bool sweet_gpu_ready(void);
+@@ -108,12 +112,60 @@
+ 	return gBoCache != 0;
+ }
+ 
++/*
++ * 0310: what the cache maintenance and the fence waits cost, one line every 10 s from SUBMIT
++ * ("SWEET GPU: last N ms: ..."). Updated with gAdrenoLock held.
++ */
++static struct {
++	uint64_t since, flushAbs, flushBytes, skipBytes, waitAbs, waitMax;
++	uint32_t submits, waits;
++} gStat;
++
++/*
++ * 0310: cache maintenance only where the CPU can have written or will read. Boot 5x (2026-11-05
++ * 21:24, CoreAnimation animating at 21 swaps/s): backboardd's render thread spent ~4.5 ms of kernel
++ * time a frame, and eagl.c's "waiting" was 5.3 ms of a 6.9 ms frame of 8 draws and 16 triangles.
++ * SUBMIT cleaned every BO and in-place surface it named (the 11 MB display surface and Mesa's 12 MB
++ * render target each time), WAIT_FENCE cleaned and invalidated them again and the flip cleaned the
++ * display surface once more: ~50 MB of dc civac a frame. Now an arena BO is cleaned at SUBMIT only
++ * if the client has mapped it (its stores may be in the cache) or it was never cleaned (the
++ * allocator zeroes through a cacheable alias); after a wait only mapped BOs are invalidated, and a
++ * BO is invalidated when first mapped. An in-place surface is cleaned at SUBMIT when this import
++ * never cleaned it, its seed moved (a writer unlocked it), or SURF_AGE has passed since (writers
++ * that never lock: HakiOS's hakios.gpu.cpp keeps the same fallback); a scanout-pool surface (only
++ * the GPU draws CoreAnimation's display surfaces once imported) is cleaned once. WAIT_FENCE no longer
++ * settles surfaces: whoever reads one with the CPU settles it (IOSurface lock, panel copy,
++ * CPU_PREP, BO_SYNC). Boot-arg sweetgpuflush=1: everything at every SUBMIT and wait, as before;
++ * sweetgpuage=MS: the fallback age (default 50; 0 = every SUBMIT).
++ */
++static int gFlushAll = -1;
++static uint64_t gSurfAgeAbs;
++
++bool
++sweet_gpu_flush_all(void)
++{
++	if (gFlushAll < 0) {
++		uint32_t all = 0, age = 50;
++		(void)PE_parse_boot_argn("sweetgpuflush", &all, sizeof(all));
++		(void)PE_parse_boot_argn("sweetgpuage", &age, sizeof(age));
++		nanoseconds_to_absolutetime((uint64_t)age * NSEC_PER_MSEC, &gSurfAgeAbs);
++		gFlushAll = all != 0;
++		IOLog("SWEET GPU: cache maintenance %s (sweetgpuflush=%u, sweetgpuage=%u ms; 0310)\n",
++		    gFlushAll ? "of every BO and surface at every submit and wait" : "only of what the CPU wrote or will read",
++		    all, age);
++	}
++	return gFlushAll != 0;
++}
++
+ /* Clean+invalidate an arena BO's lines by physical address (dc civac through the linear map). */
+ static void
+ boFlush(uint64_t pa, uint64_t len)
+ {
+ 	if (pa != 0 && len != 0) {
++		uint64_t t0 = mach_absolute_time();
+ 		flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++		gStat.flushAbs += mach_absolute_time() - t0;
++		gStat.flushBytes += len;
+ 	}
+ }
+ 
+@@ -152,7 +204,10 @@
+ static void
+ surfFlush(SweetSurface *s)
+ {
+-	flush_dcache64((addr64_t)s->kernelAddress(), (unsigned)((uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height), FALSE);
++	uint64_t len = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height, t0 = mach_absolute_time();
++	flush_dcache64((addr64_t)s->kernelAddress(), (unsigned)len, FALSE);
++	gStat.flushAbs += mach_absolute_time() - t0;
++	gStat.flushBytes += len;
+ }
+ 
+ /* Lock held: once the submissions that used it are done, drop the CPU's lines of it. */
+@@ -190,6 +245,25 @@
+ 	IOLockUnlock(gAdrenoLock);
+ }
+ 
++/*
++ * 0310: the flip of a display surface the GPU draws: wait (bounded) for the submissions that used
++ * it, without touching the CPU's lines - the MDP reads memory, and only the GPU wrote it.
++ */
++void
++sweet_surface_gpu_wait(SweetSurface *s)
++{
++	if (s == NULL || !s->gpuDirty || gAdrenoLock == NULL) {
++		return;
++	}
++	IOLockLock(gAdrenoLock);
++	for (uint32_t ms = 0; sweet_gpu_ready() && !sweet_gpu_fence_done(s->gpuFence) && ms < SETTLE_PATIENCE_MS; ms++) {
++		IOLockUnlock(gAdrenoLock);
++		IOSleep(1);
++		IOLockLock(gAdrenoLock);
++	}
++	IOLockUnlock(gAdrenoLock);
++}
++
+ static bool
+ adrenoLog(uint32_t *seen)
+ {
+@@ -216,8 +290,51 @@
+ 	bool                      submitted;    /* SET_IOVA is refused after the first submit */
+ 	bool                      gpuDirty;     /* 0197: submitted since the CPU's lines were last dropped */
+ 	bool                      zc;           /* 0220: a cacheable surface used in place (surface->gpuDirty) */
++	bool                      cpuMapped;    /* 0310: mapped into the client: its stores may be in the cache */
++	bool                      cleaned;      /* 0310: cleaned at least once */
++	uint32_t                  cleanSeed;    /* 0310: zc: the surface's seed at the last clean */
++	uint64_t                  cleanAt;      /* 0310: zc: when */
+ };
+ 
++/* 0310 (gAdrenoLock held): whether SUBMIT must clean an in-place surface; notes the clean if so. */
++static bool
++surfNeedsClean(struct sweet_gem *g, uint64_t now)
++{
++	SweetSurface *s = g->surface;
++	uint32_t seed = sweet_surface_seed_value(s);
++	bool need = sweet_gpu_flush_all() || !g->cleaned || g->cpuMapped ||
++	    (s->scanoutPA == 0 && (seed != g->cleanSeed || now - g->cleanAt >= gSurfAgeAbs));
++
++	if (need) {
++		g->cleaned = true;
++		g->cleanSeed = seed;
++		g->cleanAt = now;
++	}
++	return need;
++}
++
++/* 0310: one line every 10 s (gAdrenoLock held). */
++static void
++statSay(void)
++{
++	uint64_t now = mach_absolute_time(), ten, ms, fus, wus, wmax;
++
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten);
++	if (gStat.since == 0 || now - gStat.since < ten) {
++		gStat.since = gStat.since == 0 ? now : gStat.since;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - gStat.since, &ms);
++	absolutetime_to_nanoseconds(gStat.flushAbs, &fus);
++	absolutetime_to_nanoseconds(gStat.waits ? gStat.waitAbs / gStat.waits : 0, &wus);
++	absolutetime_to_nanoseconds(gStat.waitMax, &wmax);
++	IOLog("SWEET GPU: last %llu ms: %u submits; cache maintenance %llu MB in %llu us, %llu MB left alone (0310); "
++	    "%u fence waits, avg %llu us, max %llu us\n", ms / NSEC_PER_MSEC, gStat.submits, gStat.flushBytes >> 20,
++	    fus / 1000, gStat.skipBytes >> 20, gStat.waits, wus / 1000, wmax / 1000);
++	bzero(&gStat, sizeof(gStat));
++	gStat.since = now;
++}
++
+ class SweetAdreno630 : public IOService {
+ 	OSDeclareDefaultStructors(SweetAdreno630);
+ };
+@@ -405,6 +522,9 @@
+ 	for (;;) {
+ 		uint64_t waited = mach_absolute_time() - began;
+ 		if (sweet_gpu_fence_done(fence)) {
++			gStat.waits++;          /* 0310 */
++			gStat.waitAbs += waited;
++			gStat.waitMax = waited > gStat.waitMax ? waited : gStat.waitMax;
+ 			return true;
+ 		}
+ 		if (!sweet_gpu_ready()) {
+@@ -420,11 +540,11 @@
+ 			return false;
+ 		}
+ 		IOLockUnlock(gAdrenoLock);
+-		if (waited < early) {           /* short jobs: spin; longer ones: sleep a millisecond at a time */
+-			delay_for_interval(100, NSEC_PER_USEC);
+-		} else {
+-			IOSleep(1);
+-		}
++		/*
++		 * Short jobs: 100 us steps; longer ones: 250 us (0310: was a millisecond, which a frame's wait
++		 * overran by half of one on average - the GPU raises no interrupt here, see the file's head).
++		 */
++		delay_for_interval(waited < early ? 100 : 250, NSEC_PER_USEC);
+ 		IOLockLock(gAdrenoLock);
+ 	}
+ }
+@@ -831,14 +951,23 @@
+ 		 * mapping we do not own. Before the relocation patch (0197): a dirty client line written back
+ 		 * after it would undo a patch stored through the uncached window.
+ 		 */
++		uint64_t now = mach_absolute_time();
+ 		for (uint32_t i = 0; i < r->nr_bos; i++) {
+-			boFlush(objs[i]->pa, objs[i]->size);
+-			if (objs[i]->zc) {
+-				/* 0220: by its kernel address (no pa). ponytail: every submit, CPU-written or not;
+-				 * track CPU writes (unlock, CPU_FINI) if ~ms per 11 MB surface shows in the frame. */
+-				surfFlush(objs[i]->surface);
++			struct sweet_gem *g = objs[i];
++			if (g->pa != 0 && (g->cpuMapped || !g->cleaned || sweet_gpu_flush_all())) {
++				boFlush(g->pa, g->size);        /* 0310: only what the client can have written */
++				g->cleaned = true;
++			} else if (g->pa != 0) {
++				gStat.skipBytes += g->size;
++			}
++			if (g->zc && surfNeedsClean(g, now)) {
++				surfFlush(g->surface);          /* 0220: by its kernel address (no pa) */
++			} else if (g->zc) {
++				gStat.skipBytes += g->size;
+ 			}
+ 		}
++		gStat.submits++;
++		statSay();
+ 		/* validated: patch, then submit */
+ 		at = 0;
+ 		for (uint32_t i = 0; i < r->nr_cmds; i++) {
+@@ -945,6 +1074,10 @@
+ 		 */
+ 		for (uint32_t i = 0; ret == kIOReturnSuccess && i < GEM_MAX; i++) {
+ 			struct sweet_gem *g = &fGems[i];
++			/* 0310: only BOs the client has mapped; a CPU reader of anything else settles it itself */
++			if (g->md != NULL && !g->cpuMapped && !sweet_gpu_flush_all()) {
++				continue;
++			}
+ 			if (g->md != NULL && g->zc) {
+ 				(void)surfSettle(g->surface);   /* 0220 */
+ 			}
+@@ -1175,6 +1308,17 @@
+ 		 */
+ 		*options = (g->pa != 0 && boCached()) || g->zc ? kIOMapCopybackCache : 0;
+ 		ret = kIOReturnSuccess;
++		if (!g->cpuMapped) {
++			/* 0310: unmapped BOs skipped the invalidate after waits: drop stale lines before the client reads */
++			if (g->pa != 0 && boCached() && g->gpuDirty && (g->lastFence == 0 || sweet_gpu_fence_done(g->lastFence))) {
++				boFlush(g->pa, g->size);
++				g->gpuDirty = false;
++			}
++			if (g->zc) {
++				(void)surfSettle(g->surface);
++			}
++			g->cpuMapped = true;
++		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -70,6 +70,7 @@
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockAvoidSync         0x2     /* 0310 */
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -125,6 +126,15 @@
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++/* 0310 (SweetAdreno.cpp): the seed now, to see whether a writer unlocked the surface since. */
++uint32_t sweet_surface_seed_value(SweetSurface *s);
++bool sweet_gpu_flush_all(void);         /* 0310: SweetAdreno.cpp, boot-arg sweetgpuflush=1 */
++uint32_t
++sweet_surface_seed_value(SweetSurface *s)
++{
++	return *(volatile uint32_t *)sweet_surface_seed(s);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+@@ -1069,7 +1079,14 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	sweet_surface_gpu_settle(s);    /* 0220: a lock waits for the GPU's use of the surface, as on iOS */
++	/*
++	 * 0220: a lock waits for the GPU's use of the surface, as on iOS. 0310: not with
++	 * kIOSurfaceLockAvoidSync ("not going to modify the data ... avoid invalidating caches"):
++	 * eagl.c takes one on every frame's display surface only to move its seed.
++	 */
++	if (!((uintptr_t)options & kIOSurfaceLockAvoidSync) || sweet_gpu_flush_all()) {
++		sweet_surface_gpu_settle(s);
++	}
+ 	if (s->scanoutPA != 0 && !((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+ 		sweet_scanout_lock(s);  /* 0255: ... and a write lock for the display's (no lock held here) */
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,8 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c, 0251 */
+ extern "C" void clean_dcache64(addr64_t addr, unsigned length, boolean_t phys);
++void sweet_surface_gpu_wait(SweetSurface *s);    /* 0310: SweetAdreno.cpp */
++bool sweet_gpu_flush_all(void);                 /* 0310: SweetAdreno.cpp, boot-arg sweetgpuflush=1 */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -1591,8 +1593,17 @@
+ 		return shown;
+ 	}
+ 	pauseConsole();
+-	sweet_surface_gpu_settle(s);    /* 0220: the GPU is done with it */
+-	clean_dcache64((addr64_t)(s->kernelAddress() + s->offset), s->bytesPerRow * fLogicalH, FALSE); /* CPU lines to DRAM */
++	if (s->gpuImports != 0 && !sweet_gpu_flush_all()) {
++		/*
++		 * 0310: drawn by the GPU (imported, and SUBMIT cleaned it once, see SweetAdreno.cpp): wait
++		 * for it, and leave the CPU's lines alone - the MDP reads memory and the CPU never wrote it.
++		 * The settle and clean below were 11 MB of cache maintenance on every flip.
++		 */
++		sweet_surface_gpu_wait(s);
++	} else {
++		sweet_surface_gpu_settle(s);    /* 0220: the GPU is done with it */
++		clean_dcache64((addr64_t)(s->kernelAddress() + s->offset), s->bytesPerRow * fLogicalH, FALSE); /* CPU lines to DRAM */
++	}
+ 	vm_offset_t p = sweet_mdp.base + sweet_sspp[sweet_mdp.pipe].off;
+ 	uint32_t pa = (uint32_t)(s->scanoutPA + s->offset), stride = fZcStride1 | s->bytesPerRow;
+ 	bool first = !fZcOn;
