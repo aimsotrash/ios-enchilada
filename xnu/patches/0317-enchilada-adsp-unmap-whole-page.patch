@@ -1,0 +1,28 @@
+enchilada: ADSP probe unmaps the GCC page it mapped (kmem_free panic ~0 s into stage 1)
+
+io_map() maps whole 16 KiB pages and returns the page start plus the offset of the physical address; GCC_PA + 0x7d000 is 4 KiB into its page, and ml_io_unmap(gcc, 0x1000) handed that unaligned address to kmem_free(), which panicked right after the probe printed the gcc register (boot55, boot56 and boot57 all stopped at that line). The unmap now covers the whole page from trunc_page(). (0313 was not the cause: unmappable io_map()s come from kernel_map, not io_submap.)
+
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -32,6 +32,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <mach/vm_prot.h>
++#include <mach/vm_param.h>
+ #include <mach/mach_time.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -304,7 +305,12 @@
+ 		uint32_t v = *(volatile uint32_t *)(gcc + 0x30);
+ 		printf("SWEET ADSP: gcc hlos1_vote_aggre_noc_mmu_audio_tbu_gdsc +0x7d030 = %#010x (pwr_on %u, "
+ 		    "sw_collapse %u)\n", v, v >> 31, v & 1);
+-		ml_io_unmap(gcc, 0x1000);
++		/*
++		 * 0317: io_map() hands back the page's start plus the offset (0x17d000 is 4 KiB into a
++		 * 16 KiB page) and ml_io_unmap() frees what it is given: give it the whole page. Freeing
++		 * gcc itself panicked in kmem_free right after this line (boot55, boot56, boot57).
++		 */
++		ml_io_unmap(trunc_page(gcc), round_page(0x1000 + (gcc & PAGE_MASK)));
+ 	}
+ 	if (!sm_map(M_HDR, 0, 0x1000, false) || !sm_map(M_PT, pt, 0x1000, false)) {
+ 		return "cannot map smem";
