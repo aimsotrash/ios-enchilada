@@ -1,0 +1,56 @@
+sweet: BT proxy: keep the WCN3990 in legacy LE mode (extended LE commands local, ext/periodic adv features hidden)
+
+boot52 (0287, btfake=1 btreal=4): HCI init now completes ("GetControllerInfo: … BlSt PoweredOn …"),
+then every run ends with
+  Could not start LE scan (leScanParamsLPCoreCb):  STATUS 712
+  Bluetooth error - restarting { build=release, reason=712, context="" }
+712 = OI_HCIERR_COMMAND_DISALLOWED (HCI error 0x0c; bluetoothd status names, 0x1001c6d8c). The last
+command of the session (kernel tail) is the legacy LE_Set_Scan_Parameters (01 0b 20 07 00 e0 …), sent
+to the chip. Earlier in init bluetoothd relays LE_Read_Periodic_Advertiser_List_Size (0x204a; unified
+log "LE_SetPeriodicAdvListSize", boot51 tail 01 4a 20 00 -> 04 0e 05 …, answered by the chip). Core 5
+Vol 4 Part E 3.1.1: once the Host has issued any extended advertising/scanning/periodic command
+(0x2035..0x204a, the read-only size/count queries included), the controller answers legacy LE
+advertising and scanning commands with Command Disallowed. The Broadcom-tuned stack mixes them.
+
+- 0x2035..0x204a are answered by the fake controller (canned 0x203a 1650, 0x203b 16 sets, 0x204a 8,
+  status 0 for the rest) and never reach the chip, which therefore stays in legacy mode
+- the chip's LE_Read_Local_Supported_Features reply loses bits 12 (LE Extended Advertising) and 13
+  (LE Periodic Advertising), so bluetoothd chooses the legacy commands that do reach the chip
+
+--- a/bsd/dev/sweet_bt.c	2026-11-05 21:06:23.621171191 -0800
++++ b/bsd/dev/sweet_bt.c	2026-11-05 21:06:37.853316132 -0800
+@@ -319,6 +319,17 @@
+ 			q[7 + 18] |= 0x08;
+ 			p = q;
+ 		}
++		/*
++		 * 0288: LE_Read_Local_Supported_Features: hide LE Extended Advertising and LE
++		 * Periodic Advertising (bits 12, 13) so bluetoothd stays on legacy commands, the
++		 * only ones that reach the chip (above).
++		 */
++		if (p[0] == 0x04 && n >= 7 + 8 && n <= sizeof(q) && p[1] == 0x0e && p[4] == 0x03 &&
++		    p[5] == 0x20 && p[6] == 0x00) {
++			memcpy(q, p, n);
++			q[7 + 1] &= (uint8_t)~0x30;
++			p = q;
++		}
+ 		bt_owner->relay = true;
+ 		bt_tx(bt_owner, (uint8_t *)(uintptr_t)p, n);
+ 		bt_owner->relay = false;
+@@ -371,7 +382,15 @@
+ 			u->rx++;
+ 			u->hush = op == 0xfc4c;         /* firmware Write_RAM: ~840 per boot script, counted */
+ 			u->wram += u->hush;
+-			u->relay = u->proxy && op != 0x1001 && op != 0x1009 && (op >> 10) != 0x3f;
++			/*
++			 * 0288: LE extended advertising/scanning/periodic commands (0x2035..0x204a) stay
++			 * local too. Any of them, even LE_Read_Periodic_Advertiser_List_Size, puts a
++			 * Core 5 controller into extended mode, after which it answers every legacy LE
++			 * advertising/scanning command with Command Disallowed (Vol 4 Part E 3.1.1);
++			 * bluetoothd scans with the legacy LE_Set_Scan_Parameters.
++			 */
++			u->relay = u->proxy && op != 0x1001 && op != 0x1009 && (op >> 10) != 0x3f &&
++			    !(op >= 0x2035 && op <= 0x204a);
+ 			bt_hex(u, "rx", u->pkt, u->have);
+ 			if (u->relay) {
+ 				bt_relay(u);
