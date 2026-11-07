@@ -1,0 +1,24 @@
+enchilada: log what CoreAnimation passes to SwapWait (first 12 calls, then every 2000th)
+
+boot64 still allocated only two display surfaces under 0319. Whether CA polls with flags 0x80000000 (the only value 0319 answers busy for) and with which swap ids is not visible; this logs the first 12 calls and every 2000th with the swap id, flags, the held/pending swap ids, the answer, and how many were busy.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2312,6 +2312,17 @@
+ 			}
+ 			IOLockUnlock(fFB->fMdpLock);
+ 		}
++		{
++			/* 0333: what CoreAnimation asks (boot64 kept 2 buffers): first calls, then every 2000th */
++			static uint32_t calls, busy;
++			calls++;
++			busy += ret == kIOReturnBusy;
++			if (calls <= 12 || calls % 2000 == 0) {
++				IOLog("SWEET FB: SwapWait #%u swap %llu flags %#llx (held %u pend %u) -> %#x; %u busy so far\n", calls,
++				    args->scalarInputCount > 0 ? args->scalarInput[0] : 0ULL,
++				    args->scalarInputCount > 1 ? args->scalarInput[1] : 0ULL, fFB->fZcHeldSwap, fFB->fZcPendSwap, ret, busy);
++			}
++		}
+ 		break;
+ 	default:
+ 		break;
