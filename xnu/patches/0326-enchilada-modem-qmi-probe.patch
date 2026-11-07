@@ -1,0 +1,315 @@
+enchilada: MSS: read-only QMI probe of DMS, UIM and NAS (qmiprobe=1 with mss>=7; cellular round 1)
+
+logs/cellular/plan.md milestone 1 (SIM read). boot38 (mss=7) showed the modem announcing DMS 0x02, NAS 0x03, UIM 0x0b, WMS 0x05, VOICE 0x09 v2, WDS 0x01, WDA 0x1a and ~40 others once rmtfs/TFTP/pd-mapper are served. With boot-arg qmiprobe=1 (and mss>=7, else idle), a QMI client on apps port 0x4005 waits until DMS, UIM and NAS have all been announced (NEW_SERVER, forgotten on DEL_SERVER), then 5 s later asks, one request at a time (3 s timeout each, as qmicli would), only "get" messages with no TLVs: DMS 0x23 revision, 0x25 serial numbers (IMEI logged as its TAC + '*'), 0x2d operating mode (+ offline reason, hardware restricted), 0x3c ICCID (6 chars kept), 0x43 IMSI (MCC+MNC kept); UIM 0x2f card status (per slot card state, UPIN, error code; per application type, state, perso, PIN1/PUK1 retries; AIDs not logged); NAS 0x24 serving system (registration, CS/PS attach, radio, PLMN) and 0x4f signal info (GSM/WCDMA/LTE/NR). The pass runs again 60 s later (the card may still be initializing at the first) and a summary line closes the watch. Replies are matched by node, port, transaction and message id; every length is bounded by the QMI header and TLV lengths (qmi_tlv). Nothing is set: the modem stays in the operating mode it booted in (no DMS SET_OPERATING_MODE, so no RF), no UIM slot switch or provisioning session, no NAS register/selection, no indication registration, and rmtfs keeps dropping every EFS write; no partition is written. Over QRTR each port is a QMI client, so no QMI CTL client-id allocation is needed. Without qmiprobe, or with mss<=6, behaviour is unchanged.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -49,6 +49,9 @@
+  * 0268:
+  *   9  + en0 and its IOKit entries (sweet_wlan.c, SweetWLAN.cpp) so wifid can list what the scans
+  *        heard (SCAN_REQ/SCAN_RESULT); the watch stays open while the WLAN path is alive
++ * 0326: boot-arg qmiprobe=1 with mss>=7: a read-only QMI client asks DMS, UIM and NAS "get"
++ *        questions only (revision, IMEI/ICCID/IMSI masked, operating mode, card status, serving
++ *        system, signal); nothing is set, the modem stays in the mode it booted in
+  * 0300: sweet_adsp.c (boot-arg adsp=N) shares three things with this file, from its own thread:
+  *   mss_scm() (stateless), sweet_mss_qmp() (the one AOSS QMP mailbox, opened once, under a lock)
+  *   and sweet_mss_smem_lock() (TCSR mutex 3 holds one value per processor, so two apps threads
+@@ -2666,6 +2669,253 @@
+ 	qm_send(PORT_RMTFS, node, port);
+ }
+ 
++/*
++ * 0326: read-only QMI probe (boot-arg qmiprobe=1, needs mss>=7: without rmtfs/TFTP the modem
++ * offers none of these services). Once the modem has announced DMS (0x02), UIM (0x0b) and NAS
++ * (0x03), a client on our port 0x4005 asks them, one at a time as qmicli would, only questions:
++ * every request is a bare 7-byte header (no TLVs) with a "get" message id from qp_req[]. Nothing
++ * is set: no operating mode change (the modem stays offline/low power as it boots), no slot
++ * switch, no provisioning session, no registration, no indication registration, and rmtfs still
++ * drops every EFS write. One pass 5 s after the last of the three appears and one 60 s later (the
++ * card may still be initializing at the first). IMEI, ICCID and IMSI are logged masked.
++ */
++#define PORT_QMIP               0x4005u
++#define QP_TIMEOUT_MS           3000u
++#define QP_ALL                  (1u << 0x02 | 1u << 0x03 | 1u << 0x0b)
++
++static const struct { uint8_t svc; uint16_t msg; const char *name; } qp_req[] = {
++	{ 0x02, 0x23, "dms get revision" },
++	{ 0x02, 0x25, "dms get serial numbers" },
++	{ 0x02, 0x2d, "dms get operating mode" },
++	{ 0x02, 0x3c, "dms uim get iccid" },
++	{ 0x02, 0x43, "dms uim get imsi" },
++	{ 0x0b, 0x2f, "uim get card status" },
++	{ 0x03, 0x24, "nas get serving system" },
++	{ 0x03, 0x4f, "nas get signal info" },
++};
++#define QP_N                    (sizeof(qp_req) / sizeof(qp_req[0]))
++
++static struct {
++	int on;                                 /* -1: boot-arg not read yet */
++	uint32_t seen, node[0x0c], port[0x0c];  /* by service id (2, 3, 0xb) */
++	unsigned next, pass, start_at, sent_at, answers, errors;
++	uint16_t txn;
++	bool pending;
++} qp = { .on = -1 };
++
++/* NEW_SERVER / DEL_SERVER of one of the three services */
++static void
++qp_server(uint32_t svc, uint32_t node, uint32_t port, bool up)
++{
++	if (svc != 0x02 && svc != 0x03 && svc != 0x0b) {
++		return;
++	}
++	qp.node[svc] = node;
++	qp.port[svc] = port;
++	qp.seen = up ? qp.seen | 1u << svc : qp.seen & ~(1u << svc);
++}
++
++static void
++qp_masked(const char *what, const uint8_t *d, uint32_t len, uint8_t type, size_t keep)
++{
++	char s[40];
++
++	qmi_str(d, len, type, s, sizeof(s));
++	size_t n = strlen(s);
++	for (size_t i = keep; i < n; i++) {
++		s[i] = '*';
++	}
++	printf("SWEET QMIP: %s %s (%lu chars)\n", what, n ? s : "absent", (unsigned long)n);
++}
++
++static void
++qp_card(const uint8_t *d, uint32_t len)
++{
++	uint16_t l;
++	const uint8_t *v = qmi_tlv(d, len, 0x10, &l);
++
++	if (!v || l < 9) {
++		printf("SWEET QMIP: uim: no card status TLV\n");
++		return;
++	}
++	/* libqmi "Card Status": 4 u16 session indices (high byte slot, low byte app; 0xffff none), slots */
++	printf("SWEET QMIP: uim: primary GW session slot %u app %u (0xff: none), %u slots\n", v[1], v[0], v[8]);
++	uint32_t o = 9;
++	for (unsigned s = 0; s < v[8] && o + 6 <= l; s++) {
++		const uint8_t *c = v + o;
++		printf("SWEET QMIP: uim: slot %u card %u (0 absent, 1 present, 2 error), upin state %u, error code %u, "
++		    "%u applications\n", s + 1, c[0], c[1], c[4], c[5]);
++		o += 6;
++		for (unsigned a = 0; a < c[5] && o + 7 <= l; a++) {
++			const uint8_t *p = v + o, *q = p + 7 + p[6];
++			if (o + 7u + p[6] + 7u > l) {
++				o = l;
++				break;
++			}
++			printf("SWEET QMIP: uim:   app %u type %u (1 sim, 2 usim, 3 ruim, 4 csim, 5 isim), state %u "
++			    "(1 detected, 2 pin1, 3 puk1, 4 perso, 5 blocked, 7 ready), perso %u, pin1 state %u retries %u, "
++			    "puk1 retries %u\n", a + 1, p[0], p[1], p[2], q[1], q[2], q[3]);
++			o += 7u + p[6] + 7u;
++		}
++	}
++}
++
++static void
++qp_show(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	static const char *const modes[] = { "online", "low power", "factory test", "offline", "resetting",
++		                             "shutting down", "persistent low power", "mode-only low power" };
++	char s[128];
++	uint16_t l;
++	const uint8_t *v;
++
++	switch (msg) {
++	case 0x23:
++		qmi_str(d, len, 1, s, sizeof(s));
++		printf("SWEET QMIP: dms: revision %s\n", s);
++		break;
++	case 0x25:
++		qp_masked("dms: imei", d, len, 0x11, 8);        /* the TAC (model) only */
++		printf("SWEET QMIP: dms: esn %s, meid %s\n", qmi_tlv(d, len, 0x10, &l) ? "present" : "absent",
++		    qmi_tlv(d, len, 0x12, &l) ? "present" : "absent");
++		break;
++	case 0x2d:
++		if ((v = qmi_tlv(d, len, 1, &l)) && l >= 1) {
++			printf("SWEET QMIP: dms: operating mode %u (%s)\n", v[0], v[0] < 8 ? modes[v[0]] : "?");
++		}
++		if ((v = qmi_tlv(d, len, 0x10, &l)) && l >= 2) {
++			printf("SWEET QMIP: dms: offline reason %#x\n", v[0] | v[1] << 8);
++		}
++		if ((v = qmi_tlv(d, len, 0x11, &l)) && l >= 1) {
++			printf("SWEET QMIP: dms: hardware restricted %u\n", v[0]);
++		}
++		break;
++	case 0x3c:
++		qp_masked("dms: iccid", d, len, 1, 6);          /* 89 + country + issuer prefix */
++		break;
++	case 0x43:
++		qp_masked("dms: imsi", d, len, 1, 5);           /* MCC + MNC */
++		break;
++	case 0x2f:
++		qp_card(d, len);
++		break;
++	case 0x24:
++		if ((v = qmi_tlv(d, len, 1, &l)) && l >= 5) {
++			printf("SWEET QMIP: nas: registration %u (0 not, 1 registered, 2 searching, 3 denied, 4 unknown), "
++			    "cs %u ps %u, network %u, %u radios, first %u (4 gsm, 5 umts, 8 lte, 12 nr)\n", v[0], v[1],
++			    v[2], v[3], v[4], v[4] && l > 5 ? v[5] : 0);
++		}
++		if ((v = qmi_tlv(d, len, 0x10, &l)) && l >= 5) {
++			printf("SWEET QMIP: nas: plmn %u-%u \"%.*s\"\n", v[0] | v[1] << 8, v[2] | v[3] << 8,
++			    (int)MIN((uint32_t)v[4], (uint32_t)l - 5), (const char *)v + 5);
++		}
++		break;
++	case 0x4f:
++		if ((v = qmi_tlv(d, len, 0x12, &l)) && l >= 1) {
++			printf("SWEET QMIP: nas: gsm rssi %d dBm\n", (int8_t)v[0]);
++		}
++		if ((v = qmi_tlv(d, len, 0x13, &l)) && l >= 3) {
++			printf("SWEET QMIP: nas: wcdma rssi %d dBm ecio %d\n", (int8_t)v[0], (int16_t)(v[1] | v[2] << 8));
++		}
++		if ((v = qmi_tlv(d, len, 0x14, &l)) && l >= 6) {
++			printf("SWEET QMIP: nas: lte rssi %d rsrq %d rsrp %d dBm snr %d\n", (int8_t)v[0], (int8_t)v[1],
++			    (int16_t)(v[2] | v[3] << 8), (int16_t)(v[4] | v[5] << 8));
++		}
++		if ((v = qmi_tlv(d, len, 0x17, &l)) && l >= 4) {
++			printf("SWEET QMIP: nas: nr rsrp %d snr %d\n", (int16_t)(v[0] | v[1] << 8), (int16_t)(v[2] | v[3] << 8));
++		}
++		printf("SWEET QMIP: nas: signal info answered (%u bytes)\n", len);
++		break;
++	}
++}
++
++static void
++qp_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	uint16_t l;
++
++	if (len < 7 || d[0] != 2 || !qp.pending || qp.next >= QP_N) {
++		printf("SWEET QMIP: unexpected %u bytes from %u:%#x (type %u)\n", len, node, port, len ? d[0] : 0);
++		return;
++	}
++	unsigned i = qp.next;
++	uint16_t txn = (uint16_t)(d[1] | d[2] << 8), msg = (uint16_t)(d[3] | d[4] << 8);
++	if (txn != qp.txn || msg != qp_req[i].msg || node != qp.node[qp_req[i].svc] || port != qp.port[qp_req[i].svc]) {
++		printf("SWEET QMIP: stray answer txn %u msg %#x from %u:%#x\n", txn, msg, node, port);
++		return;
++	}
++	qp.pending = false;
++	qp.next++;
++	const uint8_t *r = qmi_tlv(d, len, 2, &l);
++	uint16_t res = r && l >= 4 ? (uint16_t)(r[0] | r[1] << 8) : 0xffff;
++	uint16_t err = r && l >= 4 ? (uint16_t)(r[2] | r[3] << 8) : 0xffff;
++	if (res != 0) {
++		qp.errors++;
++		printf("SWEET QMIP: t=+%u ms %s: QMI error %u (libqmi QmiProtocolError)\n", mss_now(), qp_req[i].name, err);
++		return;
++	}
++	qp.answers++;
++	printf("SWEET QMIP: t=+%u ms %s: ok\n", mss_now(), qp_req[i].name);
++	qp_show(msg, d, len);
++}
++
++/* from the stage-6 watch, every pass */
++static void
++qp_poll(unsigned t)
++{
++	if (qp.on < 0) {
++		int v = 0;
++		qp.on = PE_parse_boot_argn("qmiprobe", &v, sizeof(v)) && v > 0;
++		if (qp.on) {
++			printf("SWEET QMIP: read-only QMI probe on (%s)\n", mss_mode >= 7 ? "waiting for dms, uim, nas" :
++			    "needs mss>=7: idle");
++		}
++	}
++	if (!qp.on || !svc_on || qp.pass >= 2) {
++		return;
++	}
++	if (qp.pending) {
++		if ((int)(t - qp.sent_at) <= (int)QP_TIMEOUT_MS) {
++			return;
++		}
++		printf("SWEET QMIP: %s: no answer in %u ms\n", qp_req[qp.next].name, QP_TIMEOUT_MS);
++		qp.pending = false;
++		qp.errors++;
++		qp.next++;
++	}
++	if (!qp.start_at) {
++		if ((qp.seen & QP_ALL) == QP_ALL) {
++			qp.start_at = t + 5000;
++		}
++		return;
++	}
++	if (t < qp.start_at) {
++		return;
++	}
++	if (qp.next >= QP_N) {
++		printf("SWEET QMIP: t=+%u ms pass %u done: %u answers, %u errors\n", t, qp.pass + 1, qp.answers, qp.errors);
++		qp.pass++;
++		qp.next = 0;
++		qp.start_at = t + 60000;
++		return;
++	}
++	unsigned svc = qp_req[qp.next].svc;
++	uint16_t msg = qp_req[qp.next].msg;
++	if (!(qp.seen & 1u << svc)) {
++		printf("SWEET QMIP: %s: service %#x gone, skipped\n", qp_req[qp.next].name, svc);
++		qp.next++;
++		return;
++	}
++	qp.txn = (uint16_t)(qp.txn + 1);
++	if (!qp.txn) {
++		qp.txn = 1;
++	}
++	uint8_t r[7] = { 0, (uint8_t)qp.txn, (uint8_t)(qp.txn >> 8), (uint8_t)msg, (uint8_t)(msg >> 8), 0, 0 };
++	qp.pending = true;
++	qp.sent_at = t;
++	qrtr_send(Q_DATA, PORT_QMIP, qp.node[svc], qp.port[svc], r, sizeof(r));
++}
++
+ /* DATA for one of our ports; false = not ours */
+ static bool
+ svc_rx(uint32_t snode, uint32_t sport, uint32_t dport, const uint8_t *d, uint32_t len)
+@@ -2677,6 +2927,10 @@
+ 		wlfw_rx(d, len);
+ 		return true;
+ 	}
++	if (dport == PORT_QMIP) {               /* 0326 */
++		qp_rx(snode, sport, d, len);
++		return true;
++	}
+ 	if (dport == PORT_TFTP) {
+ 		if (len >= 2 && d[0] == 0 && (d[1] == 1 || d[1] == 2)) {
+ 			tftp_request(snode, sport, d, len);
+@@ -5623,6 +5877,7 @@
+ 		if (c[1] == 0x45 && (c[2] & 0xff) == 1) {
+ 			wlfw_arrive(c[3], c[4]);        /* 0266: WLFW v1 (stage 8 only) */
+ 		}
++		qp_server(c[1], c[3], c[4], true);      /* 0326 */
+ 		break;
+ 	case Q_DEL_SERVER:
+ 		printf("SWEET QRTR: t=+%u ms DEL_SERVER service %#x instance %#x node %u port %#x\n", mss_now(),
+@@ -5630,6 +5885,7 @@
+ 		if (c[1] == 0x45) {
+ 			wlfw_gone(c[3], c[4]);          /* 0266 */
+ 		}
++		qp_server(c[1], c[3], c[4], false);     /* 0326 */
+ 		break;
+ 	case Q_BYE:
+ 		printf("SWEET QRTR: t=+%u ms BYE from node %u\n", mss_now(), snode);
+@@ -5962,6 +6218,7 @@
+ 			mss_ipa_poll();
+ 		}
+ 		glink_poll(t);
++		qp_poll(t);                     /* 0326 */
+ 		(void)wlfw_poll(t, false);
+ 		wn_poll(t);                     /* 0267 */
+ 		if (wl.mission && mss_reached == 7) {
+@@ -5987,6 +6244,9 @@
+ 	if (svc_on) {
+ 		svc_summary();
+ 	}
++	if (qp.on > 0) {
++		printf("SWEET QMIP: summary: %u passes, %u answers, %u errors\n", qp.pass, qp.answers, qp.errors);
++	}
+ 	if (mss_mode >= 8) {
+ 		wlfw_summary();
+ 	}
