@@ -1,0 +1,44 @@
+enchilada: 0322 fixes: DSI command buffer at a fixed low page, no ml_io_unmap of ml_io_map maps (boot63 panic)
+
+boot63 panicked ~10 s in right after "SWEET BL: skipped: no command buffer below 4 GiB": XNU's RAM starts at 4 GiB on this port, so IOBufferMemoryDescriptor below 4 GiB always fails, and the failure path then ml_io_unmap()ed the DSI registers, which ml_io_map() had mapped permanently in io_submap (ml_io_unmap frees from kernel_map: panic). The command buffer is now the fixed page 0xa1a00000 (the low bank the port already uses for device buffers, after WLAN DMA 0xa1100000-0xa1900000) mapped as device memory, and the DSI map is never unmapped.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1834,16 +1834,19 @@
+ 	if (ver != SWEET_DSI_V2_2_1 || (ctrl & (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) !=
+ 	    (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) {
+ 		IOLog("SWEET BL: skipped: DSI0 is not a v2.2.1 controller left enabled in command mode\n");
+-		ml_io_unmap(map, SWEET_DSI_MAP);
+-		return false;
++		return false;   /* 0331: ml_io_map() maps are permanent (io_submap): ml_io_unmap() panicked */
+ 	}
+-	sweet_bl.buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionOut | kIOMemoryPhysicallyContiguous, 4096, 0x00000000fffff000ULL);
+-	uint64_t pa = sweet_bl.buf != NULL ? sweet_bl.buf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-	if (pa == 0 || pa >= (1ULL << 32) || sweet_bl.buf->getBytesNoCopy() == NULL) {
+-		IOLog("SWEET BL: skipped: no command buffer below 4 GiB\n");
+-		OSSafeReleaseNULL(sweet_bl.buf);
+-		ml_io_unmap(map, SWEET_DSI_MAP);
++	/*
++	 * 0331: XNU's RAM starts at 4 GiB on this port, so no buffer below 4 GiB can be allocated
++	 * (boot63: "no command buffer below 4 GiB", then the ml_io_unmap() below it panicked, ml_io_map()
++	 * maps being permanent). The buffer is a fixed page of the low bank the port already uses for
++	 * device buffers (MSS SCR 0xa1000000, ADSP metadata 0xa1090000, WLAN DMA 0xa1100000-0xa1900000),
++	 * mapped as device memory: the CPU's stores reach DRAM before the DMA trigger (dsb).
++	 */
++	const uint64_t pa = 0xa1a00000ULL;
++	vm_offset_t bufva = ml_io_map((vm_offset_t)pa, 0x4000);
++	if (bufva == 0) {
++		IOLog("SWEET BL: skipped: cannot map the command buffer at 0x%llx\n", pa);
+ 		return false;
+ 	}
+ 	/* dsi_host.c dsi_ctrl_enable: DMA triggered by software, held off while a frame is sent (v1.2+) */
+@@ -1853,7 +1856,7 @@
+ 		IOLog("SWEET BL: DSI0 trig ctrl 0x%08x -> 0x%08x (software DMA trigger, blocked within a frame)\n",
+ 		    trig, want);
+ 	}
+-	sweet_bl.va = (uint8_t *)sweet_bl.buf->getBytesNoCopy();
++	sweet_bl.va = (uint8_t *)bufva;
+ 	sweet_bl.pa = (uint32_t)pa;
+ 	sweet_bl.height = height;
+ 	sweet_bl.map = map;
