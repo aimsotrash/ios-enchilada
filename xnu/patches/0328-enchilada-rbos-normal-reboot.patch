@@ -1,0 +1,55 @@
+enchilada: rbos=1, restart and panic restart boot the OS again (untethered image)
+
+The tethered images reset to fastboot on restart and panic (0200/0254): right for development, wrong for an image flashed to a boot slot. With rbos=1 a restart, and a panic after pfb seconds on its screen (pfb=0 keeps the screen), reset without marking the PON spare (PSCI SYSTEM_RESET, PS_HOLD fallback), so ABL boots the active slot again. Without rbos nothing changes.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -165,6 +165,7 @@
+ 
+ static vm_offset_t rb_chan, rb_obs, rb_imem;
+ static uint32_t rb_on = 1, rb_panic_s = 60;
++static uint32_t rb_os;          /* 0328: rbos=1, restarts boot the OS again (flashed image) */
+ static int rb_panicking;
+ /*
+  * 0254: rb_marked: the spare register read back as bootloader (restart or panic path), so a
+@@ -273,6 +274,7 @@
+ 
+ 	(void)PE_parse_boot_argn("rbfb", &rb_on, sizeof(rb_on));
+ 	(void)PE_parse_boot_argn("pfb", &rb_panic_s, sizeof(rb_panic_s));
++	(void)PE_parse_boot_argn("rbos", &rb_os, sizeof(rb_os));
+ 	rb_imem = ml_io_map(RB_IMEM_PA, 0x1000);
+ 	if (rb_imem) {
+ 		imem = *(volatile uint32_t *)(rb_imem + RB_IMEM_REASON);
+@@ -330,6 +332,32 @@
+ 	uint8_t spare = 0, back = 0;
+ 	uint32_t imem = 0;
+ 
++	/*
++	 * 0328: rbos=1 (the image flashed to a boot slot, no PC): a restart, and a panic after pfb
++	 * seconds on its screen, reset without marking the PON spare, so ABL boots the active slot
++	 * (this OS) again instead of stopping in fastboot. PSCI SYSTEM_RESET, PS_HOLD as fallback.
++	 */
++	if (rb_os) {
++		if (panic) {
++			if (__atomic_exchange_n(&rb_panicking, 1, __ATOMIC_SEQ_CST) || rb_panic_s == 0) {
++				return -1;
++			}
++			(void)ml_set_interrupts_enabled(FALSE);
++			printf("SWEET RB: panic -> reboot in %u s (rbos=1)\n", rb_panic_s);
++			for (uint32_t s = 0; s < rb_panic_s; s++) {
++				delay(1000 * 1000);
++			}
++		} else {
++			if (__atomic_exchange_n(&rb_restarting, 1, __ATOMIC_SEQ_CST)) {
++				return -1;
++			}
++			printf("SWEET RB: restart -> normal boot (rbos=1)\n");
++			delay(100 * 1000);
++		}
++		rb_reset(panic);
++		return -1;
++	}
++
+ 	if (panic) {
+ 		if (__atomic_exchange_n(&rb_panicking, 1, __ATOMIC_SEQ_CST) || rb_chan == 0 || rb_panic_s == 0) {
+ 			return -1;
