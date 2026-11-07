@@ -1,0 +1,100 @@
+enchilada: GPU clock to 342 MHz while the display is off (gpulow=0 keeps it)
+
+With gpuhold=1 the GPU ran at its boot level (675 MHz) for the whole boot. On display off (RequestPowerChange, after 0322 puts the panel to sleep) SweetFramebuffer asks SweetAdreno, under gAdrenoLock, to drop the GMU DCVS level to perf index 2 (342 MHz; gpu_dcvs_set() takes no lower), and back to the boot level before the panel wakes. A failed OOB leaves the clock where it was (logged by gpu_dcvs_set).
+
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3273,6 +3273,35 @@
+ 	    ok ? "acked" : "TIMED OUT", ret, info);
+ }
+ 
++/*
++ * 0330: display off/on (SweetAdreno.cpp, gAdrenoLock held). The GPU stayed at its boot level
++ * (675 MHz) for the whole boot (gpuhold=1); with the panel off CoreAnimation hardly draws, so
++ * it drops to perf index 2 (342 MHz, the lowest level gpu_dcvs_set() takes) and goes back to
++ * the boot level when the display comes on. Boot-arg gpulow=0: never lowered.
++ */
++void sweet_gpu_display_power(bool on);
++void
++sweet_gpu_display_power(bool on)
++{
++	static int boot_level = -1, enabled = -1;
++
++	if (enabled < 0) {
++		enabled = 1;
++		(void)PE_parse_boot_argn("gpulow", &enabled, sizeof(enabled));
++	}
++	if (!enabled || hfi_gmu == 0 || gpu_dcvs_level < 2) {
++		return;
++	}
++	if (boot_level < 0) {
++		boot_level = gpu_dcvs_level;
++	}
++	int want = on ? boot_level : 2;
++	if (want != gpu_dcvs_level) {
++		gpu_dcvs_level = want;
++		gpu_dcvs_set(hfi_gmu);
++	}
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -58,6 +58,7 @@
+ bool sweet_gpu_fence_done(uint32_t fence);
+ uint32_t sweet_gpu_fence_last(void);
+ void sweet_gpu_mark_lost(void);
++void sweet_gpu_display_power(bool on);                                          /* 0330 */
+ void sweet_gpu_report(const char *why);
+ bool     sweet_gpu_alloc_pages(uint64_t size, uint64_t *pa, void **kva);
+ void     sweet_gpu_free_pages(uint64_t pa, uint64_t size);
+@@ -80,6 +81,21 @@
+ static IOLock *gAdrenoLock;
+ static uint32_t gAdrenoClients;
+ 
++/* 0330: SweetFramebuffer's display off/on: the GPU clock down/up, under the GPU lock. */
++extern "C" void sweet_adreno_display_power(bool on);
++extern "C" void
++sweet_adreno_display_power(bool on)
++{
++	if (gAdrenoLock == NULL) {
++		return;
++	}
++	IOLockLock(gAdrenoLock);
++	if (sweet_gpu_ready()) {
++		sweet_gpu_display_power(on);
++	}
++	IOLockUnlock(gAdrenoLock);
++}
++
+ /*
+  * Lines printed per call. The 6T tests made a handful of calls; CoreAnimation makes thousands
+  * a second, and a console line for each floods the log ring and costs every frame. Each kind is
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t sz);      /* 0322: the DSI map (16 KiB aligned) */
++extern "C" void sweet_adreno_display_power(bool on);    /* 0330: SweetAdreno.cpp, GPU clock with the display */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c, 0251 */
+ extern "C" void clean_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ void sweet_surface_gpu_wait(SweetSurface *s);    /* 0310: SweetAdreno.cpp */
+@@ -2251,6 +2252,7 @@
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ 			if (!off) {
++				sweet_adreno_display_power(true);       /* 0330: GPU back to its boot clock first */
+ 				fFB->panelPower(true);  /* 0322: panel awake before frames resume */
+ 			}
+ 			IOLockLock(fFB->fLock);
+@@ -2263,6 +2265,7 @@
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 			if (off) {
+ 				fFB->panelPower(false); /* 0322: after fPowerOff: no flips from here on */
++				sweet_adreno_display_power(false);      /* 0330: GPU to 342 MHz while dark */
+ 			}
+ 		}
+ 		break;
