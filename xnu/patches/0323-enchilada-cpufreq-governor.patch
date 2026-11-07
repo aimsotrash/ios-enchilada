@@ -1,0 +1,302 @@
+enchilada: cpufreq governor (sweetcpufreq=2)
+
+sweetcpufreq=1 pins the clusters at their fastest state forever: smooth, but hot and hungry when idle. sweetcpufreq=2 starts a kernel thread once all CPUs are up (0311's second sweet_cpu_clocks() call) that every 20 ms takes each cluster's busiest CPU's non-idle share (recount idle time through a new sweet_cpu_idle_abs() in osfmk/kern/processor.c; PROCESSOR_CPU_LOAD_INFO only has 10 ms ticks) and picks the slowest full-core OSM state at or above cur * util / 0.8, the fastest above 80 % busy, stepping down at most 2 states after 3 windows in a row below. L3 follows the faster cluster. Touch reports (sweet_touch.c) call sweet_cpufreq_boost(), which holds all domains at their fastest for 250 ms. The OSM bases are now mapped once and kept; the perf-state register is written only on a change. One line every 10 s gives each domain's time share per MHz. Without the accounting or with a domain disabled, =2 stays at the fastest state as =1 does; =1 and 0/absent are unchanged.
+
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -663,6 +663,25 @@
+ 	ticks[CPU_STATE_IDLE] += (uint32_t)(idle_time / hz_tick_interval);
+ }
+ 
++/*
++ * 0323: a CPU's total idle time in mach absolute units (recount, up to now if it idles now), for
++ * the enchilada cpufreq governor in IOKit, which cannot see struct processor. The tick-based
++ * PROCESSOR_CPU_LOAD_INFO above is too coarse for its 20 ms windows. UINT64_MAX: no such CPU.
++ */
++uint64_t sweet_cpu_idle_abs(int cpu);
++uint64_t
++sweet_cpu_idle_abs(int cpu)
++{
++	struct recount_usage usage = { 0 };
++	uint64_t idle_time = 0;
++
++	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || processor_array[cpu] == PROCESSOR_NULL) {
++		return UINT64_MAX;
++	}
++	recount_processor_usage(&processor_array[cpu]->pr_recount, &usage, &idle_time);
++	return idle_time;
++}
++
+ kern_return_t
+ processor_info(
+ 	processor_t     processor,
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,8 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ #include <mach/mach_time.h>
+ 
+ extern "C" int sweet_spmi_init(void);
+@@ -173,6 +175,188 @@
+ #define OSM_LUT_ROWS    40
+ #define OSM_PERF_STATE  0x920
+ 
++/*
++ * 0323: boot-arg sweetcpufreq=2, a small governor. Every ~20 ms a kernel thread takes each cluster's
++ * busiest CPU's non-idle share of the window (recount idle time, sweet_cpu_idle_abs() in
++ * osfmk/kern/processor.c) and asks for the slowest full-core state at or above cur * util / 0.8
++ * (schedutil without frequency invariance), or the fastest one when util > 0.8. It steps down at
++ * most 2 states, and only after 3 windows in a row wanted less. L3 follows the faster cluster (as
++ * a share of that cluster's fastest state). sweet_cpufreq_boost() (touch reports, sweet_touch.c)
++ * holds all three domains at their fastest for 250 ms after the last call. The boost rows with
++ * fewer cores are never asked for. Every 10 s one line gives each domain's time share per MHz.
++ * Without the accounting, or with a domain disabled, it stays at the fastest state as =1 does.
++ */
++#define GOV_TICK_MS     20
++#define GOV_UP          800     /* permille busy: fastest state; also schedutil's 1.25 headroom */
++#define GOV_DOWN_WIN    3       /* windows in a row wanting less before a step down */
++#define GOV_DOWN_STEPS  2
++#define GOV_BOOST_MS    250
++#define GOV_LOG_S       10
++#define GOV_CPUS        8       /* cpus=8: cpu0-3 little, cpu4-7 big */
++
++extern "C" uint64_t sweet_cpu_idle_abs(int cpu);        /* osfmk/kern/processor.c, 0323 */
++
++static struct {
++	volatile uint32_t *r;           /* mapped once, by the first sweet_cpu_clocks() */
++	uint32_t enable, nlvl;
++	uint32_t mhz[OSM_LUT_ROWS];     /* per table row */
++	uint32_t lvl[OSM_LUT_ROWS];     /* the full-core rows, slowest first */
++} sweet_osm[3];                         /* l3, little, big */
++static bool sweet_gov_on;
++static uint64_t sweet_boost_until, sweet_boost_abs;    /* mach absolute time */
++static uint32_t sweet_boosts;
++
++extern "C" void sweet_cpufreq_boost(void);
++extern "C" void
++sweet_cpufreq_boost(void)
++{
++	uint64_t now;
++
++	if (!__atomic_load_n(&sweet_gov_on, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (__atomic_exchange_n(&sweet_boost_until, now + sweet_boost_abs, __ATOMIC_RELAXED) < now) {
++		__atomic_add_fetch(&sweet_boosts, 1, __ATOMIC_RELAXED);
++		thread_wakeup((event_t)&sweet_boost_until);     /* now, not at the next tick */
++	}
++}
++
++/* the slowest full-core state of domain d at or above mhz */
++static uint32_t
++sweet_cpufreq_level(unsigned d, uint32_t mhz)
++{
++	uint32_t k = 0;
++
++	while (k + 1 < sweet_osm[d].nlvl && sweet_osm[d].mhz[sweet_osm[d].lvl[k]] < mhz) {
++		k++;
++	}
++	return k;
++}
++
++static void
++sweet_cpufreq_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static const char *const name[3] = { "l3", "little", "big" };
++	static uint64_t idle_abs[GOV_CPUS], spent[3][OSM_LUT_ROWS];
++	uint32_t cur[3], below[3] = { 0, 0, 0 };
++	uint64_t last = mach_absolute_time(), log_at = last, log_abs;
++
++	nanoseconds_to_absolutetime((uint64_t)GOV_LOG_S * NSEC_PER_SEC, &log_abs);
++	for (int c = 0; c < GOV_CPUS; c++) {
++		idle_abs[c] = sweet_cpu_idle_abs(c);
++	}
++	for (unsigned d = 0; d < 3; d++) {
++		cur[d] = sweet_osm[d].nlvl - 1;         /* sweet_cpu_clocks() just asked for the fastest */
++	}
++	for (;;) {
++		(void)assert_wait_timeout((event_t)&sweet_boost_until, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++
++		uint64_t now = mach_absolute_time(), win = now - last;
++		uint32_t util[2] = { 0, 0 }, want[3], share = 0;
++		bool boost = now < __atomic_load_n(&sweet_boost_until, __ATOMIC_RELAXED);
++
++		if (win == 0) {
++			continue;
++		}
++		last = now;
++		for (int c = 0; c < GOV_CPUS; c++) {
++			uint64_t t = sweet_cpu_idle_abs(c), di = 0;
++			uint32_t u;
++
++			if (t > idle_abs[c] && t != UINT64_MAX) {
++				di = t - idle_abs[c];
++				idle_abs[c] = t;
++			}
++			u = di >= win ? 0 : (uint32_t)((win - di) * 1000 / win);
++			if (u > util[c >= 4]) {
++				util[c >= 4] = u;
++			}
++		}
++		for (unsigned d = 1; d < 3; d++) {
++			uint32_t top = sweet_osm[d].nlvl - 1, w = top, u = util[d - 1];
++
++			if (!boost && u <= GOV_UP) {
++				w = sweet_cpufreq_level(d, sweet_osm[d].mhz[sweet_osm[d].lvl[cur[d]]] * u / GOV_UP);
++			}
++			want[d] = cur[d];
++			if (w >= cur[d]) {
++				below[d] = 0;
++				want[d] = w;
++			} else if (++below[d] >= GOV_DOWN_WIN) {
++				below[d] = 0;
++				want[d] = cur[d] - (cur[d] - w < GOV_DOWN_STEPS ? cur[d] - w : GOV_DOWN_STEPS);
++			}
++			uint32_t s = sweet_osm[d].mhz[sweet_osm[d].lvl[want[d]]] * 1000 / sweet_osm[d].mhz[sweet_osm[d].lvl[top]];
++			share = s > share ? s : share;
++		}
++		want[0] = sweet_cpufreq_level(0, sweet_osm[0].mhz[sweet_osm[0].lvl[sweet_osm[0].nlvl - 1]] * share / 1000);
++		for (unsigned d = 0; d < 3; d++) {
++			spent[d][cur[d]] += win;
++			if (want[d] != cur[d]) {        /* the register only on a change */
++				cur[d] = want[d];
++				sweet_osm[d].r[OSM_PERF_STATE / 4] = sweet_osm[d].lvl[cur[d]];
++				__asm__ volatile("dsb sy" ::: "memory");
++			}
++		}
++		if (now - log_at >= log_abs) {
++			char line[400];
++			size_t used = 0;
++
++			for (unsigned d = 3; d-- > 0;) {
++				used += (size_t)snprintf(line + used, sizeof(line) - used, " %s", name[d]);
++				for (uint32_t k = 0; k < sweet_osm[d].nlvl; k++) {
++					uint32_t pct = (uint32_t)(spent[d][k] * 100 / (now - log_at));
++
++					if (pct > 0 && used < sizeof(line) - 16) {
++						used += (size_t)snprintf(line + used, sizeof(line) - used, " %u:%u%%",
++						    sweet_osm[d].mhz[sweet_osm[d].lvl[k]], pct);
++					}
++					spent[d][k] = 0;
++				}
++			}
++			IOLog("SWEET CPUFREQ: last %d s%s boosts %u\n", GOV_LOG_S, line,
++			    __atomic_exchange_n(&sweet_boosts, 0, __ATOMIC_RELAXED));
++			log_at = now;
++		}
++	}
++}
++
++/* sweetcpufreq=2: once all three domains are enabled (after SMP, 0311), start the governor */
++static void
++sweet_cpufreq_start(void)
++{
++	thread_t thread;
++	int c;
++
++	if (sweet_gov_on) {
++		return;
++	}
++	for (unsigned d = 0; d < 3; d++) {
++		if (sweet_osm[d].r == NULL || !(sweet_osm[d].enable & 1) || sweet_osm[d].nlvl == 0) {
++			IOLog("SWEET CPUFREQ: governor not started (domain %u enable %#x, %u states), fastest state kept\n",
++			    d, sweet_osm[d].enable, sweet_osm[d].nlvl);
++			return;
++		}
++	}
++	for (c = 0; c < GOV_CPUS && sweet_cpu_idle_abs(c) != UINT64_MAX; c++) {
++	}
++	if (c < GOV_CPUS) {
++		IOLog("SWEET CPUFREQ: governor not started (no idle accounting for cpu%d), fastest state kept\n", c);
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)GOV_BOOST_MS * NSEC_PER_MSEC, &sweet_boost_abs);
++	if (kernel_thread_start(sweet_cpufreq_thread, NULL, &thread) != KERN_SUCCESS) {
++		IOLog("SWEET CPUFREQ: governor thread not created, fastest state kept\n");
++		return;
++	}
++	thread_deallocate(thread);
++	__atomic_store_n(&sweet_gov_on, true, __ATOMIC_RELEASE);
++	IOLog("SWEET CPUFREQ: governor on: %d ms windows, max above %d%% busy, touch boost %d ms\n",
++	    GOV_TICK_MS, GOV_UP / 10, GOV_BOOST_MS);
++}
++
+ void sweet_cpu_clocks(void);     /* 0311: also SweetCPU.cpp */
+ void
+ sweet_cpu_clocks(void)
+@@ -187,17 +371,20 @@
+ 
+ 	(void)PE_parse_boot_argn("sweetcpufreq", &want, sizeof(want));
+ 	for (unsigned d = 0; d < sizeof(domain) / sizeof(domain[0]); d++) {
+-		vm_offset_t map = ml_io_map((vm_offset_t)(domain[d].pa & ~0xfffULL), 0x2000);
+-		volatile uint32_t *r;
+-		uint32_t mhz[OSM_LUT_ROWS], cores[OSM_LUT_ROWS], rows = 0, full = 0, best = 0;
++		volatile uint32_t *r = sweet_osm[d].r;  /* 0323: mapped once, kept for the governor */
++		uint32_t *mhz = sweet_osm[d].mhz, cores[OSM_LUT_ROWS], rows = 0, full = 0, best = 0;
+ 		char line[200];
+ 		size_t used = 0;
+ 
+-		if (map == 0) {
+-			IOLog("SWEET CPUFREQ: %s: cannot map the OSM\n", domain[d].name);
+-			continue;
++		if (r == NULL) {
++			vm_offset_t map = ml_io_map((vm_offset_t)(domain[d].pa & ~0xfffULL), 0x2000);
++
++			if (map == 0) {
++				IOLog("SWEET CPUFREQ: %s: cannot map the OSM\n", domain[d].name);
++				continue;
++			}
++			r = sweet_osm[d].r = (volatile uint32_t *)(map + (domain[d].pa & 0xfff));
+ 		}
+-		r = (volatile uint32_t *)(map + (domain[d].pa & 0xfff));
+ 		uint32_t enable = r[OSM_ENABLE / 4], state = r[OSM_PERF_STATE / 4];
+ 		for (uint32_t i = 0; i < OSM_LUT_ROWS; i++) {
+ 			uint32_t v = r[(OSM_LUT + i * OSM_LUT_ROW) / 4];
+@@ -222,13 +409,23 @@
+ 		}
+ 		IOLog("SWEET CPUFREQ: %s enable %#x state %u (%u MHz) of %u:%s\n", domain[d].name, enable, state,
+ 		    state < rows ? mhz[state] : 0, rows, line);
+-		if (want == 1 && (enable & 1) && rows > 0 && best != state) {
++		sweet_osm[d].enable = enable;
++		sweet_osm[d].nlvl = 0;
++		for (uint32_t i = 0; i < rows; i++) {
++			if (cores[i] == full) {
++				sweet_osm[d].lvl[sweet_osm[d].nlvl++] = i;
++			}
++		}
++		if ((want == 1 || want == 2) && (enable & 1) && rows > 0 && best != state) {
+ 			r[OSM_PERF_STATE / 4] = best;
+ 			__asm__ volatile("dsb sy" ::: "memory");
+ 			IOLog("SWEET CPUFREQ: %s asked for state %u (%u MHz), reads back %u\n", domain[d].name, best,
+ 			    mhz[best], r[OSM_PERF_STATE / 4]);
+ 		}
+ 	}
++	if (want == 2) {
++		sweet_cpufreq_start();
++	}
+ }
+ 
+ bool
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -454,9 +454,14 @@
+ 	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+ }
+ 
++extern void sweet_cpufreq_boost(void);  /* 0323: SweetPlatformExpert.cpp */
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	if (mask | st.active) {
++		sweet_cpufreq_boost();  /* 0323: clocks to the fastest state while touched */
++	}
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
