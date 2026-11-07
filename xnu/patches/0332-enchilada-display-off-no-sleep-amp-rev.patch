@@ -1,0 +1,65 @@
+enchilada: display off/on without panel sleep (boot64 showed noise after wake); MAX98927 REV_ID 0x4x
+
+boot64: lock sent 0x28 + 0x10, unlock 0x11 + 0x29 (all acked) and restarted autorefresh, but the panel never showed another frame (its frame memory, random, on screen while the MDP flipped in place): Linux's sofef00 re-sends tear-on and its init after sleep out. Display off/on now only sends 0x28/0x29 (the AMOLED's pixels go off; the panel keeps its state); sweetbl=2 adds sleep in/out as before. The amp on this phone reads REV_ID 0x42; Linux only logs it, so any 0x4x passes now.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1974,6 +1974,8 @@
+  * dpu_hw_pp_disable_autorefresh) and is put back with a CTL_START kickoff, so the MDP pushes
+  * no frames into a sleeping panel. fMdpLock held; sleeps up to ~0.3 s.
+  */
++static bool sweet_bl_slept;     /* 0332: sleep in (0x10) was sent: wake sends 0x11 first */
++
+ static void
+ sweet_bl_sleep(bool down)
+ {
+@@ -2001,18 +2003,32 @@
+ 		sweet_bl.autorefresh = ar;
+ 		IOLog("SWEET BL: PP%u autorefresh 0x%08x -> 0 (%s, write line %u after %u ms)\n", sweet_lm[sweet_mdp.lm].pp,
+ 		    ar, (ar >> 31) ? "stopped" : "was off", lines, ms);
++		/*
++		 * 0332: display off only. After 0x10/0x11 (boot64) the panel never showed another frame
++		 * (random frame memory on screen while the MDP flipped in place): Linux's sofef00 sends
++		 * tear-on and its init again after sleep out, which this does not. 0x28 already turns the
++		 * AMOLED's pixels off and keeps the panel's state; sweetbl=2 sends sleep in/out as before.
++		 */
++		static int deep = -1;
++		if (deep < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetbl", &v, sizeof(v));
++			deep = v >= 2;
++		}
+ 		if (sweet_dsi_dcs("display off", off, 1)) {
+ 			IOSleep(40);
+-			if (sweet_dsi_dcs("sleep in", in, 1)) {
++			if (deep && sweet_dsi_dcs("sleep in", in, 1)) {
+ 				IOSleep(160);
++				sweet_bl_slept = true;
+ 			}
+ 		}
+-		sweet_bl.asleep = true;         /* even half done: wake sends 0x11/0x29 and restarts the MDP */
++		sweet_bl.asleep = true;         /* even half done: wake sends 0x29 (0x11 first if slept) and restarts the MDP */
+ 		return;
+ 	}
+-	if (sweet_dsi_dcs("sleep out", out, 1)) {
++	if (sweet_bl_slept && sweet_dsi_dcs("sleep out", out, 1)) {
+ 		IOSleep(10);
+ 	}
++	sweet_bl_slept = false;
+ 	(void)sweet_dsi_dcs("display on", on, 1);
+ 	if (sweet_bl.autorefresh >> 31) {
+ 		sweet_bl_wr(pp, PP_AUTOREFRESH_CONFIG, sweet_bl.autorefresh);
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -1759,8 +1759,9 @@
+ 	} else if ((id = amp_rd(0x01ff)) < 0) {
+ 		why = "no answer at 0x3a on SE4";
+ 	} else {
+-		printf("SWEET AMP: REV_ID %#04x%s\n", (unsigned)id, id == 0x40 ? "" : " (expected 0x40)");
+-		why = id == 0x40 ? NULL : "unexpected REV_ID";
++		/* 0332: this phone's amp reads 0x42 (boot64); Linux's max98927 only logs the revision */
++		printf("SWEET AMP: REV_ID %#04x%s\n", (unsigned)id, (id & 0xf0) == 0x40 ? "" : " (expected 0x4x)");
++		why = (id & 0xf0) == 0x40 ? NULL : "unexpected REV_ID";
+ 	}
+ 	for (unsigned i = 0; !why && i < sizeof(amp_init) / sizeof(amp_init[0]); i++) {
+ 		why = amp_wr(amp_init[i].reg, amp_init[i].mask, amp_init[i].val) ? NULL : "init write";
