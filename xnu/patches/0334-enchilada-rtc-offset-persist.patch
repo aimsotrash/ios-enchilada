@@ -1,0 +1,151 @@
+enchilada: the wall clock survives reboots (RTC offset stored on disk)
+
+The PMIC RTC only counts and is never written, so every cold boot started at the image's build time (sweetepoch) until something set the clock, and HTTPS (certificate dates) failed meanwhile; the flashed phone came up 58 minutes behind. setUTCTimeOfDay (timed/NTP, Settings) now stores the offset of UNIX time to the RTC counter in the block just before the console log on userdata ("SWEETRTC", when it moved by more than 2 s); once the partition is ready the stored offset is read back, used unless the RTC counter went backwards since (an RTC reset), and the calendar re-read (clock_initialize_calendar).
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -120,6 +120,7 @@
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
++static void sweet_rtc_recall(void);    /* 0334, below */
+ 
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+@@ -718,6 +719,7 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_rtc_recall();        /* 0334: the wall clock's stored offset, before anything wants the date */
+ 	sweet_sample_start();
+ 	/* 0241: before touch's thread, the other apps-RSC user (ddrbw=0 skips it). */
+ 	(void)sweet_rpmh_ddr_vote();
+@@ -941,4 +943,79 @@
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++
++/*
++ * 0334: the wall clock across boots. The PMIC RTC only counts (it is never written, see
++ * SweetPlatformExpert.cpp), so a cold boot started at the image's build time (sweetepoch) until
++ * something set the time, and HTTPS failed meanwhile. Its offset to UNIX time is kept in the block
++ * just before the console log: "SWEETRTC" | int64 offset | u32 RTC counter when stored | u32 check.
++ * setUTCTimeOfDay (timed, NTP, Settings) stores it; once the partition is ready it is read back and
++ * the calendar re-read. Not used if the RTC counter went backwards since (the RTC was reset).
++ */
++struct sweet_rtc_rec {
++	char     magic[8];
++	int64_t  offset;
++	uint32_t counter;
++	uint32_t check;
++};
++
++static uint64_t
++sweet_rtc_block(void)
++{
++	return su.first_block + su.nblocks - SWEET_LOG_BLOCKS - 1;
++}
++
++static uint32_t
++sweet_rtc_check(const struct sweet_rtc_rec *r)
++{
++	return (uint32_t)r->offset ^ (uint32_t)((uint64_t)r->offset >> 32) ^ r->counter ^ 0x53575254u;
++}
++
++int sweet_rtc_store(int64_t offset, uint32_t counter);
++int
++sweet_rtc_store(int64_t offset, uint32_t counter)
++{
++	struct sweet_rtc_rec r = { .offset = offset, .counter = counter };
++	int error;
++
++	if (!su.ready || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS + 2) {
++		return ENXIO;
++	}
++	memcpy(r.magic, "SWEETRTC", 8);
++	r.check = sweet_rtc_check(&r);
++	lck_mtx_lock(&sweet_ufs_lock);
++	bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++	memcpy((void *)(su.dma + DMA_BOUNCE), &r, sizeof(r));
++	error = ufs_write_blocks(sweet_rtc_block(), 1);
++	if (!error) {
++		(void)ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++static void
++sweet_rtc_recall(void)
++{
++	extern int sweet_rtc_restore(int64_t offset, uint32_t counter);    /* SweetPlatformExpert.cpp */
++	struct sweet_rtc_rec r;
++	int error;
++
++	if (su.nblocks < 2 * SWEET_LOG_BLOCKS + 2) {
++		return;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(sweet_rtc_block(), 1);
++	if (!error) {
++		memcpy(&r, (const void *)(su.dma + DMA_BOUNCE), sizeof(r));
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error || memcmp(r.magic, "SWEETRTC", 8) != 0 || r.check != sweet_rtc_check(&r)) {
++		printf("SWEET RTC: no stored offset (read %d)\n", error);
++		return;
++	}
++	if (sweet_rtc_restore(r.offset, r.counter) == 0) {
++		clock_initialize_calendar();
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -76,6 +76,8 @@
+ static uint64_t sweet_rtc_abs;                 /* mach_absolute_time() then */
+ static int64_t sweet_rtc_offset;               /* boot-arg sweetrtcoff */
+ static int64_t sweet_rtc_floor;                /* boot-arg sweetepoch */
++static bool sweet_rtc_stored;                   /* 0334: this offset is on disk */
++extern "C" int sweet_rtc_store(int64_t offset, uint32_t counter);      /* sweet_ufs.c */
+ 
+ static int
+ sweet_rtc_read(uint32_t *out)
+@@ -143,10 +145,33 @@
+ 	if (!sweet_rtc_ok) {
+ 		return;
+ 	}
+-	/* the PMIC is never written: keep the offset for this boot and say what it is */
+-	sweet_rtc_offset = (int64_t)secs - sweet_rtc_now(NULL);
+-	IOLog("SWEET RTC: time set to %lu; for this unit sweetrtcoff=%lld\n", (unsigned long)secs,
+-	    (long long)sweet_rtc_offset);
++	/* the PMIC is never written: keep the offset, and (0334) store it for the next boots */
++	int64_t now = sweet_rtc_now(NULL), off = (int64_t)secs - now;
++	int64_t moved = off - sweet_rtc_offset;
++	sweet_rtc_offset = off;
++	if (!sweet_rtc_stored || moved > 2 || moved < -2) {
++		int error = sweet_rtc_store(off, (uint32_t)now);
++		sweet_rtc_stored = error == 0;
++		IOLog("SWEET RTC: time set to %lu; offset %lld stored (%d)\n", (unsigned long)secs, (long long)off, error);
++	}
++}
++
++/* 0334: sweet_ufs.c, once the partition is ready: the offset stored by an earlier boot */
++extern "C" int sweet_rtc_restore(int64_t offset, uint32_t counter);
++extern "C" int
++sweet_rtc_restore(int64_t offset, uint32_t counter)
++{
++	int64_t now = sweet_rtc_ok ? sweet_rtc_now(NULL) : -1;
++
++	if (now < (int64_t)counter) {
++		IOLog("SWEET RTC: stored offset %lld ignored (RTC %lld, stored at %u: reset since)\n",
++		    (long long)offset, (long long)now, counter);
++		return -1;
++	}
++	sweet_rtc_offset = offset;
++	sweet_rtc_stored = true;
++	IOLog("SWEET RTC: stored offset %lld: time %lld\n", (long long)offset, (long long)(now + offset));
++	return 0;
+ }
+ 
+ /*

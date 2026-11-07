@@ -1,0 +1,37 @@
+enchilada: kern.sweet_rbfb=1 sends the next restart to fastboot on rbos images
+
+With rbos=1 (the flashed daily image) a restart boots the OS again, so a test boot needed Power + Volume Up by hand. `sysctl -w kern.sweet_rbfb=1` (root) makes the next restart take the fastboot path (PON spare) as the tethered images do; panics keep rbos's behaviour.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -12,6 +12,7 @@
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
++#include <sys/sysctl.h>        /* 0335: kern.sweet_rbfb */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -166,6 +167,13 @@
+ static vm_offset_t rb_chan, rb_obs, rb_imem;
+ static uint32_t rb_on = 1, rb_panic_s = 60;
+ static uint32_t rb_os;          /* 0328: rbos=1, restarts boot the OS again (flashed image) */
++/*
++ * 0335: `sysctl -w kern.sweet_rbfb=1` (root): the next restart stops in fastboot even with rbos=1,
++ * so a flashed phone can still be sent to fastboot over SSH for a test boot.
++ */
++static int rb_fb_once;
++SYSCTL_INT(_kern, OID_AUTO, sweet_rbfb, CTLFLAG_RW | CTLFLAG_LOCKED, &rb_fb_once, 0,
++    "next restart to fastboot (rbos images)");
+ static int rb_panicking;
+ /*
+  * 0254: rb_marked: the spare register read back as bootloader (restart or panic path), so a
+@@ -337,7 +345,7 @@
+ 	 * seconds on its screen, reset without marking the PON spare, so ABL boots the active slot
+ 	 * (this OS) again instead of stopping in fastboot. PSCI SYSTEM_RESET, PS_HOLD as fallback.
+ 	 */
+-	if (rb_os) {
++	if (rb_os && !(rb_fb_once && !panic)) {
+ 		if (panic) {
+ 			if (__atomic_exchange_n(&rb_panicking, 1, __ATOMIC_SEQ_CST) || rb_panic_s == 0) {
+ 				return -1;
