@@ -8,7 +8,15 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
 
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -94,6 +94,8 @@
+@@ -53,6 +53,7 @@
+ #include <IOKit/pwr_mgt/RootDomain.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t sz);      /* 0322: the DSI map (16 KiB aligned) */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c, 0251 */
+ extern "C" void clean_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ void sweet_surface_gpu_wait(SweetSurface *s);    /* 0310: SweetAdreno.cpp */
+@@ -94,6 +95,8 @@
  /* 0254: 1 = shutdown/restart under way (for good), 2 = system sleep: no flips, no waiting for frames. */
  static volatile uint32_t sweet_fb_paused;
  static IOReturn sweet_fb_power_note(void *, void *, UInt32, IOService *, void *, vm_size_t);
@@ -17,7 +25,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
-@@ -187,8 +189,10 @@
+@@ -187,8 +190,10 @@
  	void          zcFail(const char *why, bool wait);
  	void          zcSay(const char *what, uint32_t id);
  	void          pauseConsole(void);
@@ -28,7 +36,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -208,6 +212,23 @@
+@@ -208,6 +213,23 @@
  
  OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  
@@ -52,7 +60,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
  class IOMobileFramebufferUserClient : public IOUserClient {
-@@ -591,6 +612,40 @@
+@@ -591,6 +613,40 @@
  		}
  	}
  	OSSafeReleaseNULL(accel);
@@ -93,7 +101,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
  	IOLog("SWEET FB: start done\n");
  	return true;
  }
-@@ -1690,6 +1745,339 @@
+@@ -1690,6 +1746,339 @@
  }
  
  /*
@@ -433,7 +441,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
   * 0254: shutdown, restart and panic restart (SweetPlatformExpert's PE_halt_restart, before
   * sweet_reboot_fastboot) and the root domain's restart/power-off notice. No lock is taken (a
   * stuck SwapEnd may hold fMdpLock) and nothing waits for a frame (the MDP may be stopping):
-@@ -1861,6 +2249,9 @@
+@@ -1861,6 +2250,9 @@
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
  			bool off = args->scalarInput[0] == 0;
@@ -443,7 +451,7 @@ DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
-@@ -1869,6 +2260,9 @@
+@@ -1869,6 +2261,9 @@
  			}
  			IOLockUnlock(fFB->fLock);
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
