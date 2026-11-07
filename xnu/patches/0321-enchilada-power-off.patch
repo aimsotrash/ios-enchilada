@@ -1,0 +1,51 @@
+enchilada: power off on shutdown (PSCI SYSTEM_OFF)
+
+kPEHaltCPU returned -1, so "slide to power off" and `halt` hung the phone until Power was held ~15 s. PE_halt_restart now calls PSCI SYSTEM_OFF (0x84000008, the call Linux makes on SDM845; the TZ sets the PMIC PS_HOLD type to shutdown and drops PS_HOLD). The PON spare stays unmarked: the next power-on boots normally (Power + Volume Up for fastboot). Restart and panic restart are unchanged.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -391,4 +391,24 @@
+ 	rb_reset(panic);
+ 	return -1;
+ }
++
++/*
++ * 0321: power off (shutdown, "slide to power off"): PSCI SYSTEM_OFF, which has the TZ set the
++ * PMIC's PS_HOLD type to shutdown and drop PS_HOLD, as Linux's psci_sys_poweroff on SDM845.
++ * Before, kPEHaltCPU returned -1 and the phone hung until Power was held ~15 s. The PON spare
++ * is not marked, so a later power-on goes the normal way (Power + Volume Up for fastboot).
++ */
++int sweet_power_off(void);
++
++int
++sweet_power_off(void)
++{
++	printf("SWEET RB: power off (PSCI SYSTEM_OFF)\n");
++	delay(100 * 1000);
++	register uint64_t x0 __asm__("x0") = 0x84000008ULL;       /* PSCI SYSTEM_OFF */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	printf("SWEET RB: PSCI SYSTEM_OFF returned %d, still running\n", (int)x0);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -17,6 +17,7 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_reboot_init(void);
+ extern "C" int sweet_reboot_fastboot(int panic);
++extern "C" int sweet_power_off(void);            /* 0321 */
+ extern "C" void sweet_fb_halt(int panic);       /* SweetFramebuffer.cpp, 0254 */
+ 
+ /*
+@@ -32,6 +33,9 @@
+ 	if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
+ 		return sweet_reboot_fastboot(type == kPEPanicRestartCPU);
+ 	}
++	if (type == kPEHaltCPU) {
++		return sweet_power_off();               /* 0321: shutdown powers the phone off */
++	}
+ 	return -1;
+ }
+ 
