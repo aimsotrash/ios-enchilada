@@ -1,0 +1,50 @@
+enchilada: keep the previous boot's console log (panics on the flashed image)
+
+With rbos=1 a panic reboots into the OS again and the new boot's log overwrote the one holding the panic (a Wi-Fi join on the flashed image rebooted the phone with nothing to read). At start, before anything is written, the old log area (header + 4 MiB ring) is copied to the 1025 blocks before 0334's clock block, so the end of userdata is [previous log][clock][log]; it can be read over SSH from /dev/rufsroot0 and decoded with tools/sweet-log.py.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -915,13 +915,42 @@
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on || !su.writable || su.nblocks < 3 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+ 	if (sweet_log_secs == 0 || sweet_log_secs > 60) {
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
++	/*
++	 * 0336: keep the previous boot's log. With rbos=1 (the flashed image) a panic reboots into
++	 * this OS again, and this boot's log used to overwrite the one that held the panic. Before
++	 * anything is written, the old area (header + ring, if it has the SWEETLOG header) is copied
++	 * to the 1025 blocks before 0334's clock block: [previous log][clock][log] at the partition's
++	 * end. Read it with dd of /dev/rufsroot0 (tools/sweet-log.py decodes it).
++	 */
++	{
++		uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++		uint64_t prev = base - 1 - SWEET_LOG_BLOCKS;
++		int error;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		error = ufs_read_blocks(base, 1);
++		if (!error && memcmp((const void *)(su.dma + DMA_BOUNCE), "SWEETLOG", 8) == 0) {
++			for (uint32_t done = 0, n; done < SWEET_LOG_BLOCKS && !error; done += n) {
++				n = MIN(SWEET_LOG_BLOCKS - done, BOUNCE_SIZE / UFS_BLOCK);
++				error = ufs_read_blocks(base + done, n);
++				if (!error) {
++					error = ufs_write_blocks(prev + done, n);
++				}
++			}
++			if (!error) {
++				(void)ufs_sync_cache();
++			}
++			printf("SWEET LOG: previous boot's log kept at block 0x%llx (%d)\n", prev, error);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 		sweet_log_started = true;
