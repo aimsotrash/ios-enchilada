@@ -1,0 +1,257 @@
+enchilada: SLPI (sensor DSP): read-only probe (slpi=1), sensors round 1
+
+The OnePlus 6's IMU (BMI160, SPI), light/proximity (TMD3725, I2C 0x39) and magnetometer sit on the
+SLPI's own buses, not on an apps QUP, so iOS sensors go through booting the SLPI (PAS 12) the way
+0300 boots the ADSP. logs/sensors/plan.md has the chain; this is its first step and boots nothing.
+Boot-arg slpi=1 (with or without adsp=N; alone it runs only the ADSP's read-only stage 1, which maps
+SMEM) adds one probe after stage 1, in sweet_adsp.c's thread:
+- pil_slpi_mem (enchilada2.dtb slpi_region 0x96800000 + 0x1400000) against the kernel's RAM, and
+  the conflict with display scanout slot 3 (0264/0319, sweetzc_slots=3 puts it in that region);
+- the apps<->slpi SMEM partition (hosts 0/3, found by stage 1's ptable walk, mapped read-only) and
+  items 424 (global, crash reason), 430/481 (SMP2P out/in), 478/479/480 (GLINK);
+- slpi.mdt + the 19 slpi.bNN files from modem_a (UFS LUN 4) at the offsets of tools/mss-fw-table.py's
+  logic, crc32-checked (slpi_fw[], from modem_a.img whose sha256 matches the phone's sde4); the ELF
+  header + hash segment must be the whole mdt and the relocatable image (0x1180000 bytes) must fit
+  the region.
+It ends in one "SWEET SLPI: probe: ok/FAILED: ..." line; with sweetzc_slots=3 it reports FAILED
+(region taken by scanout slot 3) after all checks. Nothing is stored, no SCM call is made and the
+region itself is never mapped. The ADSP stages are unchanged; "done" no longer says "stopped early"
+for adsp=0. Not yet built in CI or booted.
+
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -19,6 +19,11 @@
+  *      config and start of port 0x1006 for 2 s, then stop (ad_stage45)
+  *   5  (0320) 4 + the MAX98927 speaker amp over SE4 I2C (sweet_touch.c): REV_ID, Linux init at the
+  *      lowest gain; adsp=5N (N 1..15) also runs the amp's tone generator (TONE_CONFIG N) for 1 s
++ * (0325) Boot-arg slpi=1 (with or without adsp=N): after stage 1, a read-only probe of the SLPI (sensor
++ * DSP, logs/sensors/plan.md): pil_slpi_mem against the kernel's RAM and display scanout slot 3, the
++ * apps<->slpi SMEM partition (hosts 0/3) and items 424 (global), 430, 481, 478, 479, 480, and
++ * slpi.mdt + slpi.bNN from modem_a crc-checked against slpi_fw[]. Nothing is written, the SLPI is
++ * not booted. One "SWEET SLPI: probe: ok/FAILED: ..." line.
+  * Sources, Linux v6.12: remoteproc/qcom_q6v5_pas.c (sdm845_adsp_resource_init: pas_id 1, load_state
+  * "adsp", crash reason 423, only "xo"), qcom_q6v5.c, soc/qcom/mdt_loader.c, firmware/qcom/qcom_scm.c
+  * (PAS: svc 2, cmds 1/2/5/6/7), soc/qcom/smem.c + smp2p.c, rpmsg/qcom_glink_smem.c +
+@@ -110,6 +115,40 @@
+ };
+ #define FW_MDT  (&adsp_fw[0])
+ 
++/*
++ * 0325: the SLPI, enchilada2.dtb qcom,ssc@5c00000 (pil-tz-generic, pas-id 12, smem-id 424, lcx/lmx
++ * proxy votes, memory-region pil_slpi_mem 0x96800000 + 0x1400000); sdm845.dtsi smp2p-slpi (smem
++ * 481 in / 430 out, APCS bit 26, remote pid 3) and glink-edge "dsps" (APCS bit 24).
++ * tools/mss-fw-table.py logic on slpi (modem_a.img = the phone's sde4 by sha256): offset, size, crc32.
++ */
++#define SL_PA           0x96800000ull
++#define SL_SIZE         0x1400000u
++#define HOST_SLPI       3u
++static const struct ad_fw slpi_fw[] = {
++	{ "slpi.mdt", 0x5c31000, 0x1f1c, 0xef1e513d },
++	{ "slpi.b02", 0x5585000, 0x22d8, 0x578c8be5 },
++	{ "slpi.b03", 0x5589000, 0x1af1c, 0xbe497495 },
++	{ "slpi.b04", 0x55a5000, 0x1aa008, 0x498d76c9 },
++	{ "slpi.b05", 0x5751000, 0x14cde0, 0x18986fde },
++	{ "slpi.b06", 0x58a1000, 0xab60, 0xa8e1b611 },
++	{ "slpi.b07", 0x58ad000, 0x17386, 0x757d4859 },
++	{ "slpi.b08", 0x58c5000, 0x21688, 0xb9ea8531 },
++	{ "slpi.b09", 0x58e9000, 0x52, 0x92d89c31 },
++	{ "slpi.b10", 0x58ed000, 0xf94c, 0x2696a8a4 },
++	{ "slpi.b11", 0x58fd000, 0x7540, 0x1f1d1728 },
++	{ "slpi.b12", 0x5905000, 0x58000, 0xb292a155 },
++	{ "slpi.b13", 0x595d000, 0x111b30, 0x1f39d34f },
++	{ "slpi.b14", 0x5a71000, 0x96eb8, 0x8f65fa0c },
++	{ "slpi.b15", 0x5b09000, 0x2d620, 0xe906b9ce },
++	{ "slpi.b16", 0x5b39000, 0x5fe4, 0x92080a9b },
++	{ "slpi.b17", 0x5b41000, 0x66e14, 0x0977a278 },
++	{ "slpi.b19", 0x5ba9000, 0x1ce4b, 0x5e157ba8 },
++	{ "slpi.b20", 0x5bc9000, 0x60864, 0xf791dfca },
++	{ "slpi.b21", 0x5c2d000, 0xbc, 0x77d09a0d },
++};
++static int sl_mode;
++static uint32_t sl_part_off, sl_part_size;      /* ad_probe's ptable walk: hosts 0/3 */
++
+ static int ad_mode;
+ static bool ad_bad;                     /* a refused access: the stage fails at its next check */
+ static uint64_t ad_t0;
+@@ -131,7 +170,7 @@
+ 
+ /* --- SMEM: four Device mappings (header page, ptable page, global and apps<->adsp partitions) --- */
+ struct ad_map { uint32_t off, len; vm_offset_t va; bool rw; };
+-enum { M_HDR, M_PT, M_GLOB, M_PART, M_N };
++enum { M_HDR, M_PT, M_GLOB, M_PART, M_SPART, M_N };     /* M_SPART: apps<->slpi, read-only (0325) */
+ static struct ad_map sm[M_N];
+ static struct { uint32_t lo, hi; } ours[8];   /* SMEM ranges we may store to */
+ static unsigned nours;
+@@ -335,6 +374,9 @@
+ 		if ((h0 == HOST_APPS && h1 == HOST_ADSP) || (h0 == HOST_ADSP && h1 == HOST_APPS)) {
+ 			part_off = off;
+ 			part_size = size;
++		} else if ((h0 == HOST_APPS && h1 == HOST_SLPI) || (h0 == HOST_SLPI && h1 == HOST_APPS)) {
++			sl_part_off = off;
++			sl_part_size = size;
+ 		} else if (h0 == 0xfffe && h1 == 0xfffe) {
+ 			glob_off = off;
+ 			glob_size = size;
+@@ -1822,6 +1864,110 @@
+  * 60): boot55/boot56 panicked ~10 s into boot inside these stages, before SSH was up and with the
+  * panic flush of the console log skipped; started late, a crash comes while dmesg can be watched.
+  */
++/*
++ * 0325: SLPI read-only probe (slpi=1), after stage 1 mapped the SMEM header, ptable and global
++ * partition. Reads SMEM and modem_a only: no SCM call, no store, the SLPI region is not touched
++ * (it may be a scanout slot). ponytail: the SLPI boot (plan step 3) should turn ad_stage2/3's
++ * constants into a per-remote table instead of copying them.
++ */
++static const char *
++sl_probe(char *sum, size_t n)
++{
++	uint64_t lo = gPhysBase, hi = (uint64_t)gPhysBase + gPhysSize, min = ~0ull, max = 0;
++	bool in_ram = SL_PA < hi && SL_PA + SL_SIZE > lo, reloc = false;
++	uint32_t phoff = 0, nseg = 0, bytes = 0, meta = 0, size;
++	uint16_t phnum = 0;
++	int slots = 2;
++	struct ad_phdr p;
++
++	(void)PE_parse_boot_argn("sweetzc_slots", &slots, sizeof(slots));
++	printf("SWEET SLPI: region slpi %#011llx-%#011llx %s (kernel RAM %#llx-%#llx); %s\n", SL_PA,
++	    SL_PA + SL_SIZE, in_ram ? "OVERLAPS kernel RAM" : "outside kernel RAM", lo, hi, slots >= 3 ?
++	    "CONFLICT: display scanout slot 3 lives there (sweetzc_slots=3, SweetFramebuffer.cpp SWEET_SLPI_PA)" :
++	    "no scanout slot there (sweetzc_slots < 3)");
++	if (in_ram) {
++		return "region overlaps kernel RAM";
++	}
++	if (!sl_part_off || !sm_map(M_SPART, sl_part_off, sl_part_size, false)) {
++		return "no apps<->slpi partition (hosts 0/3) in the ptable";
++	}
++	uint32_t magic = sm32(sl_part_off), hosts = sm32(sl_part_off + 4);
++	printf("SWEET SLPI: apps-slpi partition +%#x size %#x: magic %#x hosts %#x/%#x free_uncached %#x "
++	    "free_cached %#x\n", sl_part_off, sl_part_size, magic, hosts & 0xffff, hosts >> 16,
++	    sm32(sl_part_off + 12), sm32(sl_part_off + 16));
++	if (magic != 0x54525024u || sm32(sl_part_off + 8) != sl_part_size) {
++		return "partition header invalid";
++	}
++	static const struct { unsigned map; uint16_t id; const char *name; } items[] = {
++		{ M_GLOB, 424, "slpi crash reason" }, { M_SPART, 430, "smp2p apps->slpi" },
++		{ M_SPART, 481, "smp2p slpi->apps" }, { M_SPART, IT_DESC, "glink desc" },
++		{ M_SPART, IT_TX, "glink apps fifo" }, { M_SPART, IT_RX, "glink slpi fifo" },
++	};
++	snprintf(sum, n, "partition 0/3 at +%#x, items", sl_part_off);
++	for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++		uint32_t off = sm_find(items[i].map, items[i].id, &size);
++		if (size == ~0u) {
++			return "partition list broken";
++		}
++		printf("SWEET SLPI: item %u (%s): %s +%#x, %u bytes\n", items[i].id, items[i].name,
++		    off ? "present" : "absent", off, size);
++		strlcat(sum, off ? " +" : " -", n);
++	}
++	strlcat(sum, " (424 430 481 478 479 480)", n);
++	if (ad_bad) {
++		return "a refused smem read";
++	}
++
++	/* the image: what ad_stage2's check_mdt checks, on slpi_fw[] (stage 2 reloads ad_mdt) */
++	if (!load(&slpi_fw[0], 0, ad_mdt, sizeof(ad_mdt))) {
++		return "slpi.mdt";
++	}
++	memcpy(&phoff, ad_mdt + 28, 4);
++	memcpy(&phnum, ad_mdt + 44, 2);
++	if (memcmp(ad_mdt, "\177ELF\001", 5) != 0 || phoff != 52 || phnum < 2 || phnum > 32 ||
++	    52 + 32u * phnum > slpi_fw[0].size) {
++		return "slpi.mdt: not an ELF32 header with phdrs right after it";
++	}
++	for (unsigned i = 0; i < phnum; i++) {
++		ph(i, &p);
++		if (i == 0 || (p.flags & (7u << 24)) == (2u << 24)) {
++			meta += p.filesz;               /* ELF header + hash segment = the whole mdt */
++		}
++		if (!ph_load(&p)) {
++			continue;
++		}
++		reloc |= !!(p.flags & (1u << 27));
++		min = MIN(min, (uint64_t)p.paddr);
++		max = MAX(max, ((uint64_t)p.paddr + p.memsz + 0xfff) & ~0xfffull);
++		if (p.filesz == 0) {
++			continue;
++		}
++		char name[16];
++		const struct ad_fw *f = NULL;
++		snprintf(name, sizeof(name), "slpi.b%02u", i);
++		for (unsigned k = 1; k < sizeof(slpi_fw) / sizeof(slpi_fw[0]) && !f; k++) {
++			f = strcmp(slpi_fw[k].name, name) == 0 ? &slpi_fw[k] : NULL;
++		}
++		if (f == NULL || f->size != p.filesz || p.filesz > p.memsz) {
++			printf("SWEET SLPI: segment %u (%u bytes): no matching %s in slpi_fw[]\n", i, p.filesz, name);
++			return "a segment is not an slpi.bNN file of the table";
++		}
++		if (!load(f, 0, NULL, 0)) {
++			return f->name;
++		}
++		nseg++;
++		bytes += p.filesz;
++	}
++	printf("SWEET SLPI: image: %u phdrs, metadata %#x, %u segments (%u bytes) crc ok, linked %#llx-%#llx "
++	    "(%#llx bytes)%s, region %#x\n", phnum, meta, nseg, bytes, min, max, max - min,
++	    reloc ? " relocatable" : " NOT relocatable", SL_SIZE);
++	if (meta != slpi_fw[0].size || !reloc || max <= min || max - min > SL_SIZE) {
++		return "image: metadata is not header + hash, not relocatable, or larger than the region";
++	}
++	snprintf(sum + strlen(sum), n - strlen(sum), ", %u segments crc ok, %#llx of %#x", nseg, max - min, SL_SIZE);
++	return slots >= 3 ? "region taken by scanout slot 3 (sweetzc_slots=3)" : NULL;
++}
++
+ static void
+ ad_thread(void *arg, __unused wait_result_t wr)
+ {
+@@ -1838,10 +1984,21 @@
+ 	printf("SWEET ADSP: read-only probe (adsp=%d)\n", mode);
+ 	if ((err = ad_probe(sum, sizeof(sum))) != NULL) {
+ 		printf("SWEET ADSP: stage 1: FAILED: %s\n", err);
++		if (sl_mode > 0) {
++			printf("SWEET SLPI: probe: FAILED: not run, it needs ADSP stage 1's SMEM maps\n");
++		}
+ 		goto out;
+ 	}
+ 	printf("SWEET ADSP: stage 1: ok: %s\n", sum);
+ 	reached = 1;
++	if (sl_mode > 0) {
++		char ssum[160] = "";
++		if ((err = sl_probe(ssum, sizeof(ssum))) != NULL) {
++			printf("SWEET SLPI: probe: FAILED: %s (%s)\n", err, ssum);
++		} else {
++			printf("SWEET SLPI: probe: ok: %s\n", ssum);
++		}
++	}
+ 	if (mode < 2) {
+ 		goto out;
+ 	}
+@@ -1856,7 +2013,7 @@
+ 	}
+ out:
+ 	printf("SWEET ADSP: done: adsp=%d, last good stage %d%s\n", mode, reached,
+-	    reached == MIN(mode, 5) ? "" : " (stopped early)");
++	    reached == MIN(MAX(mode, 1), 5) ? "" : " (stopped early)");    /* 0325: adsp=0 with slpi=1 */
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+@@ -1864,14 +2021,18 @@
+ sweet_adsp_probe(void)
+ {
+ 	static bool once;
+-	int mode = 0;
++	int mode = 0, sl = 0;
+ 	thread_t th;
+ 
+-	if (once || !PE_parse_boot_argn("adsp", &mode, sizeof(mode)) || mode <= 0) {
++	(void)PE_parse_boot_argn("adsp", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("slpi", &sl, sizeof(sl));      /* 0325: slpi=1 alone runs stage 1 + the probe */
++	if (once || (mode <= 0 && sl <= 0)) {
+ 		return;
+ 	}
+ 	once = true;            /* one attempt per boot */
++	mode = MAX(mode, 0);
+ 	ad_mode = mode;
++	sl_mode = sl;
+ 	if (kernel_thread_start(ad_thread, (void *)(uintptr_t)mode, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
