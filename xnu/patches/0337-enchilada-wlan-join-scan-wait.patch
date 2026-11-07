@@ -1,0 +1,31 @@
+enchilada: a join no longer waits for ever on a scan whose end never came
+
+After wifid made us leave KSASN (toggling Private Wi-Fi Address), its next ASSOCIATE was logged but no join ever began and Settings spun: ws_poll starts a join only once wn.scanning is clear, and a scan started right after the leave (the station vdev stopped under it) never got its SCAN_EVENT. A join that has waited 6 s now drops that scan; should the firmware still be scanning, VDEV_START is refused and the join fails cleanly, so wifid gets an answer.
+
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -5627,6 +5627,24 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * 0337: a join waits for the scan in flight, and a scan whose end the firmware never reports
++	 * (one started right after a leave, the station vdev stopped under it) left wn.scanning set:
++	 * every later join waited for ever and wifid's join spun in Settings. After 6 s the scan is
++	 * dropped; if the firmware still scans, VDEV_START is refused and the join fails cleanly.
++	 */
++	static unsigned join_wait;
++	if (ws_req.join && wn.scanning) {
++		if (join_wait == 0) {
++			join_wait = t ? t : 1;
++		} else if (t - join_wait > 6000) {
++			printf("SWEET WLAN: join waited %u ms for a scan that never ended: scan dropped\n", t - join_wait);
++			wn.scanning = false;
++			join_wait = 0;
++		}
++	} else {
++		join_wait = 0;
++	}
+ 	if (ws_req.join && !wn.scanning) {
+ 		if (ws.state != WS_IDLE) {
+ 			bool joining = ws.state != WS_UP;
