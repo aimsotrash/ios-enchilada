@@ -1,0 +1,35 @@
+enchilada: USB on by default (sweetusb=2 sweetusbsmmu=2 sweetusbphy=4 are the defaults)
+
+Every boot since 0193 passed sweetusb=2 sweetusbsmmu=2 sweetusbphy=4 (USB Ethernet + SSH; mss=9 and later also rely on sweetusbsmmu=2 for the WLAN SMR). They cost 43 of the 607 command-line bytes, which the 0324/0325/0326 probes need. Each still takes its value from the command line; =0 turns it off as before (sweetusbsmmu now runs when its value is non-zero, given or not).
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -173,14 +173,15 @@
+ void
+ sweet_usb_probe(void)
+ {
+-	int enabled = 1;
++	int enabled = 2;        /* 0327: was 1; every boot since 0193 passed sweetusb=2 */
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 report state only, 2 (default, 0327) also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+-	int smmudump = 0;
+-	if (PE_parse_boot_argn("sweetusbsmmu", &smmudump, sizeof(smmudump)) && smmudump) {
++	int smmudump = 2;       /* 0327: default 2 (was off unless given), sweetusbsmmu=0 turns it off */
++	(void)PE_parse_boot_argn("sweetusbsmmu", &smmudump, sizeof(smmudump));
++	if (smmudump) {
+ 		sweet_usb_smmu_dump(smmudump);
+ 	}
+ 	if (!enabled) {
+@@ -1087,7 +1088,7 @@
+ 	 *   5  mode 4 in slow motion: every step printed on the panel with 3 s
+ 	 *      pauses, so a photo of the last line names the step that faults
+ 	 */
+-	int phyinit = 0;
++	int phyinit = 4;        /* 0327: default 4 (was 0), the mode every boot has used; sweetusbphy=0 skips */
+ 	PE_parse_boot_argn("sweetusbphy", &phyinit, sizeof(phyinit));
+ 	vm_offset_t phy = phyinit ? ml_io_map(QUSB2_PA, QUSB2_SIZE) : 0;
+ 	if (phy != 0) {
