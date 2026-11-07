@@ -1,0 +1,455 @@
+enchilada: panel brightness and sleep over MIPI DSI; AppleARMBacklight for CoreBrightness
+
+iOS 16.7.16 (iPhone10,3) brightness never goes through an IOMobileFramebuffer selector. CoreBrightness (in backboardd) matches {backlight-control = true}, requires IOObjectConformsTo "AppleARMBacklight" (-[CBDisplayContaineriOS findBacklight] 0x1af0cb224/0x1af0cb398, setupInternalModules 0x1af0cec70) and reads IODisplayParameters/brightness/{value,min,max} (DisplayCreateWithID 0x1af0d8794; without it no display); with none: "Built in display/backlight driver has not been found." and no slider or auto-brightness. With new-backlight-architecture = true it sets "brightness-nits" (SInt32, 16.16 nits; SetBLDriverNitsValue ~0x1aeff5a74) on that service and "IOMFBBrightnessLevel" (same value) on the IOMFB service (SetIOMFBBrightness 0x1af016814). Without backlight-calibration-parameters its range is 5..400 nits (0x1af0d9684).
+
+AppleARMBacklight (child of AppleCLCD) now carries those properties and maps brightness-nits linearly onto the panel's DCS 0x51 range 0..1023, big-endian (panel-samsung-sofef00.c, mipi_dsi_dcs_set_display_brightness_large), with sweetbl_nits (default 400) as the top; the legacy "brightness" key is taken as is, other keys are accepted. AppleCLCD accepts IOMFBBrightnessLevel. RequestPowerChange(0) (selector 12) now also puts the panel to sleep: ABL's pipe back (0254's restore), the splash PINGPONG's autorefresh stopped as dpu_hw_pingpong.c dpu_hw_pp_disable_autorefresh, then 0x28, 40 ms, 0x10, 160 ms (sofef00_panel_off); on: 0x11, 10 ms, 0x29 (sofef00_panel_on without reset/init), autorefresh back and a CTL_START kickoff (dpu_hw_ctl_trigger_start). The software blanking stays.
+
+DCS writes go out through DSI0's command DMA (0xae94000 + DSI_6G_REG_SHIFT 4, v2.2.1) as Linux dsi_host.c does: packet in MSM order (header 1, 2, 0, 0x80 | long 0x40, payload, 0xff pad) in a contiguous buffer below 4 GiB (needs 0250's MDP SMMU bypass verdict: Linux maps it in the MDP address space), CMD_DMA_CTRL = FROM_FRAME_BUFFER | LOW_POWER, CTRL |= CMD_MODE_EN | ENABLE, INTR_CTRL |= MASK_CMD_DMA_DONE, DMA_BASE, DMA_LEN, TRIG_DMA = 1, then CMD_DMA_DONE polled for up to 200 ms and everything put back. TRIG_CTRL gets the software DMA trigger and BLOCK_DMA_WITHIN_FRAME (dsi_ctrl_enable). A timeout stops all further DSI commands for the boot. Each command is logged ("SWEET BL: ..."; brightness at most once a second). fMdpLock serialises it with the MDP. Boot-arg sweetbl=0 turns it all off.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -94,6 +94,8 @@
+ /* 0254: 1 = shutdown/restart under way (for good), 2 = system sleep: no flips, no waiting for frames. */
+ static volatile uint32_t sweet_fb_paused;
+ static IOReturn sweet_fb_power_note(void *, void *, UInt32, IOService *, void *, vm_size_t);
++static bool sweet_bl_init(uint32_t height);     /* 0322 */
++#define SWEET_BL_MAX                    1023u   /* 0322: panel-samsung-sofef00.c max_brightness */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -187,8 +189,10 @@
+ 	void          zcFail(const char *why, bool wait);
+ 	void          zcSay(const char *what, uint32_t id);
+ 	void          pauseConsole(void);
++	void          panelPower(bool on);    /* 0322 */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -208,6 +212,23 @@
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++/*
++ * 0322: CoreBrightness (in backboardd) builds its built-in display only from a service matching
++ * {backlight-control = true} that conforms to AppleARMBacklight (-[CBDisplayContaineriOS
++ * findBacklight], setupInternalModules) with IODisplayParameters/brightness/{min,max,value}
++ * (DisplayCreateWithID, else no display); without one: "Built in display/backlight driver has
++ * not been found." and no slider or auto-brightness. It then sets brightness-nits on it.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	uint32_t   fMaxNits;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -591,6 +612,40 @@
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
++	/* 0322: panel brightness and sleep over DSI (sweetbl=0: off); fMdpLock serialises them with the MDP */
++	if (sweet_bl_init(fHeight) && (fMdpLock != NULL || (fMdpLock = IOLockAlloc()) != NULL)) {
++		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++		OSDictionary *params = OSDictionary::withCapacity(1), *range = OSDictionary::withCapacity(3);
++		static const char *const keys[3] = { "min", "max", "value" };
++		const uint32_t vals[3] = { 0, SWEET_BL_MAX, SWEET_BL_MAX };
++		for (uint32_t i = 0; range != NULL && i < 3; i++) {
++			OSNumber *n = OSNumber::withNumber(vals[i], 32);
++			if (n != NULL) {
++				range->setObject(keys[i], n);
++				n->release();
++			}
++		}
++		if (bl != NULL && bl->init() && params != NULL && range != NULL && range->getCount() == 3 &&
++		    params->setObject("brightness", range) && bl->setProperty("IODisplayParameters", params)) {
++			bl->fFB = this;
++			bl->fMaxNits = 400;     /* CoreBrightness's own top without backlight-calibration-parameters */
++			(void)PE_parse_boot_argn("sweetbl_nits", &bl->fMaxNits, sizeof(bl->fMaxNits));
++			bl->fMaxNits = bl->fMaxNits ? bl->fMaxNits : 400;
++			bl->setProperty("backlight-control", true);
++			bl->setProperty("new-backlight-architecture", true);
++			bl->setName("backlight");
++			if (bl->attach(this)) {
++				bl->registerService();
++				IOLog("SWEET BL: AppleARMBacklight published: brightness-nits 0..%u nits -> DCS 0x51 0..%u "
++				    "(sweetbl_nits=N moves the top)\n", bl->fMaxNits, SWEET_BL_MAX);
++			}
++		} else {
++			IOLog("SWEET BL: could not publish AppleARMBacklight\n");
++		}
++		OSSafeReleaseNULL(range);
++		OSSafeReleaseNULL(params);
++		OSSafeReleaseNULL(bl);
++	}
+ 	IOLog("SWEET FB: start done\n");
+ 	return true;
+ }
+@@ -1690,6 +1745,339 @@
+ }
+ 
+ /*
++ * 0322: the panel itself, over MIPI DSI: brightness (DCS 0x51) and sleep (0x28/0x10, 0x11/0x29).
++ * ABL left DSI0 (DSI 6G v2.2.1) and the Samsung panel running in command mode; this only adds
++ * DCS writes through the controller's command DMA, as Linux msm dsi_host.c does it, polled
++ * instead of the CMD_DMA_DONE interrupt. Boot-arg sweetbl=0 turns all of it off.
++ */
++#define SWEET_DSI0_PA           0x0ae94000u     /* Linux dsi_cfg.c sdm845_dsi_cfg io_start */
++#define SWEET_DSI_MAP           0x4000u
++#define SWEET_DSI_SHIFT         4u              /* dsi_cfg.h DSI_6G_REG_SHIFT: registers after 6G_HW_VERSION */
++#define SWEET_DSI_V2_2_1        0x20020001u     /* dsi_cfg.h MSM_DSI_6G_VER_MINOR_V2_2_1 */
++/* dsi.xml.h, offsets after the shift */
++#define DSI_CTRL                0x000u
++#define DSI_CTRL_ENABLE         (1u << 0)
++#define DSI_CTRL_CMD_MODE_EN    (1u << 2)
++#define DSI_STATUS0             0x004u
++#define DSI_FIFO_STATUS         0x008u
++#define DSI_CMD_DMA_CTRL        0x038u
++#define DSI_CMD_DMA_FROM_FB     (1u << 28)
++#define DSI_CMD_DMA_LOW_POWER   (1u << 26)
++#define DSI_DMA_BASE            0x044u
++#define DSI_DMA_LEN             0x048u
++#define DSI_ACK_ERR_STATUS      0x064u
++#define DSI_TRIG_CTRL           0x080u
++#define DSI_TRIG_DMA_SW         4u              /* DMA_TRIGGER field [2:0] = TRIGGER_SW */
++#define DSI_TRIG_BLOCK_DMA      (1u << 12)      /* BLOCK_DMA_WITHIN_FRAME */
++#define DSI_TRIG_DMA            0x08cu
++#define DSI_TIMEOUT_STATUS      0x0bcu
++#define DSI_INTR_CTRL           0x10cu
++#define DSI_IRQ_CMD_DMA_DONE    (1u << 0)
++#define DSI_IRQ_MASK_CMD_DMA_DONE (1u << 1)
++#define SWEET_DSI_DMA_US        200000u         /* dsi_cmd_dma_tx waits 200 ms for CMD_DMA_DONE */
++/* dpu_hw_pingpong.c / dpu_hw_ctl.c */
++#define PP_SYNC_CONFIG_VSYNC    0x004u
++#define PP_EXTERNAL_TE          (1u << 20)
++#define PP_LINE_COUNT           0x02cu
++#define PP_AUTOREFRESH_CONFIG   0x030u
++#define SWEET_CTL_START         0x01cu
++
++static struct {
++	vm_offset_t  map, dsi;          /* DSI0 mapping, and its registers (map + shift); 0: off */
++	IOBufferMemoryDescriptor *buf;  /* command DMA buffer, below 4 GiB */
++	uint8_t     *va;
++	uint32_t     pa;
++	bool         broken;            /* a command timed out: no more */
++	bool         asleep;            /* 0x28/0x10 sent */
++	uint32_t     autorefresh;       /* PINGPONG autorefresh config stopped for sleep */
++	uint32_t     level;             /* last 0x51 value sent, ~0u: none */
++	uint32_t     height;            /* panel lines, for the autorefresh stop */
++} sweet_bl = { 0, 0, NULL, NULL, 0, false, false, 0, ~0u, 0 };
++
++static inline void
++sweet_bl_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++sweet_bl_init(uint32_t height)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetbl", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET BL: off (sweetbl=0): no panel brightness or sleep\n");
++		return false;
++	}
++	/*
++	 * Linux maps the command buffer into the MDP's address space (dsi_tx_buf_alloc_6g:
++	 * kms->aspace), so the DSI command DMA fetches through the MDP's SMMU streams: a
++	 * physical address works only while 0250 found them bypassed.
++	 */
++	if (sweet_mdp.base == 0 || sweet_mdp.smmu != 1 || sweet_mdp.lm < 0 || sweet_mdp.ctl < 0) {
++		IOLog("SWEET BL: skipped: needs 0250's MDP probe with the splash CTL/mixer found and the MDP SMMU "
++		    "streams bypassed (sweetmdp=0, or its verdict)\n");
++		return false;
++	}
++	vm_offset_t map = ml_io_map(SWEET_DSI0_PA, SWEET_DSI_MAP);
++	if (map == 0) {
++		IOLog("SWEET BL: cannot map DSI0\n");
++		return false;
++	}
++	vm_offset_t d = map + SWEET_DSI_SHIFT;
++	uint32_t ver = sweet_rd(map, 0), ctrl = sweet_rd(d, DSI_CTRL), trig = sweet_rd(d, DSI_TRIG_CTRL);
++	IOLog("SWEET BL: DSI0 version 0x%08x ctrl 0x%08x status0 0x%08x cmd dma ctrl 0x%08x trig ctrl 0x%08x intr 0x%08x\n",
++	    ver, ctrl, sweet_rd(d, DSI_STATUS0), sweet_rd(d, DSI_CMD_DMA_CTRL), trig, sweet_rd(d, DSI_INTR_CTRL));
++	if (ver != SWEET_DSI_V2_2_1 || (ctrl & (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) !=
++	    (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) {
++		IOLog("SWEET BL: skipped: DSI0 is not a v2.2.1 controller left enabled in command mode\n");
++		ml_io_unmap(map, SWEET_DSI_MAP);
++		return false;
++	}
++	sweet_bl.buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionOut | kIOMemoryPhysicallyContiguous, 4096, 0x00000000fffff000ULL);
++	uint64_t pa = sweet_bl.buf != NULL ? sweet_bl.buf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++	if (pa == 0 || pa >= (1ULL << 32) || sweet_bl.buf->getBytesNoCopy() == NULL) {
++		IOLog("SWEET BL: skipped: no command buffer below 4 GiB\n");
++		OSSafeReleaseNULL(sweet_bl.buf);
++		ml_io_unmap(map, SWEET_DSI_MAP);
++		return false;
++	}
++	/* dsi_host.c dsi_ctrl_enable: DMA triggered by software, held off while a frame is sent (v1.2+) */
++	uint32_t want = (trig & ~7u) | DSI_TRIG_DMA_SW | DSI_TRIG_BLOCK_DMA;
++	if (want != trig) {
++		sweet_bl_wr(d, DSI_TRIG_CTRL, want);
++		IOLog("SWEET BL: DSI0 trig ctrl 0x%08x -> 0x%08x (software DMA trigger, blocked within a frame)\n",
++		    trig, want);
++	}
++	sweet_bl.va = (uint8_t *)sweet_bl.buf->getBytesNoCopy();
++	sweet_bl.pa = (uint32_t)pa;
++	sweet_bl.height = height;
++	sweet_bl.map = map;
++	sweet_bl.dsi = d;               /* last: on */
++	IOLog("SWEET BL: on: DCS commands via DSI0 command DMA, buffer 0x%08x (sweetbl=0 turns it off)\n", sweet_bl.pa);
++	return true;
++}
++
++/*
++ * One DCS write (cmd byte + parameters) as dsi_host.c sends it: msm_dsi_host_xfer_prepare,
++ * dsi_cmd_dma_add (packet in the MSM order: header bytes 1, 2, 0, flags), dsi_cmd_dma_tx /
++ * msm_dsi_host_cmd_xfer_commit, msm_dsi_host_xfer_restore. Low power, as Linux's host default
++ * (CMD_DMA_CTRL = FROM_FRAME_BUFFER | LOW_POWER). Polls CMD_DMA_DONE. fMdpLock held; thread only.
++ */
++static bool
++sweet_dsi_dcs(const char *what, const uint8_t *p, uint32_t n, bool quiet = false)
++{
++	vm_offset_t d = sweet_bl.dsi;
++	uint8_t *b = sweet_bl.va;
++	uint32_t len;
++	if (d == 0 || sweet_bl.broken || n == 0 || n > 60) {
++		if (quiet) {
++			return false;
++		}
++		IOLog("SWEET BL: %s (DCS 0x%02x): not sent (%s)\n", what, p[0],
++		    d == 0 ? "off" : sweet_bl.broken ? "an earlier command timed out" : "bad length");
++		return false;
++	}
++	if (n <= 2) {           /* drm_mipi_dsi.c: DCS short write 0x05, with one parameter 0x15 */
++		b[0] = p[0];
++		b[1] = n == 2 ? p[1] : 0;
++		b[2] = n == 2 ? 0x15 : 0x05;
++		b[3] = 0x80;    /* last packet */
++		len = 4;
++	} else {                /* DCS long write 0x39: word count in the header, payload after, 0xff to a word */
++		b[0] = (uint8_t)n;
++		b[1] = 0;
++		b[2] = 0x39;
++		b[3] = 0x80 | 0x40;
++		memcpy(b + 4, p, n);
++		len = (4 + n + 3) & ~3u;
++		memset(b + 4 + n, 0xff, len - 4 - n);
++	}
++	clean_dcache64((addr64_t)(uintptr_t)b, len, FALSE);
++	uint32_t ctrl = sweet_rd(d, DSI_CTRL), dma = sweet_rd(d, DSI_CMD_DMA_CTRL), intr = sweet_rd(d, DSI_INTR_CTRL);
++	sweet_bl_wr(d, DSI_CMD_DMA_CTRL, DSI_CMD_DMA_FROM_FB | DSI_CMD_DMA_LOW_POWER);
++	sweet_bl_wr(d, DSI_CTRL, ctrl | DSI_CTRL_CMD_MODE_EN | DSI_CTRL_ENABLE);
++	sweet_bl_wr(d, DSI_INTR_CTRL, intr | DSI_IRQ_MASK_CMD_DMA_DONE);       /* also acks a stale DONE */
++	sweet_bl_wr(d, DSI_DMA_BASE, sweet_bl.pa);
++	sweet_bl_wr(d, DSI_DMA_LEN, len);
++	sweet_bl_wr(d, DSI_TRIG_DMA, 1);
++	uint32_t us = 0, v = 0;
++	for (; us < SWEET_DSI_DMA_US; us += 20) {
++		v = sweet_rd(d, DSI_INTR_CTRL);
++		if (v & DSI_IRQ_CMD_DMA_DONE) {
++			break;
++		}
++		IODelay(20);
++	}
++	bool done = (v & DSI_IRQ_CMD_DMA_DONE) != 0;
++	/* ack DONE (write 1, as dsi_host_irq), put the mask, CTRL and CMD_DMA_CTRL back */
++	sweet_bl_wr(d, DSI_INTR_CTRL, (v & ~DSI_IRQ_MASK_CMD_DMA_DONE) | (intr & DSI_IRQ_MASK_CMD_DMA_DONE));
++	sweet_bl_wr(d, DSI_CTRL, ctrl);
++	sweet_bl_wr(d, DSI_CMD_DMA_CTRL, dma);
++	if (!done) {
++		sweet_bl.broken = true;
++		IOLog("SWEET BL: %s (DCS 0x%02x, %u bytes): TIMED OUT after %u ms: status0 0x%08x fifo 0x%08x ack err 0x%08x "
++		    "timeout 0x%08x intr 0x%08x; no more DSI commands this boot\n", what, p[0], len, SWEET_DSI_DMA_US / 1000,
++		    sweet_rd(d, DSI_STATUS0), sweet_rd(d, DSI_FIFO_STATUS), sweet_rd(d, DSI_ACK_ERR_STATUS),
++		    sweet_rd(d, DSI_TIMEOUT_STATUS), v);
++		return false;
++	}
++	if (!quiet) {
++		IOLog("SWEET BL: %s (DCS 0x%02x, %u bytes): done after %u us, ack err 0x%08x\n", what, p[0], len, us,
++		    sweet_rd(d, DSI_ACK_ERR_STATUS));
++	}
++	return true;
++}
++
++/*
++ * panel-samsung-sofef00.c sofef00_panel_bl_update_status: 0x51, 16 bits big-endian, 0..1023.
++ * CoreBrightness ramps every change, so a success is logged at most once a second (with how
++ * many went out since); failures always. fMdpLock held.
++ */
++static void
++sweet_bl_level(uint32_t level, const char *from)
++{
++	static uint64_t said;
++	static uint32_t unsaid;
++	level = level > SWEET_BL_MAX ? SWEET_BL_MAX : level;
++	if (level == sweet_bl.level) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), second;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
++	bool quiet = said != 0 && now - said < second;
++	const uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++	char what[96];
++	snprintf(what, sizeof(what), "brightness %u/%u from %s (%u more since the last line)", level, SWEET_BL_MAX,
++	    from, unsaid);
++	if (sweet_dsi_dcs(what, cmd, sizeof(cmd), quiet)) {
++		sweet_bl.level = level;
++	}
++	if (quiet) {
++		unsaid++;
++	} else {
++		said = now;
++		unsaid = 0;
++	}
++}
++
++/*
++ * Panel sleep / wake (sofef00_panel_off / _on without the reset and init: the panel keeps its
++ * registers in sleep). Around it the splash PINGPONG's autorefresh stops (dpu_hw_pingpong.c
++ * dpu_hw_pp_disable_autorefresh) and is put back with a CTL_START kickoff, so the MDP pushes
++ * no frames into a sleeping panel. fMdpLock held; sleeps up to ~0.3 s.
++ */
++static void
++sweet_bl_sleep(bool down)
++{
++	if (sweet_bl.dsi == 0 || down == sweet_bl.asleep) {
++		return;
++	}
++	vm_offset_t pp = sweet_mdp.base + SWEET_PP(sweet_lm[sweet_mdp.lm].pp);
++	vm_offset_t ctl = sweet_mdp.base + SWEET_CTL(sweet_mdp.ctl);
++	static const uint8_t off[] = { 0x28 }, in[] = { 0x10 }, out[] = { 0x11 }, on[] = { 0x29 };
++	if (down) {
++		uint32_t ar = sweet_rd(pp, PP_AUTOREFRESH_CONFIG), lines = 0, ms = 0;
++		if (ar >> 31) {
++			uint32_t vs = sweet_rd(pp, PP_SYNC_CONFIG_VSYNC);
++			sweet_bl_wr(pp, PP_SYNC_CONFIG_VSYNC, vs & ~PP_EXTERNAL_TE);
++			sweet_bl_wr(pp, PP_AUTOREFRESH_CONFIG, 0);
++			for (; ms < 84; ms += 2) {      /* KICKOFF_TIMEOUT_MS, polled every 2 ms as Linux */
++				IODelay(2000);
++				lines = sweet_rd(pp, PP_LINE_COUNT) & 0xffff;
++				if (lines == 0 || lines >= sweet_bl.height) {
++					break;
++				}
++			}
++			sweet_bl_wr(pp, PP_SYNC_CONFIG_VSYNC, vs);
++		}
++		sweet_bl.autorefresh = ar;
++		IOLog("SWEET BL: PP%u autorefresh 0x%08x -> 0 (%s, write line %u after %u ms)\n", sweet_lm[sweet_mdp.lm].pp,
++		    ar, (ar >> 31) ? "stopped" : "was off", lines, ms);
++		if (sweet_dsi_dcs("display off", off, 1)) {
++			IOSleep(40);
++			if (sweet_dsi_dcs("sleep in", in, 1)) {
++				IOSleep(160);
++			}
++		}
++		sweet_bl.asleep = true;         /* even half done: wake sends 0x11/0x29 and restarts the MDP */
++		return;
++	}
++	if (sweet_dsi_dcs("sleep out", out, 1)) {
++		IOSleep(10);
++	}
++	(void)sweet_dsi_dcs("display on", on, 1);
++	if (sweet_bl.autorefresh >> 31) {
++		sweet_bl_wr(pp, PP_AUTOREFRESH_CONFIG, sweet_bl.autorefresh);
++		sweet_bl_wr(ctl, SWEET_CTL_START, 1);   /* dpu_hw_ctl_trigger_start: the command-mode kickoff */
++		IOLog("SWEET BL: PP%u autorefresh back to 0x%08x, CTL%d started\n", sweet_lm[sweet_mdp.lm].pp,
++		    sweet_bl.autorefresh, sweet_mdp.ctl);
++	}
++	sweet_bl.asleep = false;
++}
++
++/*
++ * RequestPowerChange: the panel to sleep after fPowerOff is set (no flips from then on), out
++ * of it before fPowerOff is cleared. ABL's pipe is put back first while frames still run, so no
++ * write lock waits for a frame that will not come and nothing scans a client surface asleep.
++ */
++void
++AppleCLCD::panelPower(bool on)
++{
++	if (sweet_bl.dsi == 0 || fMdpLock == NULL) {
++		return;         /* sweetbl=0 or not set up: the software blanking alone, as before */
++	}
++	IOLockLock(fMdpLock);
++	if (!on) {
++		zcStop("display off", false, false);
++		for (uint32_t ms = 0; sweet_mdp_away && ms < SWEET_ZC_LATCH_MS; ms++) {
++			IOSleep(1);
++			zcStop("display off", false, false);
++		}
++	}
++	sweet_bl_sleep(!on);
++	IOLockUnlock(fMdpLock);
++}
++
++/* CoreBrightness's SetIOMFBBrightness also sets IOMFBBrightnessLevel (16.16 nits) here: the backlight service handles it. */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	return d != NULL && d->getObject("IOMFBBrightnessLevel") != NULL ? kIOReturnSuccess : IOService::setProperties(properties);
++}
++
++/*
++ * CoreBrightness (new-backlight-architecture): "brightness-nits", SInt32 16.16 nits, mapped
++ * linearly onto 0..1023 with sweetbl_nits (default 400) as the top; the legacy "brightness"
++ * (IODisplayParameters range 0..1023) as is. Other keys (DisplayBrightnessSliderPosition,
++ * FadePeriod, backlight-level) are accepted and ignored.
++ */
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *nits = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
++	OSNumber *raw = OSDynamicCast(OSNumber, d->getObject("brightness"));
++	if ((nits == NULL && raw == NULL) || fFB == NULL || fFB->fMdpLock == NULL) {
++		return kIOReturnSuccess;
++	}
++	int64_t v = (int32_t)(nits != NULL ? nits : raw)->unsigned32BitValue();
++	if (nits != NULL) {
++		v = v * SWEET_BL_MAX / ((int64_t)fMaxNits << 16);
++	}
++	IOLockLock(fFB->fMdpLock);
++	sweet_bl_level(v < 0 ? 0 : v > SWEET_BL_MAX ? SWEET_BL_MAX : (uint32_t)v, nits != NULL ? "brightness-nits" : "brightness");
++	IOLockUnlock(fFB->fMdpLock);
++	return kIOReturnSuccess;
++}
++
++/*
+  * 0254: shutdown, restart and panic restart (SweetPlatformExpert's PE_halt_restart, before
+  * sweet_reboot_fastboot) and the root domain's restart/power-off notice. No lock is taken (a
+  * stuck SwapEnd may hold fMdpLock) and nothing waits for a frame (the MDP may be stopping):
+@@ -1861,6 +2249,9 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			if (!off) {
++				fFB->panelPower(true);  /* 0322: panel awake before frames resume */
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+@@ -1869,6 +2260,9 @@
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			if (off) {
++				fFB->panelPower(false); /* 0322: after fPowerOff: no flips from here on */
++			}
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
