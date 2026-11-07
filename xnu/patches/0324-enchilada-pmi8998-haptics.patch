@@ -1,0 +1,217 @@
+enchilada: PMI8998 haptics probe and one test pulse (boot-arg sweethaptic)
+
+The OnePlus 6/6T vibrator is an LRA on the PMI8998 haptics block, SID 3 base 0xc000 (dtbo_a overlays, every enchilada and fajita entry: "qcom,qpnp-haptics", actuator-type 0 = LRA, play-mode buffer, vmax 2088 mV, ilim 800 mA, sc-dbc-cycles 8, wave-play-rate 4255 us, clock trim in MISC 0x9f3). sweet_haptic_init() runs from SweetPlatformExpert::start after sweet_reboot_init() and does nothing without the boot-arg. sweethaptic=1 checks the REVID (type 0x51, subtype 0x15 = PMI8998), finds the APID of PPID 0x3c0 and its owner, reads the trim and dumps the block's registers (read only, observer channel). sweethaptic=2 also, when the APID's owner is EE 0, writes the downstream leds-qpnp-haptics.c long-pattern configuration (LRA, auto-res ZXD_EOP/high-z opt1/cal 32, buffer mode, vmax sweethaptic_mv default 1508 mV capped at the DT's 2088, ILIM 400 mA, SC debounce 8, sine, rate code 4255/5 with the trim, no brake, no overdrive, eight samples 0x28), every write read back, refuses to play on a busy or short-circuit flag, plays 100 ms (EN_CTL 0x46 = 0x80, PLAY 0x70 = 0x80) while polling the short-circuit flags every 10 ms, then forces PLAY = 0 and EN = 0 (retried up to 3 times) and dumps the registers again. Nothing above 0xd0 is written (no secure unlock; TEST2 auto-resonance enable stays as found). Writes use the RW channel as sweet_reboot_fastboot() does.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -411,4 +411,192 @@
+ 	printf("SWEET RB: PSCI SYSTEM_OFF returned %d, still running\n", (int)x0);
+ 	return -1;
+ }
++
++/*
++ * 0324: PMI8998 haptics (the OnePlus 6/6T vibrator), behind boot-arg sweethaptic. The block is
++ * SID 3 base 0xc000 (vendor dtbo "qcom,qpnp-haptics" reg <0xc000 0x100> under qcom,pmi8998@3;
++ * mainline pmi8998.dtsi haptics@c000). The motor is an LRA: actuator-type 0, play-mode buffer,
++ * vmax 2088 mV, ilim 800 mA, sc-dbc-cycles 8, wave-play-rate 4255 us, misc-clk-trim-error-reg
++ * 0xf3 (MISC, SID 2 0x900), the same in every enchilada and fajita overlay of dtbo_a.
++ * Registers and the play sequence are downstream leds-qpnp-haptics.c (OnePlus SDM845 tree) and
++ * mainline-candidate qcom-spmi-haptics.c, as their long-pattern (> 20 ms) path, minus what is
++ * not needed for one pulse: no write above 0xd0 (secure, TEST2 auto-resonance enable stays as
++ * found), no brake, no overdrive.
++ *
++ *   sweethaptic=1   read only: REVID gate, the APID and its owner, the block's registers
++ *   sweethaptic=2   ... and one 100 ms pulse at sweethaptic_mv (default 1508 mV, capped at the
++ *                   DT's 2088), samples 0x28 (Android's long-pattern level); every config
++ *                   write read back; stops at once on a short-circuit flag
++ *
++ * Writes go through the RW channel like sweet_reboot_fastboot(), only when the APID's owner is
++ * EE 0. Stop is forced: PLAY = 0 and EN = 0 are retried whatever failed before.
++ */
++#define HAP_PPID        0x3c0u
++#define HAP_MISC_PPID   0x209u
++#define HAP_STATUS_1    0x0au           /* bit 1 busy, bit 3 SC flag, bit 4 auto-res error */
++#define HAP_INT_RT_STS  0x10u           /* bit 0 SC, bit 1 play */
++#define HAP_EN_CTL      0x46u
++#define HAP_PLAY        0x70u
++#define HAP_SAMPLE      0x28u
++#define HAP_RATE_US     4255u           /* qcom,wave-play-rate-us, LRA period (~235 Hz) */
++
++static vm_offset_t hap_chan, hap_obs, hap_misc_obs;
++
++static int
++hap_rd(unsigned reg, uint8_t *out)
++{
++	return rb_xfer(hap_obs, (1u << 27) | (reg << 4), out);
++}
++
++/* Masked write, read back; -1 on a failed transfer or a read-back that differs. */
++static int
++hap_wr(unsigned reg, uint8_t mask, uint8_t val)
++{
++	uint8_t old = 0, back = 0;
++	if (mask != 0xff && hap_rd(reg, &old) != 0) {
++		return -1;
++	}
++	uint8_t want = (uint8_t)((old & ~mask) | (val & mask));
++	if (rb_xfer(hap_chan, reg << 4, &want) != 0 || hap_rd(reg, &back) != 0 ||
++	    (back & mask) != (val & mask)) {
++		printf("SWEET HAPTIC: write %#x = %#x failed (reads %#x, status %#x)\n",
++		    0xc000u + reg, want, back, rb_status);
++		return -1;
++	}
++	return 0;
++}
++
++static void
++hap_stop(void)
++{
++	uint8_t zero = 0, play = 0xff, en = 0xff;
++	for (unsigned t = 0; t < 3 && (play != 0 || en != 0); t++) {
++		zero = 0;
++		(void)rb_xfer(hap_chan, HAP_PLAY << 4, &zero);
++		delay(20 * 1000);       /* let the buffer finish its cycle */
++		zero = 0;
++		(void)rb_xfer(hap_chan, HAP_EN_CTL << 4, &zero);
++		(void)hap_rd(HAP_PLAY, &play);
++		(void)hap_rd(HAP_EN_CTL, &en);
++	}
++	printf("SWEET HAPTIC: stopped, play %#x en %#x%s\n", play, en,
++	    play == 0 && (en & 0x80u) == 0 ? "" : " (NOT STOPPED)");
++}
++
++static void
++hap_dump(const char *when)
++{
++	static const uint8_t regs[] = {0x04, 0x05, 0x0a, 0x0b, 0x0c, 0x10, 0x46, 0x48, 0x4b, 0x4c,
++		0x4d, 0x4e, 0x4f, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x5c, 0x5e, 0x60, 0x61, 0x62,
++		0x63, 0x64, 0x65, 0x66, 0x67, 0x70, 0xe3};
++	char line[400];
++	unsigned n = 0;
++	for (unsigned i = 0; i < sizeof(regs) && n + 12 < sizeof(line); i++) {
++		uint8_t v = 0;
++		if (hap_rd(regs[i], &v) == 0) {
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, " %02x=%02x", regs[i], v);
++		} else {
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, " %02x=??", regs[i]);
++		}
++	}
++	printf("SWEET HAPTIC: %s:%s\n", when, line);
++}
++
++/* One pulse. Config as the downstream long pattern; every step must read back. */
++static void
++hap_pulse(uint32_t mv, uint8_t trim)
++{
++	uint8_t st = 0, rt = 0;
++	uint32_t rate = HAP_RATE_US / 5u;               /* HAP_RATE_CFG_STEP_US */
++	uint32_t err = (trim & 0x0fu) * 7u;             /* 0.7 % per LSB, bit 7 = negative */
++	rate = (trim & 0x80u) ? rate * (1000u - err) / 1000u : rate * (1000u + err) / 1000u;
++	uint8_t vmax = (uint8_t)(((mv + 58u) / 116u) << 1);
++
++	if (hap_wr(0x4c, 0x01, 0x00) ||                 /* CFG1: LRA */
++	    hap_wr(0x4f, 0x7f, 0x47) ||                 /* AUTO_RES: ZXD_EOP, high-z opt1, cal 32 */
++	    hap_wr(0x4e, 0x30, 0x10) ||                 /* SEL: buffer */
++	    hap_wr(0x51, 0x7e, vmax) ||                 /* VMAX, no overdrive */
++	    hap_wr(0x52, 0x01, 0x00) ||                 /* ILIM 400 mA (DT 800) */
++	    hap_wr(0x53, 0x07, 0x01) ||                 /* SC debounce 8 cycles */
++	    hap_wr(0x4d, 0x01, 0x00) ||                 /* CFG2: sine */
++	    hap_wr(0x54, 0xff, (uint8_t)rate) ||        /* RATE_CFG1/2: LRA period */
++	    hap_wr(0x55, 0x0f, (uint8_t)(rate >> 8)) ||
++	    hap_wr(0x48, 0x01, 0x00) ||                 /* EN_CTL2: no brake */
++	    hap_wr(0x5e, 0x73, 0x00)) {                 /* WF_REPEAT 1, sample repeat 1 */
++		printf("SWEET HAPTIC: config failed, no pulse\n");
++		return;
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		if (hap_wr(0x60 + i, 0xff, HAP_SAMPLE)) {
++			printf("SWEET HAPTIC: samples failed, no pulse\n");
++			return;
++		}
++	}
++	if (hap_rd(HAP_STATUS_1, &st) || hap_rd(HAP_INT_RT_STS, &rt) || (st & 0x0au) || (rt & 1u)) {
++		printf("SWEET HAPTIC: status %#x rt %#x before play (busy/short): no pulse\n", st, rt);
++		return;
++	}
++	printf("SWEET HAPTIC: pulse 100 ms, vmax %u mV (%#x), rate code %#x (trim %#x), samples %#x\n",
++	    (vmax >> 1) * 116u, vmax, rate, trim, HAP_SAMPLE);
++	uint8_t on = 0x80;
++	if (rb_xfer(hap_chan, HAP_EN_CTL << 4, &on) == 0) {
++		on = 0x80;
++		(void)rb_xfer(hap_chan, HAP_PLAY << 4, &on);
++		for (unsigned ms = 0; ms < 100; ms += 10) {
++			delay(10 * 1000);
++			if (hap_rd(HAP_STATUS_1, &st) || hap_rd(HAP_INT_RT_STS, &rt) || (st & 0x08u) || (rt & 1u)) {
++				printf("SWEET HAPTIC: at %u ms status %#x rt %#x: stopping\n", ms, st, rt);
++				break;
++			}
++		}
++	}
++	hap_stop();
++	(void)hap_rd(HAP_STATUS_1, &st);
++	printf("SWEET HAPTIC: after: status %#x (auto-res lo/hi in the dump)\n", st);
++}
++
++/* Thread context, after sweet_spmi_init() (SweetPlatformExpert::start). */
++void sweet_haptic_init(void);
++
++void
++sweet_haptic_init(void)
++{
++	uint32_t level = 0, mv = 1508;
++	uint8_t type = 0, subtype = 0, trim = 0;
++	(void)PE_parse_boot_argn("sweethaptic", &level, sizeof(level));
++	(void)PE_parse_boot_argn("sweethaptic_mv", &mv, sizeof(mv));
++	if (level == 0 || !sp_ready) {
++		return;
++	}
++	mv = mv < 116u ? 116u : (mv > 2088u ? 2088u : mv);
++	uint16_t apid = sp_find_apid(HAP_PPID), mapid = sp_find_apid(HAP_MISC_PPID);
++	if (apid == SP_NO_APID || sweet_spmi_read(2, 0x104, &type) || sweet_spmi_read(2, 0x105, &subtype) ||
++	    type != 0x51 || subtype != 0x15) {
++		printf("SWEET HAPTIC: no haptics APID (%u) or no PMI8998 (revid type %#x subtype %#x)\n",
++		    (unsigned)apid, type, subtype);
++		return;
++	}
++	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	hap_obs = sp_obs + 0x80u * apid;
++	if (mapid != SP_NO_APID) {
++		hap_misc_obs = sp_obs + 0x80u * mapid;
++		(void)rb_xfer(hap_misc_obs, (1u << 27) | (0xf3u << 4), &trim);
++	}
++	printf("SWEET HAPTIC: sweethaptic=%u, PMI8998 SID 3 0xc000 APID %u owner %u, misc APID %u trim %#x\n",
++	    level, (unsigned)apid, owner, (unsigned)mapid, trim);
++	hap_dump("as found");
++	if (level < 2) {
++		return;
++	}
++	if (owner != 0) {
++		printf("SWEET HAPTIC: APID owned by EE %u, not apps: no writes\n", owner);
++		return;
++	}
++	hap_chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (!hap_chan) {
++		return;
++	}
++	hap_pulse(mv, trim);
++	hap_dump("after the pulse");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -18,6 +18,7 @@
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_reboot_init(void);
++extern "C" void sweet_haptic_init(void);        /* 0324 */
+ extern "C" int sweet_reboot_fastboot(int panic);
+ extern "C" int sweet_power_off(void);            /* 0321 */
+ extern "C" void sweet_fb_halt(int panic);       /* SweetFramebuffer.cpp, 0254 */
+@@ -450,6 +451,7 @@
+ 	}
+ 	sweet_cpu_clocks();
+ 	sweet_reboot_init();
++	sweet_haptic_init();             /* 0324, boot-arg sweethaptic */
+ 	PE_halt_restart = sweet_halt_restart;
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
