@@ -1,0 +1,483 @@
+enchilada: ADSP stages 4/5: AFE QUAT MI2S RX port start, MAX98927 on SE4, amp tone generator
+
+plan.md Steps 4-5 / §2 (cheapest audible milestone, no PCM path). boot59 verified adsp=3 (q6core answered, AVS 2.8, AFE svc 4 api 2). New boot-arg values; adsp<=3 is unchanged (host check output identical).
+
+adsp=4: stage 3 ends after a 2 s settle instead of the 30 s watch and the ADSP stays up. TLMM gpio58-61 (NORTH) to qua_mi2s (function 1, pinctrl-sdm845.c; 8 mA, no bias, 58/59 output-high as sdm845.dtsi quat_mi2s_*_active). APR to the AFE (svc 4) as q6afe.c does: AFE_SVC_CMD_SET_PARAM / AFE_MODULE_CLOCK_SET / AFE_PARAM_ID_CLOCK_SET for Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT 0x106 at 1.536 MHz (sdm845.c MI2S_BCLK_RATE, attribute COUPLE_NO, root default: the clock path mainline sdm845 uses); AFE_PORT_CMD_SET_PARAM_V2 AFE_PARAM_ID_I2S_CONFIG on 0x1006 (16 bit, AFE_PORT_I2S_SD1 per qcom,sd-lines <1>, stereo, 48 kHz, ws internal, 36 bytes = sizeof(union afe_port_config)); AFE_PORT_CMD_DEVICE_START; 2 s; then always DEVICE_STOP, clock off, the pins' old cfg back, ad_stop(). Every APR basic result is logged; any failure stops the same way.
+
+adsp=5: with the port running, the MAX98927 (0x3a on QUP SE4 i2c@890000) through a new sweet_amp_reg() in sweet_touch.c that reuses the gauge's GENI FIFO engine (third touch_state; gpio89/90 SOUTH qup4 = mux 2/3; GCC wrap0 AHB 6/7, core 8/9, SE4 14, CBCR 0x174f0, RCG 0x174f4). Reset gpio69 (EAST) low 10 ms then high, REV_ID 0x1ff must be 0x40, then Linux max98927_probe + set_fmt (I2S slave NB_NF) + hw_params (16 bit, 48 kHz, BSEL 32) with the lowest gain: digital volume 0 = -16 dB, speaker gain 0x11 = +3 dB (lowest step that is not mute). The amp is not enabled. adsp=5N (N 1..15, e.g. adsp=51) also writes TONE_GEN_DC_CFG 0x38 = N, SPK_SRC_SEL = tone, AMP_EN, GLOBAL_EN for 1 s: neither Linux nor the OnePlus vendor driver documents the TONE_CONFIG encodings, so N is chosen at boot. Teardown always: GLOBAL_EN/AMP_EN/tone off, soft reset, gpio69 held low (amp in reset).
+
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -15,6 +15,10 @@
+  *      ADSP opens is logged; "apr_audio_svc" and "IPCRTR" are opened both ways; APR to q6core (svc 3,
+  *      domain 4): AVCS_CMD_ADSP_EVENT_GET_STATE until ready (3 s), then AVCS_CMD_GET_FWK_VERSION
+  *      (AVCS_GET_VERSIONS if unsupported); QRTR HELLO and the ADSP's NEW_SERVERs logged; 30 s watch
++ *   4  (0320) 3 with a 2 s settle, the ADSP kept up: TLMM gpio58-61 to QUAT MI2S, AFE bit clock, I2S
++ *      config and start of port 0x1006 for 2 s, then stop (ad_stage45)
++ *   5  (0320) 4 + the MAX98927 speaker amp over SE4 I2C (sweet_touch.c): REV_ID, Linux init at the
++ *      lowest gain; adsp=5N (N 1..15) also runs the amp's tone generator (TONE_CONFIG N) for 1 s
+  * Sources, Linux v6.12: remoteproc/qcom_q6v5_pas.c (sdm845_adsp_resource_init: pas_id 1, load_state
+  * "adsp", crash reason 423, only "xo"), qcom_q6v5.c, soc/qcom/mdt_loader.c, firmware/qcom/qcom_scm.c
+  * (PAS: svc 2, cmds 1/2/5/6/7), soc/qcom/smem.c + smp2p.c, rpmsg/qcom_glink_smem.c +
+@@ -53,6 +57,7 @@
+     uint64_t *res, unsigned *resumes);
+ extern bool sweet_mss_qmp(const char *msg);
+ extern void sweet_mss_smem_lock(bool take);
++extern int sweet_amp_reg(uint16_t reg, bool write, uint8_t *val);     /* sweet_touch.c (0320) */
+ void sweet_adsp_probe(void);
+ 
+ #define AD_WIMG_IO      0x7u            /* VM_WIMG_IO */
+@@ -1252,18 +1257,35 @@
+ static struct {
+ 	uint32_t want;          /* opcode of the command in flight, 0 = none */
+ 	uint32_t token, state, polls, next, first;
+-	bool ready, fwk_unsupported, done;
++	uint32_t rsp_op, rsp_status;    /* 0320: the last APR_BASIC_RSP_RESULT */
++	bool ready, fwk_unsupported, done, rsp;
+ } apr;
+ 
+-static void
+-apr_cmd(uint32_t opcode)
++/* 0320: to any service (src = dst svc, APPS 5 -> ADSP 4), the payload after the 20-byte header */
++static bool
++apr_send(uint8_t svc, uint32_t opcode, const void *pl, uint32_t len)
+ {
+-	uint16_t h[10] = { (2u << 8) | (5u << 4), 20, APR_SVC_CORE | (5u << 8), 0, APR_SVC_CORE | (4u << 8), 0 };
++	uint8_t p[20 + 64];
++	uint16_t h[10] = { (2u << 8) | (5u << 4), (uint16_t)(20 + len), (uint16_t)(svc | (5u << 8)), 0,
++		           (uint16_t)(svc | (4u << 8)), 0 };
+ 	uint32_t tok = ++apr.token;
+ 
++	if (len > sizeof(p) - 20) {
++		return false;
++	}
+ 	memcpy(&h[6], &tok, 4);
+ 	memcpy(&h[8], &opcode, 4);
+-	if (gk_send(CH_APR, h, 20)) {
++	memcpy(p, h, 20);
++	if (len) {
++		memcpy(p + 20, pl, len);
++	}
++	return gk_send(CH_APR, p, 20 + len);
++}
++
++static void
++apr_cmd(uint32_t opcode)
++{
++	if (apr_send(APR_SVC_CORE, opcode, NULL, 0)) {
+ 		apr.want = opcode;
+ 	}
+ }
+@@ -1292,6 +1314,9 @@
+ 	switch (op) {
+ 	case APR_BASIC_RSP_RESULT:              /* { opcode, status } */
+ 		printf("SWEET ADSP: apr:   basic result for %#x: status %#x\n", w[0], w[1]);
++		apr.rsp_op = w[0];
++		apr.rsp_status = w[1];
++		apr.rsp = true;
+ 		if (w[0] == apr.want) {
+ 			apr.want = 0;
+ 		}
+@@ -1476,6 +1501,8 @@
+ 			why = "apr_audio_svc not open both ways within 10 s";
+ 		} else if (!ok_at && t >= 15000) {
+ 			why = "q6core did not answer within 15 s";
++		} else if (ok_at && ad_mode >= 4 && t >= ok_at + 2000) {
++			break;                  /* 0320: settled; stage 4 runs on the live ADSP */
+ 		}
+ 		delay(1000);
+ 	}
+@@ -1491,12 +1518,305 @@
+ 	if (!ok_at) {
+ 		printf("SWEET ADSP: stage 3: FAILED: %s\n", why ? why : "?");
+ 	} else {
+-		printf("SWEET ADSP: watch: %s at +%u ms\n", why ? why : "30 s without a fatal", t);
++		printf("SWEET ADSP: watch: %s at +%u ms\n", why ? why : ad_mode >= 4 ? "2 s without a fatal" :
++		    "30 s without a fatal", t);
++	}
++	if (ok_at && !why && ad_mode >= 4) {
++		return true;            /* 0320: ad_stage45() ends in ad_stop() */
+ 	}
+ 	ad_stop(why ? why : "adsp=3 ends here");
+ 	return ok_at != 0;
+ }
+ 
++/* ======================================================================================== */
++/*
++ * 0320, stages 4 and 5 (logs/audio/plan.md Steps 4-5 and §2): a tone from the speaker amp, no PCM.
++ *   4  TLMM gpio58-61 (NORTH: SCK, WS, SD0, SD1) to qua_mi2s = function 1 (pinctrl-sdm845.c), 8 mA,
++ *      no bias, 58/59 output-high (sdm845.dtsi quat_mi2s_*_active). APR to the AFE (svc 4), as q6afe.c:
++ *      QUAD_MI2S_IBIT 0x106 at 1.536 MHz (sdm845.c MI2S_BCLK_RATE; q6afe-dai: attribute COUPLE_NO,
++ *      root default) through AFE_SVC_CMD_SET_PARAM / AFE_MODULE_CLOCK_SET; AFE_PARAM_ID_I2S_CONFIG on
++ *      QUATERNARY_MI2S_RX 0x1006: 16 bit, SD1 (oneplus-common qcom,sd-lines <1>), stereo, 48 kHz, ws
++ *      internal (the CPU is bit and frame master), padded to sizeof(union afe_port_config) = 36 as
++ *      q6afe_port_start sends it; DEVICE_START. adsp=4 runs the port 2 s. Then always: DEVICE_STOP,
++ *      clock off (freq 0), the pins' old cfg back, ad_stop().
++ *   5  with the port running: MAX98927 (Linux max98927.c): reset gpio69 (EAST, active low) low 10 ms
++ *      then high (OnePlus vendor driver), REV_ID 0x1ff must read 0x40 (Linux register default), then
++ *      max98927_probe + set_fmt (I2S, slave, NB_NF) + hw_params (16 bit, 48 kHz, 32 BCLK per LRCLK) with
++ *      the gain at its lowest: digital volume 0 = -16 dB (TLV -1600 step 25), speaker gain 0x11 = +3 dB
++ *      PCM and PDM, the lowest step that is not mute (vendor: "000:mute 001:+3db"). IV feedback stays
++ *      hi-z (no TX port). adsp=5 leaves the amp disabled. adsp=5N (N 1..15): TONE_GEN_DC_CFG 0x38 = N,
++ *      SPK_SRC_SEL 0x3b = 2 ("tone", vendor speaker_source_text), AMP_EN, GLOBAL_EN, 1 s. N is a knob:
++ *      neither Linux nor the vendor driver gives the TONE_CONFIG encodings (datasheet only). Teardown
++ *      whenever the amp answered: GLOBAL_EN 0, AMP_EN 0, tone 0, source PCM, soft reset; gpio69 held low.
++ */
++#define APR_SVC_AFE             4u
++#define AFE_DEVICE_START        0x000100e5u
++#define AFE_DEVICE_STOP         0x000100e6u
++#define AFE_PORT_SET_PARAM_V2   0x000100efu
++#define AFE_SVC_SET_PARAM       0x000100f3u
++#define AFE_MODULE_DEV_IF       0x0001020cu     /* AFE_MODULE_AUDIO_DEV_INTERFACE */
++#define AFE_PARAM_I2S_CONFIG    0x0001020du
++#define AFE_MODULE_CLOCK_SET    0x0001028fu
++#define AFE_PARAM_CLOCK_SET     0x00010290u
++#define AFE_QUAT_MI2S_RX        0x1006u
++#define AFE_CLK_QUAD_MI2S_IBIT  0x106u
++#define AD_MI2S_BCLK            1536000u        /* 48000 x 16 bit x 2 */
++#define TLMM_NORTH              0x03900000ull
++#define TLMM_EAST               0x03500000ull
++#define GPIO_AMP_RESET          69u
++#define TLMM_CFG(mux, pull, drive, oe) (((mux) << 2) | (pull) | ((drive) << 6) | ((oe) ? 0x200u : 0u))
++
++/* one TLMM pin (cfg at tile + 0x1000 * pin: mux 5:2, drive 8:6, oe 9, pull 1:0; io at +4, bit 1 = out):
++ * the level first, then cfg's low 10 bits. Returns the old cfg | old io << 16, ~0 = not mapped. */
++static uint32_t
++ad_gpio(uint64_t tile, unsigned pin, uint32_t cfg, bool high)
++{
++	vm_offset_t va = io_map(tile + 0x1000ull * pin, 0x1000, AD_WIMG_IO, VM_PROT_READ | VM_PROT_WRITE, true);
++
++	if (!va) {
++		printf("SWEET ADSP: cannot map tlmm gpio%u\n", pin);
++		ad_bad = true;
++		return ~0u;
++	}
++	volatile uint32_t *r = (volatile uint32_t *)va;
++	uint32_t old_cfg = r[0], old_io = r[1];
++	r[1] = (old_io & ~2u) | (high ? 2u : 0u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	r[0] = (old_cfg & ~0x3ffu) | (cfg & 0x3ffu);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET ADSP: gpio%u cfg %#x io %#x -> cfg %#x io %#x\n", pin, old_cfg, old_io, r[0], r[1]);
++	ml_io_unmap(trunc_page(va), round_page(0x1000 + (va & PAGE_MASK)));     /* as 0317 */
++	return (old_cfg & 0xffffu) | (old_io << 16);
++}
++
++/* GLINK receive + the ADSP's health while a stage waits; false = fatal, glink error or refused access */
++static bool
++ad_pump(void)
++{
++	uint32_t sk = slave_kernel();
++
++	for (unsigned i = 0; i < 64 && gk.rx && gk_rx_one(); i++) {
++	}
++	if (sk == ~0u || (sk & SK_FATAL)) {
++		printf("SWEET ADSP: t=+%u ms slave-kernel %#x FATAL\n", ad_now(), sk);
++		crash_reason();
++		ad.running = false;     /* crashed: no stop request */
++		return false;
++	}
++	return !gk.bad && !ad_bad;
++}
++
++/* one AFE command and its APR_BASIC_RSP_RESULT (q6afe.c afe_apr_send_pkt, TIMEOUT_MS 1000) */
++static bool
++afe_cmd(const char *what, uint32_t opcode, const void *pl, uint32_t len)
++{
++	unsigned t0 = ad_now();
++	bool sent = false;
++
++	apr.rsp = false;
++	while (ad.running && ad_now() - t0 < 1000) {
++		if (!sent) {
++			sent = apr_send(APR_SVC_AFE, opcode, pl, len);
++		}
++		if (!ad_pump()) {
++			break;
++		}
++		if (apr.rsp && apr.rsp_op == opcode) {
++			printf("SWEET ADSP: afe %s (%#x): status %#x%s\n", what, opcode, apr.rsp_status,
++			    apr.rsp_status ? " FAILED" : " ok");
++			return apr.rsp_status == 0;
++		}
++		delay(1000);
++	}
++	printf("SWEET ADSP: afe %s (%#x): %s\n", what, opcode, !ad.running ? "adsp not running" :
++	    sent ? "no answer in 1 s" : "not sent");
++	return false;
++}
++
++static bool
++afe_clock(uint32_t hz)          /* struct afe_clk_set after afe_svc_cmd_set_param + param data */
++{
++	const uint32_t p[12] = { 12 + 20, 0, 0, 0, AFE_MODULE_CLOCK_SET, AFE_PARAM_CLOCK_SET, 20,
++		                 1, AFE_CLK_QUAD_MI2S_IBIT, hz, 1 /* COUPLE_NO | root 0 << 16 */, hz ? 1u : 0u };
++
++	return afe_cmd(hz ? "clock QUAD_MI2S_IBIT on" : "clock QUAD_MI2S_IBIT off", AFE_SVC_SET_PARAM, p,
++	           (uint32_t)sizeof(p));
++}
++
++static bool
++afe_port(uint32_t opcode, const char *what)
++{
++	const uint32_t p = AFE_QUAT_MI2S_RX;    /* port_id, reserved 0 */
++
++	return afe_cmd(what, opcode, &p, 4);
++}
++
++/* --- the amp, through sweet_amp_reg() --- */
++static const struct { uint16_t reg; uint8_t mask, val; } amp_init[] = {
++	{ 0x0100, 0xff, 0x01 },                         /* software reset (max98927_probe) */
++	{ 0x001c, 0xff, 0xff }, { 0x001d, 0xff, 0xff }, /* PCM TX hi-z: no IV slots */
++	{ 0x0025, 0xff, 0x80 }, { 0x0026, 0xff, 0x01 }, /* PCM to speaker monomix */
++	{ 0x0036, 0xff, 0x00 },                         /* digital volume -16 dB (Linux 0x38) */
++	{ 0x003c, 0xff, 0x11 },                         /* speaker gain +3 dB PCM and PDM (Linux 0x05) */
++	{ 0x0037, 0xff, 0x03 }, { 0x003f, 0xff, 0xf7 }, /* DC blockers */
++	{ 0x0040, 0xff, 0x1c }, { 0x0042, 0xff, 0x3e }, /* boost output voltage, current limit */
++	{ 0x0043, 0xff, 0x04 }, { 0x0044, 0xff, 0x00 }, { 0x0045, 0xff, 0x24 },        /* measurement ADC */
++	{ 0x007f, 0xff, 0x06 },                         /* brownout level */
++	{ 0x0082, 0xff, 0x08 }, { 0x0086, 0xff, 0x01 }, { 0x0087, 0xff, 0x10 },        /* envelope tracking */
++	{ 0x0021, 0x03, 0x00 },                         /* set_fmt: slave */
++	{ 0x0020, 0x3c, 0x00 },                         /* normal BCLK edge, I2S */
++	{ 0x0018, 0x03, 0x03 },                         /* PCM RX ch0 + ch1 */
++	{ 0x003b, 0x03, 0x00 }, { 0x0035, 0x01, 0x00 }, /* speaker source PCM, PDM RX off */
++	{ 0x0020, 0xc0, 0x40 },                         /* hw_params: 16-bit channels */
++	{ 0x0023, 0x0f, 0x08 }, { 0x0024, 0xff, 0x88 }, /* 48 kHz; IV ADC 48 kHz */
++	{ 0x0022, 0x0f, 0x02 },                         /* BSEL 32 BCLK per LRCLK */
++};
++
++static int
++amp_rd(uint16_t reg)
++{
++	uint8_t v = 0;
++	int e = sweet_amp_reg(reg, false, &v);
++
++	if (e) {
++		printf("SWEET AMP: read %#06x: error %d\n", reg, e);
++		return -1;
++	}
++	return v;
++}
++
++static bool
++amp_wr(uint16_t reg, uint8_t mask, uint8_t val)        /* mask 0xff: plain write */
++{
++	int old = mask == 0xff ? 0 : amp_rd(reg);
++	uint8_t v = (uint8_t)(((unsigned)old & ~(unsigned)mask) | (unsigned)val);
++	int e = old < 0 ? EIO : sweet_amp_reg(reg, true, &v);
++
++	if (e) {
++		printf("SWEET AMP: write %#06x = %#04x: error %d\n", reg, v, e);
++	}
++	return e == 0;
++}
++
++static const char *
++amp_stage(int mode)
++{
++	static const uint16_t show[] = { 0x0018, 0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0036, 0x003c };
++	uint32_t rst = TLMM_CFG(0u, 3u, 7u, true);     /* gpio, pull-up, 16 mA, out (speaker_default) */
++	unsigned tone = mode > 50 && mode <= 65 ? (unsigned)(mode - 50) : 0;
++	const char *why = NULL;
++	int id = -1;
++
++	printf("SWEET AMP: reset gpio69 low 10 ms, then high; REV_ID\n");
++	(void)ad_gpio(TLMM_EAST, GPIO_AMP_RESET, rst, false);
++	delay(10000);
++	(void)ad_gpio(TLMM_EAST, GPIO_AMP_RESET, rst, true);
++	delay(6000);
++	if (ad_bad) {
++		why = "tlmm gpio69";
++	} else if ((id = amp_rd(0x01ff)) < 0) {
++		why = "no answer at 0x3a on SE4";
++	} else {
++		printf("SWEET AMP: REV_ID %#04x%s\n", (unsigned)id, id == 0x40 ? "" : " (expected 0x40)");
++		why = id == 0x40 ? NULL : "unexpected REV_ID";
++	}
++	for (unsigned i = 0; !why && i < sizeof(amp_init) / sizeof(amp_init[0]); i++) {
++		why = amp_wr(amp_init[i].reg, amp_init[i].mask, amp_init[i].val) ? NULL : "init write";
++		if (i == 0) {
++			delay(10000);   /* after the software reset */
++		}
++	}
++	for (unsigned i = 0; !why && i < sizeof(show) / sizeof(show[0]); i++) {
++		printf("SWEET AMP: R%04x = %#04x\n", show[i], (unsigned)amp_rd(show[i]));
++	}
++	if (!why) {
++		printf("SWEET AMP: init ok: I2S slave, 16 bit, 48 kHz, volume -16 dB, gain +3 dB\n");
++	}
++	if (!why && !tone) {
++		printf("SWEET AMP: adsp=5: amp left disabled (adsp=5N plays the tone, N = TONE_CONFIG 1..15)\n");
++	} else if (!why) {
++		printf("SWEET AMP: tone: TONE_CONFIG %u, source tone, amp on for 1 s\n", tone);
++		if (!amp_wr(0x0038, 0x0f, (uint8_t)tone) || !amp_wr(0x003b, 0x03, 0x02) ||
++		    !amp_wr(0x003a, 0x01, 0x01) || !amp_wr(0x00ff, 0x01, 0x01)) {
++			why = "tone enable";
++		}
++		for (unsigned end = ad_now() + 1000; !why && ad_now() < end; delay(10000)) {
++			why = ad_pump() ? NULL : "adsp fatal or glink error during the tone";
++		}
++		if (!why) {
++			printf("SWEET AMP: tone done (state %#x, int raw %#x %#x %#x)\n", (unsigned)amp_rd(0x00ff),
++			    (unsigned)amp_rd(0x0001), (unsigned)amp_rd(0x0002), (unsigned)amp_rd(0x0003));
++		}
++	}
++	if (id >= 0) {                  /* max98927_dac_event POST_PMD, then a software reset */
++		(void)amp_wr(0x00ff, 0xff, 0x00);
++		(void)amp_wr(0x003a, 0xff, 0x00);
++		(void)amp_wr(0x0038, 0xff, 0x00);
++		(void)amp_wr(0x003b, 0xff, 0x00);
++		(void)amp_wr(0x0100, 0xff, 0x01);
++	}
++	(void)ad_gpio(TLMM_EAST, GPIO_AMP_RESET, rst, false);  /* held in reset (max98927_i2c_remove) */
++	printf("SWEET AMP: off: global/amp/tone 0, soft reset, reset gpio69 held low\n");
++	return why;
++}
++
++static int
++ad_stage45(int mode)
++{
++	static const unsigned quat_pin[4] = { 58, 59, 60, 61 };
++	uint32_t quat_old[4];
++	const uint32_t i2s[16] = { AFE_QUAT_MI2S_RX | (48u << 16), 0, 0, 0, AFE_MODULE_DEV_IF, AFE_PARAM_I2S_CONFIG, 36,
++		                   1, 16 | (2u << 16) /* bit width, AFE_PORT_I2S_SD1 */,
++		                   1 | (1u << 16) /* stereo, ws internal */, 48000, 0 /* linear PCM */ };
++	const char *why = NULL;
++	bool clk = false, started = false;
++	int reached = 3;
++
++	printf("SWEET ADSP: stage 4: tlmm gpio58-61 -> qua_mi2s, afe port %#x\n", AFE_QUAT_MI2S_RX);
++	for (unsigned i = 0; i < 4; i++) {
++		quat_old[i] = ad_gpio(TLMM_NORTH, quat_pin[i], TLMM_CFG(1u, 0u, 3u, i < 2), i < 2);
++	}
++	if (ad_bad) {
++		why = "tlmm gpio58-61";
++	} else if (!(clk = afe_clock(AD_MI2S_BCLK))) {
++		why = "afe clock set";
++	} else if (!afe_cmd("i2s config", AFE_PORT_SET_PARAM_V2, i2s, (uint32_t)sizeof(i2s))) {
++		why = "afe i2s config";
++	} else {
++		started = true;         /* a failed start is still followed by a stop */
++		why = afe_port(AFE_DEVICE_START, "device start") ? NULL : "afe device start";
++	}
++	if (!why) {
++		reached = 4;
++		printf("SWEET ADSP: stage 4: ok: QUATERNARY_MI2S_RX %#x started, bit clock %u Hz\n", AFE_QUAT_MI2S_RX,
++		    AD_MI2S_BCLK);
++		if (mode >= 5) {
++			why = amp_stage(mode);
++			reached = why ? 4 : 5;
++		} else {
++			for (unsigned end = ad_now() + 2000; !why && ad_now() < end; delay(10000)) {
++				why = ad_pump() ? NULL : "adsp fatal or glink error";
++			}
++		}
++	}
++	if (why) {
++		printf("SWEET ADSP: stage %d: FAILED: %s\n", reached + 1, why);
++	}
++	if (started) {
++		(void)afe_port(AFE_DEVICE_STOP, "device stop");
++	}
++	if (clk) {
++		(void)afe_clock(0);
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (quat_old[i] != ~0u) {
++			(void)ad_gpio(TLMM_NORTH, quat_pin[i], quat_old[i] & 0x3ffu, (quat_old[i] >> 17) & 1u);
++		}
++	}
++	ad_stop(why ? why : mode >= 5 ? "adsp=5 ends here" : "adsp=4 ends here");
++	return reached;
++}
++
+ /*
+  * 0315: everything, the read-only probe too, runs in this thread after adspdelay seconds (default
+  * 60): boot55/boot56 panicked ~10 s into boot inside these stages, before SSH was up and with the
+@@ -1531,12 +1851,12 @@
+ 		if (mode == 2) {
+ 			ad_stop("adsp=2 ends here");
+ 		} else if (ad_stage3()) {
+-			reached = 3;
++			reached = mode >= 4 && ad.running ? ad_stage45(mode) : 3;  /* running: not stopped */
+ 		}
+ 	}
+ out:
+ 	printf("SWEET ADSP: done: adsp=%d, last good stage %d%s\n", mode, reached,
+-	    reached == MIN(mode, 3) ? "" : " (stopped early)");
++	    reached == MIN(mode, 5) ? "" : " (stopped early)");
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -24,6 +24,7 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ int sweet_bq_read(uint8_t reg, uint16_t *out);
++int sweet_amp_reg(uint16_t reg, bool write, uint8_t *val);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -1160,6 +1161,61 @@
+ 	return err;
+ }
+ 
++/*
++ * 0320: the speaker amp, MAX98927 at 0x3a on QUP SE4 (i2c@890000, wrapper 0: enchilada dtbo entry 5,
++ * mainline sdm845-oneplus-enchilada.dts). SDA/SCL gpio89/90 in TLMM SOUTH, function qup4 = mux 2 on
++ * gpio89 and 3 on gpio90 (pinctrl-sdm845.c). GCC (gcc-sdm845.c): wrap0 m/s AHB bits 6/7, SE4 bit 14,
++ * CBCR 0x174f0, RCG 0x174f4; bits 8/9 are wrapper 0's core clocks as touch's 18/19 are wrapper 1's.
++ * Same FIFO engine and 100 kHz as the gauge; 16-bit register address, 8-bit data. Only sweet_adsp.c's
++ * thread calls it (adsp=5). 0 = ok, ENODEV = SE4 unusable this boot (already logged).
++ */
++#define AMP_SE_PA       0x00890000u
++#define AMP_GCC_CBCR    0x174f0u
++#define AMP_GCC_RCG     0x174f4u
++#define AMP_VOTE_MASK   ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14))
++#define AMP_ADDR        0x3au
++
++static struct touch_state amp = { .name = "AMP SE4" };
++static int amp_ready;
++
++static bool
++amp_open(void)
++{
++	vm_offset_t pins = ml_io_map(FJ_TLMM_SOUTH + TOUCH_GPIO_CFG(89), 0x2000);
++
++	amp.gcc = st.gcc ? st.gcc : bq.gcc ? bq.gcc : ml_io_map(FJ_GCC_PA, 0x60000);
++	amp.se = ml_io_map(AMP_SE_PA, 0x4000);
++	if (!pins || !amp.gcc || !amp.se) {
++		printf("SWEET AMP SE4: MMIO mapping failed\n");
++		return false;
++	}
++	vm_offset_t south = pins - TOUCH_GPIO_CFG(89);  /* touch_gpio_at() adds 0x1000 * pin */
++	for (unsigned pin = 89; pin <= 90; pin++) {
++		uint32_t cfg = touch_rd(south, TOUCH_GPIO_CFG(pin));
++		if (((cfg >> 2) & 0xfu) != pin - 87u) {
++			touch_gpio_at(south, pin, pin - 87u, 0, 0, false, false);      /* qup4, 2 mA, no bias */
++		}
++		printf("SWEET AMP SE4: gpio%u cfg %#x -> %#x\n", pin, cfg, touch_rd(south, TOUCH_GPIO_CFG(pin)));
++	}
++	return fajita_clocks(&amp, AMP_VOTE_MASK, AMP_GCC_CBCR, AMP_GCC_RCG) && touch_se_init(&amp);
++}
++
++int
++sweet_amp_reg(uint16_t reg, bool write, uint8_t *val)
++{
++	if (amp_ready == 0) {
++		amp_ready = amp_open() ? 1 : -1;
++	}
++	if (amp_ready < 0 || amp.dead) {
++		return ENODEV;
++	}
++	if (write) {
++		const uint8_t tx[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, *val };
++		return geni_msg(&amp, AMP_ADDR, tx, 3u, NULL, 0, false);
++	}
++	return geni_read(&amp, AMP_ADDR, reg, true, val, 1u);
++}
++
+ void
+ sweet_touch_init(void)
+ {
